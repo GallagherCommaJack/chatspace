@@ -21,6 +21,9 @@ from tqdm import tqdm
 
 from . import __version__ as CHATSPACE_VERSION
 
+# enable tf32 tensor cores
+torch.set_float32_matmul_precision('high')
+
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -339,6 +342,7 @@ class _ModelRunner:
         self.compile_enabled = compile_enabled
         self.compile_mode = compile_mode or "default"
         self._compiled_forward: Optional[Any] = None
+        self._compiled_cache: Dict[int, Any] = {}
 
         pad_token_id = getattr(getattr(model, "tokenizer", None), "pad_token_id", 0)
         if pad_token_id is None:
@@ -370,10 +374,47 @@ class _ModelRunner:
         tokenized = self.model.tokenize([text], max_length=max_length, padding=False, truncation=True)
         return {key: value.squeeze(0) for key, value in tokenized.items()}
 
+    def warmup(self, bucket_sizes: Iterable[int]) -> Dict[int, float]:
+        timings: Dict[int, float] = {}
+        if not self.compile_enabled or self._compiled_forward is None:
+            return timings
+
+        for size in bucket_sizes:
+            if size in self._compiled_cache:
+                continue
+
+            features = self._dummy_features(size)
+            start = time.perf_counter()
+            with torch.inference_mode():
+                self.forward(features)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timings[size] = time.perf_counter() - start
+
+        return timings
+
+    def _dummy_features(self, seq_len: int) -> Dict[str, torch.Tensor]:
+        features: Dict[str, torch.Tensor] = {}
+        for key, pad_value in self.pad_values.items():
+            dtype = torch.long
+            if key == "attention_mask":
+                tensor = torch.ones((1, seq_len), dtype=dtype)
+            else:
+                tensor = torch.full((1, seq_len), pad_value, dtype=dtype)
+            features[key] = tensor
+        if "attention_mask" not in features:
+            features["attention_mask"] = torch.ones((1, seq_len), dtype=torch.long)
+        return features
+
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device_features = {key: value.to(self.device, non_blocking=True) for key, value in features.items()}
         if self.compile_enabled and self._compiled_forward is not None:
-            return self._compiled_forward(device_features)
+            bucket_size = next(iter(device_features.values())).shape[-1]
+            compiled = self._compiled_cache.get(bucket_size)
+            if compiled is None:
+                compiled = self._compiled_forward
+                self._compiled_cache[bucket_size] = compiled
+            return compiled(device_features)
         return self.model.forward(device_features)
 
 
@@ -433,6 +474,22 @@ def _effective_batch_size(bucket_size: int, cfg: SentenceTransformerConfig) -> i
         sequences = cfg.tokens_per_batch // max(bucket_size, 1)
         return max(sequences, 1)
     return max(cfg.batch_size, 1)
+
+
+def _enumerate_bucket_sizes(cfg: SentenceTransformerConfig) -> List[int]:
+    sizes: List[int] = []
+    size = _next_power_of_two(cfg.bucket_min_tokens)
+    while size <= cfg.bucket_max_tokens:
+        if size not in sizes:
+            sizes.append(size)
+        if size == cfg.bucket_max_tokens:
+            break
+        size *= 2
+
+    if cfg.bucket_max_tokens not in sizes:
+        sizes.append(cfg.bucket_max_tokens)
+
+    return sorted(set(sizes))
 
 
 @dataclass
@@ -739,7 +796,6 @@ def _config_to_dict(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
 def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
     start_time = time.time()
     paths = _prepare_paths(cfg)
-    ds = _load_dataset(cfg)
     model = _load_model(cfg)
 
     try:
@@ -748,6 +804,15 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
         logging.debug("Unable to set model.max_seq_length explicitly; using model default.")
 
     model_runner = _ModelRunner(model, cfg.compile_model, cfg.compile_mode)
+
+    bucket_sizes = _enumerate_bucket_sizes(cfg)
+    warmup_timings = model_runner.warmup(bucket_sizes)
+    if warmup_timings:
+        readable = {size: round(duration, 4) for size, duration in warmup_timings.items()}
+        logging.info("Warmup compile timings (seconds) per bucket: %s", readable)
+        logging.info("Warmup compile total: %.4fs", sum(warmup_timings.values()))
+
+    ds = _load_dataset(cfg)
 
     git_sha = _observe_git_sha()
 
