@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
-import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
+import queue
+import threading
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -62,6 +62,7 @@ class SentenceTransformerConfig:
     tokenizer_padding: str = "left"
     trust_remote_code: bool = True
     num_workers: int = 1
+    prefetch_batches: int = 4
     progress: bool = True
     source_label: str = "huggingface"
     run_id: Optional[str] = None
@@ -75,6 +76,8 @@ class SentenceTransformerConfig:
             raise ValueError("rows_per_shard must be positive")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if self.prefetch_batches <= 0:
+            raise ValueError("prefetch_batches must be positive")
         if self.max_rows is not None and self.max_rows <= 0:
             raise ValueError("max_rows must be positive if provided")
 
@@ -100,17 +103,6 @@ def _default_tokenizer_kwargs(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
         kwargs["padding_side"] = cfg.tokenizer_padding
     kwargs.update(cfg.tokenizer_kwargs)
     return kwargs
-
-
-def _batched(iterable: Iterable[Dict[str, Any]], batch_size: int) -> Iterator[List[Dict[str, Any]]]:
-    batch: List[Dict[str, Any]] = []
-    for item in iterable:
-        batch.append(item)
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
 
 
 def _load_dataset(cfg: SentenceTransformerConfig) -> IterableDataset:
@@ -207,14 +199,363 @@ def _compute_norms(embedding_batch: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(embedding_batch, dim=1)
 
 
-def _tensor_from_embeddings(embeddings: List[List[float]]) -> torch.Tensor:
-    return torch.tensor(embeddings, dtype=torch.float32)
+@dataclass
+class PipelineStats:
+    total_rows: int = 0
+    skipped_rows: int = 0
+    embedding_dim: Optional[int] = None
+    min_norm: Optional[float] = None
+    max_norm: Optional[float] = None
+
+    def register_rows(self, count: int) -> None:
+        self.total_rows += count
+
+    def register_skipped(self, count: int = 1) -> None:
+        self.skipped_rows += count
+
+    def update_embedding_dim(self, dim: int) -> None:
+        if self.embedding_dim is None:
+            self.embedding_dim = dim
+        elif dim is not None and self.embedding_dim != dim:
+            raise ValueError(f"Inconsistent embedding dimension: expected {self.embedding_dim}, received {dim}")
+
+    def update_norm_bounds(self, min_norm: Optional[float], max_norm: Optional[float]) -> None:
+        if min_norm is None or max_norm is None:
+            return
+        self.min_norm = min_norm if self.min_norm is None else min(self.min_norm, min_norm)
+        self.max_norm = max_norm if self.max_norm is None else max(self.max_norm, max_norm)
 
 
-def _convert_embeddings(numpy_embeddings: Any) -> List[List[float]]:
-    if hasattr(numpy_embeddings, "tolist"):
-        return numpy_embeddings.astype("float32").tolist()
-    return [[float(x) for x in row] for row in numpy_embeddings]
+@dataclass
+class StageTimings:
+    busy_seconds: float = 0.0
+    idle_seconds: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def add_busy(self, delta: float) -> None:
+        if delta <= 0:
+            return
+        with self._lock:
+            self.busy_seconds += delta
+
+    def add_idle(self, delta: float) -> None:
+        if delta <= 0:
+            return
+        with self._lock:
+            self.idle_seconds += delta
+
+    def to_dict(self, total_duration: float) -> Dict[str, Any]:
+        total_stage = self.busy_seconds + self.idle_seconds
+        utilization = (self.busy_seconds / total_duration) if total_duration > 0 else None
+        stage_busy_fraction = (self.busy_seconds / total_stage) if total_stage > 0 else None
+        return {
+            "busy_seconds": self.busy_seconds,
+            "idle_seconds": self.idle_seconds,
+            "busy_fraction_of_stage": stage_busy_fraction,
+            "busy_fraction_of_run": utilization,
+        }
+
+
+@dataclass
+class PipelineMetrics:
+    loader: StageTimings = field(default_factory=StageTimings)
+    encoder: StageTimings = field(default_factory=StageTimings)
+    writer: StageTimings = field(default_factory=StageTimings)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    encoder_encode_seconds: float = 0.0
+
+    def add_encoder_encode(self, delta: float) -> None:
+        if delta <= 0:
+            return
+        with self._lock:
+            self.encoder_encode_seconds += delta
+
+    def to_dict(self, total_duration: float) -> Dict[str, Any]:
+        return {
+            "loader": self.loader.to_dict(total_duration),
+            "encoder": {
+                **self.encoder.to_dict(total_duration),
+                "encode_call_seconds": self.encoder_encode_seconds,
+            },
+            "writer": self.writer.to_dict(total_duration),
+        }
+
+
+@dataclass
+class EmbeddedBatch:
+    rows: List[Dict[str, Any]]
+    embeddings: torch.Tensor
+
+
+@dataclass
+class ThreadState:
+    error: Optional[BaseException] = None
+
+
+_STOP = object()
+
+
+def _dataset_loader_worker(ds: IterableDataset, cfg: SentenceTransformerConfig, row_queue: "queue.Queue[Any]", state: ThreadState, metrics: PipelineMetrics) -> None:
+    try:
+        last_timestamp = time.perf_counter()
+        for row in _rows_from_dataset(ds, cfg):
+            before_put = time.perf_counter()
+            metrics.loader.add_busy(before_put - last_timestamp)
+            row_queue.put(row)
+            after_put = time.perf_counter()
+            metrics.loader.add_idle(after_put - before_put)
+            last_timestamp = after_put
+    except BaseException as exc:  # noqa: BLE001
+        state.error = exc
+    finally:
+        row_queue.put(_STOP)
+
+
+def _encode_and_dispatch_batch(
+    batch_rows: List[Dict[str, Any]],
+    texts: List[str],
+    *,
+    model: SentenceTransformer,
+    cfg: SentenceTransformerConfig,
+    created_at: str,
+    run_id: str,
+    stats: PipelineStats,
+    metrics: PipelineMetrics,
+    batch_queue: "queue.Queue[Any]",
+    progress: tqdm,
+) -> bool:
+    if not batch_rows:
+        return False
+
+    encode_start = time.perf_counter()
+    with torch.inference_mode():
+        embeddings = model.encode(
+            texts,
+            batch_size=cfg.batch_size,
+            show_progress_bar=False,
+            convert_to_tensor=True,
+        )
+    metrics.add_encoder_encode(time.perf_counter() - encode_start)
+
+    if not isinstance(embeddings, torch.Tensor):
+        embeddings_tensor = torch.as_tensor(embeddings)
+    else:
+        embeddings_tensor = embeddings.detach()
+
+    if embeddings_tensor.ndim != 2:
+        raise ValueError(f"Expected 2D embeddings, got shape {tuple(embeddings_tensor.shape)}")
+
+    embedding_dim = embeddings_tensor.shape[1]
+    stats.update_embedding_dim(embedding_dim)
+
+    processed_rows: List[Dict[str, Any]] = []
+    for row in batch_rows:
+        augmented_row = dict(row)
+        augmented_row["model"] = cfg.model_name
+        augmented_row["created_at"] = created_at
+        augmented_row["run_id"] = run_id
+        processed_rows.append(augmented_row)
+
+    remaining: Optional[int] = None
+    reached_limit = False
+    if cfg.max_rows is not None:
+        remaining = max(cfg.max_rows - stats.total_rows, 0)
+        if remaining <= 0:
+            return True
+        if len(processed_rows) > remaining:
+            processed_rows = processed_rows[:remaining]
+            embeddings_tensor = embeddings_tensor[:remaining]
+            reached_limit = True
+
+    num_rows = len(processed_rows)
+    if num_rows == 0:
+        return True if cfg.max_rows is not None and remaining == 0 else reached_limit
+
+    embeddings_tensor = embeddings_tensor[:num_rows]
+    norms_tensor = _compute_norms(embeddings_tensor)
+    batch_min_norm = float(norms_tensor.min().item()) if norms_tensor.numel() > 0 else None
+    batch_max_norm = float(norms_tensor.max().item()) if norms_tensor.numel() > 0 else None
+
+    stats.register_rows(num_rows)
+    stats.update_norm_bounds(batch_min_norm, batch_max_norm)
+    progress.update(num_rows)
+
+    batch_queue.put(EmbeddedBatch(rows=processed_rows, embeddings=embeddings_tensor))
+    return reached_limit
+
+
+def _embedding_pipeline(
+    model: SentenceTransformer,
+    cfg: SentenceTransformerConfig,
+    created_at: str,
+    run_id: str,
+    *,
+    row_queue: "queue.Queue[Any]",
+    batch_queue: "queue.Queue[Any]",
+    stats: PipelineStats,
+    metrics: PipelineMetrics,
+    progress: tqdm,
+) -> None:
+    batch_rows: List[Dict[str, Any]] = []
+    batch_texts: List[str] = []
+    reached_limit = False
+
+    while True:
+        wait_start = time.perf_counter()
+        item = row_queue.get()
+        wait_end = time.perf_counter()
+        metrics.encoder.add_idle(wait_end - wait_start)
+
+        if item is _STOP:
+            break
+
+        busy_start = time.perf_counter()
+
+        if reached_limit:
+            metrics.encoder.add_busy(time.perf_counter() - busy_start)
+            continue
+
+        text_value = str(item.get(cfg.text_field, ""))
+        if not text_value:
+            stats.register_skipped()
+            metrics.encoder.add_busy(time.perf_counter() - busy_start)
+            continue
+
+        batch_rows.append(dict(item))
+        batch_texts.append(text_value)
+
+        if len(batch_rows) >= cfg.batch_size:
+            reached_limit = _encode_and_dispatch_batch(
+                batch_rows,
+                batch_texts,
+                model=model,
+                cfg=cfg,
+                created_at=created_at,
+                run_id=run_id,
+                stats=stats,
+                metrics=metrics,
+                batch_queue=batch_queue,
+                progress=progress,
+            ) and cfg.max_rows is not None
+            batch_rows = []
+            batch_texts = []
+
+        metrics.encoder.add_busy(time.perf_counter() - busy_start)
+
+    if not reached_limit and batch_rows:
+        busy_start = time.perf_counter()
+        _encode_and_dispatch_batch(
+            batch_rows,
+            batch_texts,
+            model=model,
+            cfg=cfg,
+            created_at=created_at,
+            run_id=run_id,
+            stats=stats,
+            metrics=metrics,
+            batch_queue=batch_queue,
+            progress=progress,
+        )
+        metrics.encoder.add_busy(time.perf_counter() - busy_start)
+
+
+class _ShardWriter:
+    def __init__(self, cfg: SentenceTransformerConfig, paths: Dict[str, Path], git_sha: Optional[str]) -> None:
+        self._cfg = cfg
+        self._paths = paths
+        self._git_sha = git_sha
+        self._current_rows: List[Dict[str, Any]] = []
+        self._current_norms: List[float] = []
+        self._shards: List[Dict[str, Any]] = []
+        self._shard_index = 0
+
+    @property
+    def shards(self) -> List[Dict[str, Any]]:
+        return self._shards
+
+    def run(self, batch_queue: "queue.Queue[Any]", stop_token: Any, state: ThreadState, metrics: PipelineMetrics) -> None:
+        try:
+            while True:
+                wait_start = time.perf_counter()
+                item = batch_queue.get()
+                wait_end = time.perf_counter()
+                metrics.writer.add_idle(wait_end - wait_start)
+
+                if item is stop_token:
+                    break
+
+                busy_start = time.perf_counter()
+                self._append_batch(item)
+                metrics.writer.add_busy(time.perf_counter() - busy_start)
+
+            busy_start = time.perf_counter()
+            self._flush_remaining()
+            metrics.writer.add_busy(time.perf_counter() - busy_start)
+        except BaseException as exc:  # noqa: BLE001
+            state.error = exc
+
+    def _append_batch(self, batch: EmbeddedBatch) -> None:
+        if not batch.rows:
+            return
+
+        embeddings_cpu = batch.embeddings.detach().to(device="cpu", dtype=torch.float32)
+        if embeddings_cpu.shape[0] != len(batch.rows):
+            raise ValueError(
+                f"Mismatch between rows ({len(batch.rows)}) and embeddings ({embeddings_cpu.shape[0]})"
+            )
+
+        embeddings_list = embeddings_cpu.tolist()
+        norms_tensor = torch.linalg.vector_norm(embeddings_cpu, dim=1)
+        norms_list = norms_tensor.tolist()
+
+        for row, embedding in zip(batch.rows, embeddings_list):
+            row["embedding"] = embedding
+
+        self._current_rows.extend(batch.rows)
+        self._current_norms.extend(norms_list)
+        while len(self._current_rows) >= self._cfg.rows_per_shard:
+            self._write_shard(self._cfg.rows_per_shard)
+
+    def _flush_remaining(self) -> None:
+        if self._current_rows:
+            self._write_shard(len(self._current_rows))
+
+    def _write_shard(self, rows_to_write: int) -> None:
+        shard_rows = self._current_rows[:rows_to_write]
+        shard_norms = self._current_norms[:rows_to_write]
+        self._current_rows = self._current_rows[rows_to_write:]
+        self._current_norms = self._current_norms[rows_to_write:]
+
+        shard_created_at = _iso_now()
+        shard_path = self._paths["embeddings_dir"] / f"shard-{self._shard_index:05d}.parquet"
+        table = pa.Table.from_pylist(shard_rows)
+        pq.write_table(table, shard_path)
+        file_size = shard_path.stat().st_size
+        checksum = _compute_sha256(shard_path)
+
+        shard_min_norm = min(shard_norms) if shard_norms else None
+        shard_max_norm = max(shard_norms) if shard_norms else None
+        embedding_dim = len(shard_rows[0]["embedding"]) if shard_rows and shard_rows[0].get("embedding") is not None else None
+
+        self._shards.append(
+            {
+                "path": str(shard_path),
+                "rows": len(shard_rows),
+                "bytes": file_size,
+                "sha256": checksum,
+                "embedding_dim": embedding_dim,
+                "min_norm": float(shard_min_norm) if shard_min_norm is not None else None,
+                "max_norm": float(shard_max_norm) if shard_max_norm is not None else None,
+                "created_at": shard_created_at,
+                "shard_index": self._shard_index,
+                "tool": {
+                    "package": "chatspace",
+                    "version": CHATSPACE_VERSION,
+                    "git_sha": self._git_sha,
+                },
+            }
+        )
+        self._shard_index += 1
 
 
 def _config_to_dict(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
@@ -236,155 +577,81 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
     created_at = _iso_now()
     run_id = cfg.run_id or created_at.replace(":", "").replace("-", "")
 
-    shards: List[Dict[str, Any]] = []
-    total_rows = 0
-    skipped_rows = 0
-    embedding_dim: Optional[int] = None
-    min_norm: Optional[float] = None
-    max_norm: Optional[float] = None
+    row_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, cfg.batch_size * cfg.prefetch_batches))
+    batch_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, cfg.prefetch_batches))
 
-    current_shard_rows: List[Dict[str, Any]] = []
-    shard_index = 0
+    loader_state = ThreadState()
+    writer_state = ThreadState()
+    metrics = PipelineMetrics()
 
-    iterator = _rows_from_dataset(ds, cfg)
+    loader_thread = threading.Thread(
+        target=_dataset_loader_worker,
+        args=(ds, cfg, row_queue, loader_state, metrics),
+        name="dataset-loader",
+        daemon=True,
+    )
+    loader_thread.start()
+
+    shard_writer = _ShardWriter(cfg, paths, git_sha)
+    writer_thread = threading.Thread(
+        target=shard_writer.run,
+        args=(batch_queue, _STOP, writer_state, metrics),
+        name="shard-writer",
+        daemon=True,
+    )
+    writer_thread.start()
+
+    stats = PipelineStats()
     progress = tqdm(disable=not cfg.progress, unit="rows")
+    embedding_error: Optional[BaseException] = None
 
-    for batch in _batched(iterator, cfg.batch_size):
-        texts = [str(row.get(cfg.text_field, "")) for row in batch]
-
-        filtered_indices: List[int] = []
-        filtered_rows: List[Dict[str, Any]] = []
-        for idx, (row, text) in enumerate(zip(batch, texts)):
-            if not text:
-                skipped_rows += 1
-                continue
-            filtered_indices.append(idx)
-            filtered_rows.append(row)
-
-        if not filtered_rows:
-            continue
-
-        with torch.inference_mode():
-            embeddings_array = model.encode(
-                [texts[i] for i in filtered_indices],
-                batch_size=cfg.batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                convert_to_tensor=False,
-            )
-
-        embeddings_list = _convert_embeddings(embeddings_array)
-        embeddings_tensor = _tensor_from_embeddings(embeddings_list)
-        batch_norms = _compute_norms(embeddings_tensor)
-
-        if embedding_dim is None:
-            embedding_dim = embeddings_tensor.shape[1]
-
-        for row, embedding, norm in zip(filtered_rows, embeddings_list, batch_norms.tolist()):
-            augmented_row = dict(row)
-            augmented_row["embedding"] = embedding
-            augmented_row["model"] = cfg.model_name
-            augmented_row["created_at"] = created_at
-            augmented_row["run_id"] = run_id
-            current_shard_rows.append(augmented_row)
-
-            min_norm = norm if min_norm is None else min(min_norm, norm)
-            max_norm = norm if max_norm is None else max(max_norm, norm)
-
-        batch_size_effective = len(filtered_rows)
-        total_rows += batch_size_effective
-        progress.update(batch_size_effective)
-
-        if cfg.max_rows is not None and total_rows >= cfg.max_rows:
-            current_shard_rows = current_shard_rows[: cfg.max_rows - (total_rows - batch_size_effective)]
-            total_rows = cfg.max_rows
-
-        while current_shard_rows and len(current_shard_rows) >= cfg.rows_per_shard:
-            shard_rows = current_shard_rows[: cfg.rows_per_shard]
-            current_shard_rows = current_shard_rows[cfg.rows_per_shard :]
-            shard_created_at = _iso_now()
-            shard_path = paths["embeddings_dir"] / f"shard-{shard_index:05d}.parquet"
-            table = pa.Table.from_pylist(shard_rows)
-            pq.write_table(table, shard_path)
-            file_size = shard_path.stat().st_size
-            checksum = _compute_sha256(shard_path)
-
-            shard_norms_tensor = _tensor_from_embeddings([row["embedding"] for row in shard_rows])
-            shard_norms = _compute_norms(shard_norms_tensor)
-
-            shards.append(
-                {
-                    "path": str(shard_path),
-                    "rows": len(shard_rows),
-                    "bytes": file_size,
-                    "sha256": checksum,
-                    "embedding_dim": embedding_dim,
-                    "min_norm": float(shard_norms.min().item()),
-                    "max_norm": float(shard_norms.max().item()),
-                    "created_at": shard_created_at,
-                    "shard_index": shard_index,
-                    "tool": {
-                        "package": "chatspace",
-                        "version": CHATSPACE_VERSION,
-                        "git_sha": git_sha,
-                    },
-                }
-            )
-            shard_index += 1
-
-            if cfg.max_rows is not None and total_rows >= cfg.max_rows:
-                break
-
-        if cfg.max_rows is not None and total_rows >= cfg.max_rows:
-            break
-
-    progress.close()
-
-    if current_shard_rows:
-        shard_created_at = _iso_now()
-        shard_path = paths["embeddings_dir"] / f"shard-{shard_index:05d}.parquet"
-        table = pa.Table.from_pylist(current_shard_rows)
-        pq.write_table(table, shard_path)
-        file_size = shard_path.stat().st_size
-        checksum = _compute_sha256(shard_path)
-        shard_norms_tensor = _tensor_from_embeddings([row["embedding"] for row in current_shard_rows])
-        shard_norms = _compute_norms(shard_norms_tensor)
-        shards.append(
-            {
-                "path": str(shard_path),
-                "rows": len(current_shard_rows),
-                "bytes": file_size,
-                "sha256": checksum,
-                "embedding_dim": embedding_dim,
-                "min_norm": float(shard_norms.min().item()),
-                "max_norm": float(shard_norms.max().item()),
-                "created_at": shard_created_at,
-                "shard_index": shard_index,
-                "tool": {
-                    "package": "chatspace",
-                    "version": CHATSPACE_VERSION,
-                    "git_sha": git_sha,
-                },
-            }
+    try:
+        _embedding_pipeline(
+            model=model,
+            cfg=cfg,
+            created_at=created_at,
+            run_id=run_id,
+            row_queue=row_queue,
+            batch_queue=batch_queue,
+            stats=stats,
+            metrics=metrics,
+            progress=progress,
         )
+    except BaseException as exc:  # noqa: BLE001
+        embedding_error = exc
+    finally:
+        progress.close()
+        batch_queue.put(_STOP)
+        loader_thread.join()
+        writer_thread.join()
+
+    if loader_state.error is not None:
+        raise RuntimeError("Dataset loader thread failed") from loader_state.error
+    if writer_state.error is not None:
+        raise RuntimeError("Shard writer thread failed") from writer_state.error
+    if embedding_error is not None:
+        raise embedding_error
 
     duration = time.time() - start_time
+    metrics_summary = metrics.to_dict(duration)
+    logging.info("Pipeline stage timings: %s", metrics_summary)
     manifest = {
         "dataset": cfg.dataset,
         "subset": cfg.subset,
         "split": cfg.split,
         "model": cfg.model_name,
         "source": cfg.source_label,
-        "rows_total": total_rows,
-        "rows_skipped": skipped_rows,
-        "embedding_dim": embedding_dim,
+        "rows_total": stats.total_rows,
+        "rows_skipped": stats.skipped_rows,
+        "embedding_dim": stats.embedding_dim,
         "rows_per_shard": cfg.rows_per_shard,
-        "shards": shards,
+        "shards": shard_writer.shards,
         "created_at": created_at,
         "run_id": run_id,
-        "min_norm": min_norm,
-        "max_norm": max_norm,
+        "min_norm": stats.min_norm,
+        "max_norm": stats.max_norm,
         "run_config": _config_to_dict(cfg),
+        "timings": metrics_summary,
     }
 
     manifest_path = paths["manifest_path"]
@@ -399,15 +666,16 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
         "created_at": created_at,
         "run_id": run_id,
         "duration_seconds": duration,
-        "rows_total": total_rows,
-        "rows_skipped": skipped_rows,
-        "num_shards": len(shards),
-        "embedding_dim": embedding_dim,
+        "rows_total": stats.total_rows,
+        "rows_skipped": stats.skipped_rows,
+        "num_shards": len(shard_writer.shards),
+        "embedding_dim": stats.embedding_dim,
         "git_sha": git_sha,
         "manifest_path": str(manifest_path),
-        "min_norm": min_norm,
-        "max_norm": max_norm,
+        "min_norm": stats.min_norm,
+        "max_norm": stats.max_norm,
         "tool_version": CHATSPACE_VERSION,
+        "timings": metrics_summary,
     }
 
     run_path = paths["run_path"]
@@ -439,6 +707,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", dest="dtype", default="bfloat16", help="Model dtype hint (e.g., float16, bfloat16)")
     parser.add_argument("--device", dest="device", default=None, help="Device map hint (e.g., 'cuda', 'auto')")
     parser.add_argument("--attention", dest="attention_impl", default="flash_attention_2", help="Attention implementation hint")
+    parser.add_argument("--prefetch-batches", dest="prefetch_batches", type=int, default=4, help="Number of dataset batches to buffer ahead of the encoder")
     parser.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress bars")
     parser.add_argument("--run-id", dest="run_id", default=None, help="Optional run identifier")
     parser.add_argument("--resume", dest="resume", action="store_true", help="Future placeholder for resuming runs")
@@ -465,6 +734,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         dtype=args.dtype,
         device=args.device,
         attention_impl=args.attention_impl,
+        prefetch_batches=args.prefetch_batches,
         progress=args.progress,
         run_id=args.run_id,
         resume=args.resume,
