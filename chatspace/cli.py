@@ -189,9 +189,15 @@ def handle_embed_hf(args: argparse.Namespace) -> None:
         dtype=args.dtype,
         device=args.device,
         attention_impl=args.attention,
+        prefetch_batches=args.prefetch_batches,
         progress=not args.no_progress,
         run_id=args.run_id,
         resume=args.resume,
+        bucket_min_tokens=args.bucket_min_tokens,
+        bucket_max_tokens=args.bucket_max_tokens,
+        tokens_per_batch=args.tokens_per_batch,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
     )
 
     run_sentence_transformer(cfg)
@@ -232,6 +238,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_hf.add_argument("--dtype", default="bfloat16", help="Model dtype hint")
     p_hf.add_argument("--device", default=None, help="Device hint, e.g. 'cuda', 'auto'")
     p_hf.add_argument("--attention", default="flash_attention_2", help="Attention implementation hint")
+    p_hf.add_argument("--prefetch-batches", type=int, default=4, help="Number of batches to prefetch from the loader")
+    p_hf.add_argument("--bucket-min-tokens", type=int, default=128, help="Minimum token count for bucket sizing")
+    p_hf.add_argument("--bucket-max-tokens", type=int, default=32768, help="Maximum token count for bucket sizing")
+    p_hf.add_argument("--tokens-per-batch", type=int, default=None, help="Target number of tokens per batch (overrides --batch-size when set)")
+    p_hf.add_argument("--compile-model", action="store_true", help="Enable torch.compile for model forward pass")
+    p_hf.add_argument("--compile-mode", default="default", help="torch.compile mode (default: 'default')")
     p_hf.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     p_hf.add_argument("--run-id", default=None, help="Optional run identifier")
     p_hf.add_argument("--resume", action="store_true", help="Resume if shards already exist (not yet implemented)")

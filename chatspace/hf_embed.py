@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,11 @@ class SentenceTransformerConfig:
     trust_remote_code: bool = True
     num_workers: int = 1
     prefetch_batches: int = 4
+    bucket_min_tokens: int = 128
+    bucket_max_tokens: int = 32768
+    tokens_per_batch: Optional[int] = None
+    compile_model: bool = False
+    compile_mode: Optional[str] = "default"
     progress: bool = True
     source_label: str = "huggingface"
     run_id: Optional[str] = None
@@ -78,6 +84,14 @@ class SentenceTransformerConfig:
             raise ValueError("batch_size must be positive")
         if self.prefetch_batches <= 0:
             raise ValueError("prefetch_batches must be positive")
+        if self.bucket_min_tokens <= 0:
+            raise ValueError("bucket_min_tokens must be positive")
+        if self.bucket_max_tokens <= 0:
+            raise ValueError("bucket_max_tokens must be positive")
+        if self.bucket_min_tokens > self.bucket_max_tokens:
+            raise ValueError("bucket_min_tokens must be less than or equal to bucket_max_tokens")
+        if self.tokens_per_batch is not None and self.tokens_per_batch <= 0:
+            raise ValueError("tokens_per_batch must be positive if provided")
         if self.max_rows is not None and self.max_rows <= 0:
             raise ValueError("max_rows must be positive if provided")
 
@@ -282,6 +296,146 @@ class PipelineMetrics:
 
 
 @dataclass
+class TokenBatch:
+    rows: List[Dict[str, Any]]
+    features: Dict[str, torch.Tensor]
+    bucket_size: int
+
+
+class _BucketBuffer:
+    def __init__(self, bucket_size: int) -> None:
+        self.bucket_size = bucket_size
+        self.rows: List[Dict[str, Any]] = []
+        self.tokens: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+    def add(self, row: Dict[str, Any], tokenized: Dict[str, torch.Tensor]) -> None:
+        self.rows.append(row)
+        for key, tensor in tokenized.items():
+            self.tokens[key].append(tensor)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def pop(self, count: int, pad_values: Dict[str, int]) -> Optional[TokenBatch]:
+        if count <= 0 or not self.rows:
+            return None
+        count = min(count, len(self.rows))
+        rows = self.rows[:count]
+        token_slices = {key: value[:count] for key, value in self.tokens.items()}
+        features = _pad_and_stack_tokens(token_slices, self.bucket_size, pad_values)
+        self.rows = self.rows[count:]
+        for key in list(self.tokens.keys()):
+            self.tokens[key] = self.tokens[key][count:]
+        return TokenBatch(rows=rows, features=features, bucket_size=self.bucket_size)
+
+    def flush(self, pad_values: Dict[str, int]) -> Optional[TokenBatch]:
+        return self.pop(len(self.rows), pad_values)
+
+
+class _ModelRunner:
+    def __init__(self, model: SentenceTransformer, compile_enabled: bool, compile_mode: Optional[str]) -> None:
+        self.model = model
+        self.device = model.device
+        self.compile_enabled = compile_enabled
+        self.compile_mode = compile_mode or "default"
+        self._compiled_forward: Optional[Any] = None
+
+        pad_token_id = getattr(getattr(model, "tokenizer", None), "pad_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+        self.pad_values: Dict[str, int] = {
+            "input_ids": pad_token_id,
+            "attention_mask": 0,
+            "token_type_ids": 0,
+        }
+
+        if self.compile_enabled and not hasattr(torch, "compile"):
+            logging.warning("torch.compile requested but not available in this PyTorch build; disabling compilation.")
+            self.compile_enabled = False
+
+        if self.compile_enabled:
+            try:
+                def forward_fn(features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                    return model.forward(features)
+
+                self._compiled_forward = torch.compile(forward_fn, mode=self.compile_mode)
+            except Exception:
+                logging.warning("torch.compile failed; continuing without compilation", exc_info=True)
+                self.compile_enabled = False
+                self._compiled_forward = None
+
+        self.model.eval()
+
+    def tokenize(self, text: str, *, max_length: int) -> Dict[str, torch.Tensor]:
+        tokenized = self.model.tokenize([text], max_length=max_length, padding=False, truncation=True)
+        return {key: value.squeeze(0) for key, value in tokenized.items()}
+
+    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device_features = {key: value.to(self.device, non_blocking=True) for key, value in features.items()}
+        if self.compile_enabled and self._compiled_forward is not None:
+            return self._compiled_forward(device_features)
+        return self.model.forward(device_features)
+
+
+def _next_power_of_two(value: int) -> int:
+    if value <= 0:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _select_bucket_size(length: int, cfg: SentenceTransformerConfig) -> int:
+    bucket = max(cfg.bucket_min_tokens, _next_power_of_two(length))
+    return min(bucket, cfg.bucket_max_tokens)
+
+
+def _token_sequence_length(tokens: Dict[str, torch.Tensor]) -> int:
+    if "attention_mask" in tokens:
+        return int(tokens["attention_mask"].sum().item())
+    if "input_ids" in tokens:
+        return int(tokens["input_ids"].shape[-1])
+    for value in tokens.values():
+        if isinstance(value, torch.Tensor):
+            return int(value.shape[-1])
+    return 0
+
+
+def _pad_and_stack_tokens(
+    token_slices: Dict[str, List[torch.Tensor]], bucket_size: int, pad_values: Dict[str, int]
+) -> Dict[str, torch.Tensor]:
+    features: Dict[str, torch.Tensor] = {}
+    for key, tensors in token_slices.items():
+        if not tensors:
+            continue
+        pad_value = pad_values.get(key, 0)
+        padded: List[torch.Tensor] = []
+        for tensor in tensors:
+            if tensor.ndimension() == 0:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndimension() > 1:
+                tensor = tensor.view(-1)
+            current_len = tensor.shape[-1]
+            if current_len > bucket_size:
+                tensor = tensor[..., :bucket_size]
+                current_len = bucket_size
+            if current_len < bucket_size:
+                pad_shape = (bucket_size - current_len,)
+                pad_tensor = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
+                tensor = torch.cat([tensor, pad_tensor], dim=-1)
+            padded.append(tensor)
+        if padded:
+            stacked = torch.stack(padded, dim=0)
+            features[key] = stacked
+    return features
+
+
+def _effective_batch_size(bucket_size: int, cfg: SentenceTransformerConfig) -> int:
+    if cfg.tokens_per_batch is not None:
+        sequences = cfg.tokens_per_batch // max(bucket_size, 1)
+        return max(sequences, 1)
+    return max(cfg.batch_size, 1)
+
+
+@dataclass
 class EmbeddedBatch:
     rows: List[Dict[str, Any]]
     embeddings: torch.Tensor
@@ -312,10 +466,9 @@ def _dataset_loader_worker(ds: IterableDataset, cfg: SentenceTransformerConfig, 
 
 
 def _encode_and_dispatch_batch(
-    batch_rows: List[Dict[str, Any]],
-    texts: List[str],
+    token_batch: TokenBatch,
     *,
-    model: SentenceTransformer,
+    model_runner: _ModelRunner,
     cfg: SentenceTransformerConfig,
     created_at: str,
     run_id: str,
@@ -324,37 +477,11 @@ def _encode_and_dispatch_batch(
     batch_queue: "queue.Queue[Any]",
     progress: tqdm,
 ) -> bool:
-    if not batch_rows:
+    rows = [dict(row) for row in token_batch.rows]
+    if not rows:
         return False
 
-    encode_start = time.perf_counter()
-    with torch.inference_mode():
-        embeddings = model.encode(
-            texts,
-            batch_size=cfg.batch_size,
-            show_progress_bar=False,
-            convert_to_tensor=True,
-        )
-    metrics.add_encoder_encode(time.perf_counter() - encode_start)
-
-    if not isinstance(embeddings, torch.Tensor):
-        embeddings_tensor = torch.as_tensor(embeddings)
-    else:
-        embeddings_tensor = embeddings.detach()
-
-    if embeddings_tensor.ndim != 2:
-        raise ValueError(f"Expected 2D embeddings, got shape {tuple(embeddings_tensor.shape)}")
-
-    embedding_dim = embeddings_tensor.shape[1]
-    stats.update_embedding_dim(embedding_dim)
-
-    processed_rows: List[Dict[str, Any]] = []
-    for row in batch_rows:
-        augmented_row = dict(row)
-        augmented_row["model"] = cfg.model_name
-        augmented_row["created_at"] = created_at
-        augmented_row["run_id"] = run_id
-        processed_rows.append(augmented_row)
+    features = {key: value for key, value in token_batch.features.items()}
 
     remaining: Optional[int] = None
     reached_limit = False
@@ -362,17 +489,28 @@ def _encode_and_dispatch_batch(
         remaining = max(cfg.max_rows - stats.total_rows, 0)
         if remaining <= 0:
             return True
-        if len(processed_rows) > remaining:
-            processed_rows = processed_rows[:remaining]
-            embeddings_tensor = embeddings_tensor[:remaining]
+        if len(rows) > remaining:
+            rows = rows[:remaining]
+            features = {key: value[:remaining] for key, value in features.items()}
             reached_limit = True
 
-    num_rows = len(processed_rows)
+    num_rows = len(rows)
     if num_rows == 0:
         return True if cfg.max_rows is not None and remaining == 0 else reached_limit
 
-    embeddings_tensor = embeddings_tensor[:num_rows]
-    norms_tensor = _compute_norms(embeddings_tensor)
+    encode_start = time.perf_counter()
+    with torch.inference_mode():
+        outputs = model_runner.forward(features)
+    metrics.add_encoder_encode(time.perf_counter() - encode_start)
+
+    embeddings = outputs.get("sentence_embedding")
+    if embeddings is None:
+        raise ValueError("Model forward pass did not return 'sentence_embedding'.")
+    embeddings = embeddings.detach()[:num_rows]
+
+    stats.update_embedding_dim(embeddings.shape[1])
+
+    norms_tensor = _compute_norms(embeddings)
     batch_min_norm = float(norms_tensor.min().item()) if norms_tensor.numel() > 0 else None
     batch_max_norm = float(norms_tensor.max().item()) if norms_tensor.numel() > 0 else None
 
@@ -380,12 +518,17 @@ def _encode_and_dispatch_batch(
     stats.update_norm_bounds(batch_min_norm, batch_max_norm)
     progress.update(num_rows)
 
-    batch_queue.put(EmbeddedBatch(rows=processed_rows, embeddings=embeddings_tensor))
+    for row in rows:
+        row["model"] = cfg.model_name
+        row["created_at"] = created_at
+        row["run_id"] = run_id
+
+    batch_queue.put(EmbeddedBatch(rows=rows, embeddings=embeddings))
     return reached_limit
 
 
 def _embedding_pipeline(
-    model: SentenceTransformer,
+    model_runner: _ModelRunner,
     cfg: SentenceTransformerConfig,
     created_at: str,
     run_id: str,
@@ -396,8 +539,7 @@ def _embedding_pipeline(
     metrics: PipelineMetrics,
     progress: tqdm,
 ) -> None:
-    batch_rows: List[Dict[str, Any]] = []
-    batch_texts: List[str] = []
+    buckets: Dict[int, _BucketBuffer] = {}
     reached_limit = False
 
     while True:
@@ -421,14 +563,35 @@ def _embedding_pipeline(
             metrics.encoder.add_busy(time.perf_counter() - busy_start)
             continue
 
-        batch_rows.append(dict(item))
-        batch_texts.append(text_value)
+        try:
+            tokenized = model_runner.tokenize(text_value, max_length=cfg.bucket_max_tokens)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to tokenize row: %s", exc)
+            stats.register_skipped()
+            metrics.encoder.add_busy(time.perf_counter() - busy_start)
+            continue
 
-        if len(batch_rows) >= cfg.batch_size:
+        if "attention_mask" not in tokenized and "input_ids" in tokenized:
+            tokenized["attention_mask"] = torch.ones_like(tokenized["input_ids"], dtype=torch.long)
+
+        seq_length = _token_sequence_length(tokenized)
+        if seq_length == 0:
+            stats.register_skipped()
+            metrics.encoder.add_busy(time.perf_counter() - busy_start)
+            continue
+
+        bucket_size = _select_bucket_size(seq_length, cfg)
+        bucket = buckets.setdefault(bucket_size, _BucketBuffer(bucket_size))
+        bucket.add(dict(item), tokenized)
+
+        batch_target = _effective_batch_size(bucket_size, cfg)
+        while len(bucket) >= batch_target and not reached_limit:
+            token_batch = bucket.pop(batch_target, model_runner.pad_values)
+            if token_batch is None:
+                break
             reached_limit = _encode_and_dispatch_batch(
-                batch_rows,
-                batch_texts,
-                model=model,
+                token_batch,
+                model_runner=model_runner,
                 cfg=cfg,
                 created_at=created_at,
                 run_id=run_id,
@@ -437,26 +600,33 @@ def _embedding_pipeline(
                 batch_queue=batch_queue,
                 progress=progress,
             ) and cfg.max_rows is not None
-            batch_rows = []
-            batch_texts = []
 
         metrics.encoder.add_busy(time.perf_counter() - busy_start)
 
-    if not reached_limit and batch_rows:
-        busy_start = time.perf_counter()
-        _encode_and_dispatch_batch(
-            batch_rows,
-            batch_texts,
-            model=model,
-            cfg=cfg,
-            created_at=created_at,
-            run_id=run_id,
-            stats=stats,
-            metrics=metrics,
-            batch_queue=batch_queue,
-            progress=progress,
-        )
-        metrics.encoder.add_busy(time.perf_counter() - busy_start)
+    if not reached_limit:
+        flush_start = time.perf_counter()
+        for bucket_size in sorted(buckets):
+            bucket = buckets[bucket_size]
+            batch_target = _effective_batch_size(bucket_size, cfg)
+            while len(bucket) > 0 and not reached_limit:
+                count = min(batch_target, len(bucket))
+                token_batch = bucket.pop(count, model_runner.pad_values)
+                if token_batch is None:
+                    break
+                reached_limit = _encode_and_dispatch_batch(
+                    token_batch,
+                    model_runner=model_runner,
+                    cfg=cfg,
+                    created_at=created_at,
+                    run_id=run_id,
+                    stats=stats,
+                    metrics=metrics,
+                    batch_queue=batch_queue,
+                    progress=progress,
+                ) and cfg.max_rows is not None
+            if reached_limit:
+                break
+        metrics.encoder.add_busy(time.perf_counter() - flush_start)
 
 
 class _ShardWriter:
@@ -572,12 +742,21 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
     ds = _load_dataset(cfg)
     model = _load_model(cfg)
 
+    try:
+        model.max_seq_length = cfg.bucket_max_tokens
+    except Exception:
+        logging.debug("Unable to set model.max_seq_length explicitly; using model default.")
+
+    model_runner = _ModelRunner(model, cfg.compile_model, cfg.compile_mode)
+
     git_sha = _observe_git_sha()
 
     created_at = _iso_now()
     run_id = cfg.run_id or created_at.replace(":", "").replace("-", "")
 
-    row_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, cfg.batch_size * cfg.prefetch_batches))
+    max_bucket_batch = _effective_batch_size(cfg.bucket_min_tokens, cfg)
+
+    row_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, max_bucket_batch * cfg.prefetch_batches))
     batch_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, cfg.prefetch_batches))
 
     loader_state = ThreadState()
@@ -607,7 +786,7 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
 
     try:
         _embedding_pipeline(
-            model=model,
+            model_runner=model_runner,
             cfg=cfg,
             created_at=created_at,
             run_id=run_id,
@@ -708,6 +887,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", dest="device", default=None, help="Device map hint (e.g., 'cuda', 'auto')")
     parser.add_argument("--attention", dest="attention_impl", default="flash_attention_2", help="Attention implementation hint")
     parser.add_argument("--prefetch-batches", dest="prefetch_batches", type=int, default=4, help="Number of dataset batches to buffer ahead of the encoder")
+    parser.add_argument("--bucket-min-tokens", dest="bucket_min_tokens", type=int, default=128, help="Minimum sequence length bucket (tokens)")
+    parser.add_argument("--bucket-max-tokens", dest="bucket_max_tokens", type=int, default=32768, help="Maximum sequence length bucket (tokens)")
+    parser.add_argument("--tokens-per-batch", dest="tokens_per_batch", type=int, default=None, help="Target number of tokens per batch (overrides --batch-size when set)")
+    parser.add_argument("--compile-model", dest="compile_model", action="store_true", help="Enable torch.compile for the model forward pass")
+    parser.add_argument("--compile-mode", dest="compile_mode", default="default", help="torch.compile mode to use when compilation is enabled")
     parser.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress bars")
     parser.add_argument("--run-id", dest="run_id", default=None, help="Optional run identifier")
     parser.add_argument("--resume", dest="resume", action="store_true", help="Future placeholder for resuming runs")
@@ -738,6 +922,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         progress=args.progress,
         run_id=args.run_id,
         resume=args.resume,
+        bucket_min_tokens=args.bucket_min_tokens,
+        bucket_max_tokens=args.bucket_max_tokens,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
+        tokens_per_batch=args.tokens_per_batch,
     )
 
     run_sentence_transformer(cfg)
