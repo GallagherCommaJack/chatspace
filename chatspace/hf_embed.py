@@ -77,6 +77,7 @@ class SentenceTransformerConfig:
     run_id: Optional[str] = None
     max_rows_per_file: Optional[int] = None
     resume: bool = False
+    extract_first_assistant: bool = False
     model_kwargs: Dict[str, Any] = field(default_factory=dict)
     tokenizer_kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -202,6 +203,30 @@ def _observe_git_sha() -> Optional[str]:
         return None
 
 
+def _extract_first_assistant_response(conversation: List[Dict[str, Any]]) -> Optional[str]:
+    """Extract the first assistant response from a conversation list.
+
+    Args:
+        conversation: List of conversation turns with 'role' and 'content' fields
+
+    Returns:
+        The content of the first assistant response, or None if not found
+    """
+    if not isinstance(conversation, list):
+        return None
+
+    for turn in conversation:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role", "").lower()
+        if role in ("assistant", "model"):
+            content = turn.get("content")
+            if content:
+                return str(content).strip()
+
+    return None
+
+
 def _rows_from_dataset(ds: IterableDataset, cfg: SentenceTransformerConfig) -> Iterator[Dict[str, Any]]:
     for idx, row in enumerate(ds):
         if cfg.max_rows is not None and idx >= cfg.max_rows:
@@ -209,7 +234,22 @@ def _rows_from_dataset(ds: IterableDataset, cfg: SentenceTransformerConfig) -> I
         if cfg.seed is not None:
             # Deterministic hashing to decide keep/drop could be added here; for now no-op.
             pass
-        yield dict(row)
+
+        row_dict = dict(row)
+
+        # If extract_first_assistant is enabled, extract from conversation field
+        if cfg.extract_first_assistant and cfg.text_field in row_dict:
+            conversation = row_dict.get(cfg.text_field)
+            assistant_text = _extract_first_assistant_response(conversation)
+            if assistant_text:
+                # Store original conversation in metadata, replace text_field with extracted text
+                row_dict[f"_original_{cfg.text_field}"] = conversation
+                row_dict[cfg.text_field] = assistant_text
+            else:
+                # Skip rows without assistant responses
+                continue
+
+        yield row_dict
 
 
 def _compute_norms(embedding_batch: torch.Tensor) -> torch.Tensor:
@@ -579,6 +619,9 @@ def _encode_and_dispatch_batch(
         row["model"] = cfg.model_name
         row["created_at"] = created_at
         row["run_id"] = run_id
+        # Normalize text field: ensure embedded text is always in "text" column
+        if cfg.text_field != "text" and cfg.text_field in row:
+            row["text"] = row[cfg.text_field]
 
     batch_queue.put(EmbeddedBatch(rows=rows, embeddings=embeddings))
     return reached_limit
@@ -879,6 +922,10 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
     duration = time.time() - start_time
     metrics_summary = metrics.to_dict(duration)
     logging.info("Pipeline stage timings: %s", metrics_summary)
+    preprocessing_note = None
+    if cfg.extract_first_assistant:
+        preprocessing_note = f"Extracted first assistant response from '{cfg.text_field}' field; skipped rows without assistant responses"
+
     manifest = {
         "dataset": cfg.dataset,
         "subset": cfg.subset,
@@ -894,6 +941,7 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> Dict[str, Any]:
         "run_id": run_id,
         "min_norm": stats.min_norm,
         "max_norm": stats.max_norm,
+        "preprocessing": preprocessing_note,
         "run_config": _config_to_dict(cfg),
         "timings": metrics_summary,
     }

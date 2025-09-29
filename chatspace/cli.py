@@ -198,6 +198,7 @@ def handle_embed_hf(args: argparse.Namespace) -> None:
         tokens_per_batch=args.tokens_per_batch,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
+        extract_first_assistant=args.extract_first_assistant,
     )
 
     run_sentence_transformer(cfg)
@@ -247,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hf.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     p_hf.add_argument("--run-id", default=None, help="Optional run identifier")
     p_hf.add_argument("--resume", action="store_true", help="Resume if shards already exist (not yet implemented)")
+    p_hf.add_argument("--extract-first-assistant", action="store_true", help="Extract first assistant response from conversation field")
     p_hf.set_defaults(func=handle_embed_hf)
 
     return parser
