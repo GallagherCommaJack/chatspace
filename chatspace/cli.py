@@ -205,6 +205,80 @@ def handle_embed_hf(args: argparse.Namespace) -> None:
     run_sentence_transformer(cfg)
 
 
+def handle_reduce_embeddings(args: argparse.Namespace) -> None:
+    """Compute dimensionality reduction for embeddings."""
+    from .reduce_embeddings import (
+        load_embeddings_from_shards,
+        compute_reduction,
+        save_reduced_embeddings
+    )
+    import numpy as np
+
+    # Load embeddings from all specified directories
+    all_embeddings = []
+    all_texts = []
+    all_datasets = []
+
+    for emb_dir_str in args.embedding_dirs:
+        emb_dir = Path(emb_dir_str)
+        embeddings, texts, datasets = load_embeddings_from_shards(
+            emb_dir,
+            max_samples=args.max_samples,
+            sample_seed=args.sample_seed
+        )
+        all_embeddings.append(embeddings)
+        all_texts.extend(texts)
+        all_datasets.extend(datasets)
+
+    # Concatenate all embeddings
+    embeddings_combined = np.vstack(all_embeddings)
+    print(f"Total embeddings: {len(embeddings_combined)}")
+    print(f"Datasets: {set(all_datasets)}")
+
+    # Compute reduction
+    reduced = compute_reduction(
+        embeddings_combined,
+        method=args.method,
+        n_components=args.n_components,
+        seed=args.seed,
+        n_neighbors=args.n_neighbors,
+        min_dist=args.min_dist,
+        metric=args.metric,
+        perplexity=args.perplexity
+    )
+
+    # Save
+    metadata = {
+        "method": args.method,
+        "n_components": args.n_components,
+        "n_samples": len(reduced),
+        "datasets": list(set(all_datasets)),
+        "embedding_dirs": args.embedding_dirs,
+        "seed": args.seed,
+        "sample_seed": args.sample_seed,
+        "max_samples_per_dataset": args.max_samples,
+    }
+
+    save_reduced_embeddings(
+        Path(args.output),
+        reduced,
+        all_texts,
+        all_datasets,
+        metadata
+    )
+
+
+def handle_visualize_embeddings(args: argparse.Namespace) -> None:
+    """Launch interactive web viewer for reduced embeddings."""
+    from .visualize_embeddings import load_reduced_embeddings, create_app
+
+    df, metadata = load_reduced_embeddings(Path(args.input))
+    app = create_app(df, metadata)
+
+    print(f"Starting server on http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=args.debug)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chatspace", description="Dataset download and embedding toolkit")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -251,6 +325,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_hf.add_argument("--resume", action="store_true", help="Resume if shards already exist (not yet implemented)")
     p_hf.add_argument("--extract-first-assistant", action="store_true", help="Extract first assistant response from conversation field")
     p_hf.set_defaults(func=handle_embed_hf)
+
+    p_reduce = sub.add_parser("reduce-embeddings", help="Compute dimensionality reduction (UMAP/t-SNE) for embeddings")
+    p_reduce.add_argument("--embedding-dirs", nargs="+", required=True, help="Directories containing embedding shards (can specify multiple)")
+    p_reduce.add_argument("--output", required=True, help="Output path for reduced embeddings (parquet)")
+    p_reduce.add_argument("--method", choices=["umap", "tsne"], default="umap", help="Dimensionality reduction method")
+    p_reduce.add_argument("--n-components", type=int, default=2, help="Output dimensionality (2 or 3)")
+    p_reduce.add_argument("--max-samples", type=int, default=None, help="Maximum samples per dataset to load")
+    p_reduce.add_argument("--sample-seed", type=int, default=42, help="Random seed for sampling")
+    p_reduce.add_argument("--seed", type=int, default=42, help="Random seed for reduction algorithm")
+    p_reduce.add_argument("--n-neighbors", type=int, default=15, help="UMAP: number of neighbors")
+    p_reduce.add_argument("--min-dist", type=float, default=0.1, help="UMAP: minimum distance")
+    p_reduce.add_argument("--metric", default="cosine", help="Distance metric")
+    p_reduce.add_argument("--perplexity", type=float, default=30, help="t-SNE: perplexity parameter")
+    p_reduce.set_defaults(func=handle_reduce_embeddings)
+
+    p_viz = sub.add_parser("visualize-embeddings", help="Launch interactive web viewer for reduced embeddings")
+    p_viz.add_argument("--input", required=True, help="Path to reduced embeddings parquet file")
+    p_viz.add_argument("--host", default="127.0.0.1", help="Host to bind to")
+    p_viz.add_argument("--port", type=int, default=8050, help="Port to bind to")
+    p_viz.add_argument("--debug", action="store_true", help="Enable debug mode")
+    p_viz.set_defaults(func=handle_visualize_embeddings)
 
     return parser
 
