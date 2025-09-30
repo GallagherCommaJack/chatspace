@@ -55,7 +55,17 @@ bash runs/fineweb-10BT.sh
 
 ### Core Modules
 
-- `chatspace/hf_embed.py`: Full-featured embedding pipeline for SentenceTransformer models
+- `chatspace/hf_embed/`: Full-featured embedding pipeline for SentenceTransformer models (modular package)
+  - `config.py`: `SentenceTransformerConfig` dataclass with validation
+  - `dataset.py`: Dataset loading, conversation extraction, row streaming
+  - `model.py`: `_ModelRunner` class for tokenization, inference, warmup, and compilation
+  - `bucketing.py`: Token bucketing (`_BucketBuffer`), batch sizing, padding logic
+  - `pipeline.py`: Main orchestration (`run_sentence_transformer`), threading, encoder loop
+  - `writer.py`: `_ShardWriter` for Parquet I/O, manifest generation
+  - `metrics.py`: `PipelineStats`, `StageTimings`, `PipelineMetrics` for performance tracking
+  - `utils.py`: Pure utility functions (paths, checksums, git SHA, ISO timestamps)
+
+  **Key features:**
   - Streaming dataset loader with deterministic sampling
   - Token-based bucketing (power-of-2 sizes from `bucket_min_tokens` to `bucket_max_tokens`)
   - Adaptive batch sizing based on `tokens_per_batch` (overrides `batch_size` when set)

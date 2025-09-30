@@ -41,4 +41,10 @@ build-backend = "setuptools.build_meta"
 chatspace = "chatspace.cli:main"
 
 [dependency-groups]
-dev = [ "ipykernel>=6.30.1", "ipywidgets>=8.1.7", "matplotlib>=3.10.6" ]
+dev = [
+ "ipykernel>=6.30.1",
+ "ipywidgets>=8.1.7",
+ "matplotlib>=3.10.6",
+ "pytest>=8.4.2",
+ "pytest-mock>=3.15.1",
+]
