@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import time
+from queue import Full
 from typing import Any, Optional
 
 from .bucketing import (
@@ -16,7 +17,7 @@ from .bucketing import (
 )
 from .config import SentenceTransformerConfig
 from .dataset import _load_dataset, _rows_from_dataset
-from .metrics import PipelineMetrics, PipelineStats
+from .metrics import PipelineStats, StatsUpdate
 from .model import _ModelRunner, _load_model
 from .orchestrator import ProcessController, ProgressUpdate
 from .utils import (
@@ -26,7 +27,7 @@ from .utils import (
     _observe_git_sha,
     _prepare_paths,
 )
-from .writer import EmbeddedBatch, ProcessState, _ShardWriter, write_manifest
+from .writer import EmbeddedBatch, _ShardWriter, write_manifest
 
 # Sentinel for signaling process shutdown
 _STOP = object()
@@ -37,26 +38,44 @@ def _dataset_loader_worker(
     row_queue: mp.Queue[Any],
     error_queue: mp.Queue[tuple[str, Exception]],
     shutdown_event: mp.Event,
-    metrics: PipelineMetrics,
 ) -> None:
     """Background process for loading dataset rows."""
     try:
         ds = _load_dataset(cfg)
-        last_timestamp = time.perf_counter()
         for row in _rows_from_dataset(ds, cfg):
             if shutdown_event.is_set():
                 break
-            before_put = time.perf_counter()
-            metrics.loader.add_busy(before_put - last_timestamp)
             row_queue.put(row)
-            after_put = time.perf_counter()
-            metrics.loader.add_idle(after_put - before_put)
-            last_timestamp = after_put
     except Exception as exc:
         logging.exception("Loader process error")
         error_queue.put(("loader", exc))
     finally:
         row_queue.put(_STOP)
+
+
+def _send_stats_update(stats_queue: Optional[mp.Queue[Any]], **kwargs: Any) -> None:
+    """Send a stats update to the controller, logging if the queue is full."""
+    if stats_queue is None:
+        return
+
+    try:
+        stats_queue.put_nowait(StatsUpdate(**kwargs))
+    except Full:
+        logging.warning("Stats queue full; dropping stats update: %s", kwargs)
+    except Exception:
+        logging.debug("Failed to enqueue stats update", exc_info=True)
+
+
+def _apply_stats_update(stats: PipelineStats, update: StatsUpdate) -> None:
+    """Apply a stats update received from the encoder."""
+    if update.rows_processed > 0:
+        stats.register_rows(update.rows_processed)
+    if update.rows_skipped > 0:
+        stats.register_skipped(update.rows_skipped)
+    if update.embedding_dim is not None:
+        stats.update_embedding_dim(update.embedding_dim)
+    if update.min_norm is not None or update.max_norm is not None:
+        stats.update_norm_bounds(update.min_norm, update.max_norm)
 
 
 def _encode_and_dispatch_batch(
@@ -66,24 +85,27 @@ def _encode_and_dispatch_batch(
     cfg: SentenceTransformerConfig,
     created_at: str,
     run_id: str,
-    stats: PipelineStats,
-    metrics: PipelineMetrics,
     batch_queue: mp.Queue[Any],
     progress_queue: Optional[mp.Queue[Any]],
-) -> bool:
-    """Encode a batch and dispatch to writer. Returns True if max_rows limit reached."""
+    stats_queue: Optional[mp.Queue[Any]],
+    rows_processed_so_far: int,
+) -> tuple[bool, int]:
+    """Encode a batch and dispatch to writer. Returns (reached_limit, num_rows_processed)."""
+    # Import torch here (after CLI startup, but within encoder process)
+    import torch
+
     rows = [dict(row) for row in token_batch.rows]
     if not rows:
-        return False
+        return False, 0
 
     features = {key: value for key, value in token_batch.features.items()}
 
     remaining: Optional[int] = None
     reached_limit = False
     if cfg.max_rows is not None:
-        remaining = max(cfg.max_rows - stats.total_rows, 0)
+        remaining = max(cfg.max_rows - rows_processed_so_far, 0)
         if remaining <= 0:
-            return True
+            return True, 0
         if len(rows) > remaining:
             rows = rows[:remaining]
             features = {key: value[:remaining] for key, value in features.items()}
@@ -91,26 +113,30 @@ def _encode_and_dispatch_batch(
 
     num_rows = len(rows)
     if num_rows == 0:
-        return True if cfg.max_rows is not None and remaining == 0 else reached_limit
+        return (True if cfg.max_rows is not None and remaining == 0 else reached_limit), 0
 
-    encode_start = time.perf_counter()
     with torch.inference_mode():
         outputs = model_runner.forward(features)
-    metrics.add_encoder_encode(time.perf_counter() - encode_start)
 
     embeddings = outputs.get("sentence_embedding")
     if embeddings is None:
         raise ValueError("Model forward pass did not return 'sentence_embedding'.")
     embeddings = embeddings.detach()[:num_rows]
 
-    stats.update_embedding_dim(embeddings.shape[1])
+    embedding_dim = embeddings.shape[1]
 
     norms_tensor = _compute_norms(embeddings)
     batch_min_norm = float(norms_tensor.min().item()) if norms_tensor.numel() > 0 else None
     batch_max_norm = float(norms_tensor.max().item()) if norms_tensor.numel() > 0 else None
 
-    stats.register_rows(num_rows)
-    stats.update_norm_bounds(batch_min_norm, batch_max_norm)
+    # Send stats update to controller
+    _send_stats_update(
+        stats_queue,
+        rows_processed=num_rows,
+        embedding_dim=embedding_dim,
+        min_norm=batch_min_norm,
+        max_norm=batch_max_norm,
+    )
 
     # Send progress update to controller
     if progress_queue is not None:
@@ -128,7 +154,7 @@ def _encode_and_dispatch_batch(
             row["text"] = row[cfg.text_field]
 
     batch_queue.put(EmbeddedBatch(rows=rows, embeddings=embeddings))
-    return reached_limit
+    return reached_limit, num_rows
 
 
 def _encoder_worker(
@@ -138,10 +164,9 @@ def _encoder_worker(
     row_queue: mp.Queue[Any],
     batch_queue: mp.Queue[Any],
     progress_queue: mp.Queue[Any],
+        stats_queue: Optional[mp.Queue[Any]],
     error_queue: mp.Queue[tuple[str, Exception]],
     shutdown_event: mp.Event,
-    stats: PipelineStats,
-    metrics: PipelineMetrics,
 ) -> None:
     """Encoder process: load model, tokenize, bucket, batch, encode, dispatch."""
     try:
@@ -150,6 +175,9 @@ def _encoder_worker(
 
         # Enable tf32 tensor cores
         torch.set_float32_matmul_precision('high')
+
+        # Track rows processed locally for max_rows enforcement
+        rows_processed_total = 0
 
         # Load model inside the encoder process
         logging.info("Encoder process: loading model %s", cfg.model_name)
@@ -173,35 +201,29 @@ def _encoder_worker(
         reached_limit = False
 
         while not shutdown_event.is_set():
-            wait_start = time.perf_counter()
             try:
                 item = row_queue.get(timeout=0.1)
             except Exception:
                 continue
-            wait_end = time.perf_counter()
-            metrics.encoder.add_idle(wait_end - wait_start)
 
             if item is _STOP:
                 break
 
-            busy_start = time.perf_counter()
-
             if reached_limit:
-                metrics.encoder.add_busy(time.perf_counter() - busy_start)
                 continue
 
             text_value = str(item.get(cfg.text_field, ""))
             if not text_value:
-                stats.register_skipped()
-                metrics.encoder.add_busy(time.perf_counter() - busy_start)
+                # Send skipped row update
+                _send_stats_update(stats_queue, rows_skipped=1)
                 continue
 
             try:
                 tokenized = model_runner.tokenize(text_value, max_length=cfg.bucket_max_tokens)
             except Exception as exc:
                 logging.warning("Failed to tokenize row: %s", exc)
-                stats.register_skipped()
-                metrics.encoder.add_busy(time.perf_counter() - busy_start)
+                # Send skipped row update
+                _send_stats_update(stats_queue, rows_skipped=1)
                 continue
 
             if "attention_mask" not in tokenized and "input_ids" in tokenized:
@@ -209,8 +231,8 @@ def _encoder_worker(
 
             seq_length = _token_sequence_length(tokenized)
             if seq_length == 0:
-                stats.register_skipped()
-                metrics.encoder.add_busy(time.perf_counter() - busy_start)
+                # Send skipped row update
+                _send_stats_update(stats_queue, rows_skipped=1)
                 continue
 
             bucket_size = _select_bucket_size(seq_length, cfg)
@@ -222,23 +244,22 @@ def _encoder_worker(
                 token_batch = bucket.pop(batch_target, model_runner.pad_values)
                 if token_batch is None:
                     break
-                reached_limit = _encode_and_dispatch_batch(
+                limit_reached, num_processed = _encode_and_dispatch_batch(
                     token_batch,
                     model_runner=model_runner,
                     cfg=cfg,
                     created_at=created_at,
                     run_id=run_id,
-                    stats=stats,
-                    metrics=metrics,
                     batch_queue=batch_queue,
                     progress_queue=progress_queue,
-                ) and cfg.max_rows is not None
-
-            metrics.encoder.add_busy(time.perf_counter() - busy_start)
+                    stats_queue=stats_queue,
+                    rows_processed_so_far=rows_processed_total,
+                )
+                rows_processed_total += num_processed
+                reached_limit = limit_reached and cfg.max_rows is not None
 
         # Flush remaining buckets
         if not reached_limit and not shutdown_event.is_set():
-            flush_start = time.perf_counter()
             for bucket_size in sorted(buckets):
                 bucket = buckets[bucket_size]
                 batch_target = _effective_batch_size(bucket_size, cfg)
@@ -247,20 +268,21 @@ def _encoder_worker(
                     token_batch = bucket.pop(count, model_runner.pad_values)
                     if token_batch is None:
                         break
-                    reached_limit = _encode_and_dispatch_batch(
+                    limit_reached, num_processed = _encode_and_dispatch_batch(
                         token_batch,
                         model_runner=model_runner,
                         cfg=cfg,
                         created_at=created_at,
                         run_id=run_id,
-                        stats=stats,
-                        metrics=metrics,
                         batch_queue=batch_queue,
                         progress_queue=progress_queue,
-                    ) and cfg.max_rows is not None
+                        stats_queue=stats_queue,
+                        rows_processed_so_far=rows_processed_total,
+                    )
+                    rows_processed_total += num_processed
+                    reached_limit = limit_reached and cfg.max_rows is not None
                 if reached_limit:
                     break
-            metrics.encoder.add_busy(time.perf_counter() - flush_start)
 
     except Exception as exc:
         logging.exception("Encoder process error")
@@ -301,12 +323,12 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
     row_queue: mp.Queue[Any] = ctx.Queue(maxsize=max(1, max_bucket_batch * cfg.prefetch_batches))
     batch_queue: mp.Queue[Any] = ctx.Queue(maxsize=max(1, cfg.prefetch_batches))
     progress_queue: mp.Queue[Any] = ctx.Queue(maxsize=100)
+    stats_queue = ctx.Queue(maxsize=100)
     error_queue: mp.Queue[tuple[str, Exception]] = ctx.Queue()
     shard_metadata_queue: mp.Queue[Any] = ctx.Queue(maxsize=1)
     shutdown_event = ctx.Event()
 
-    # Shared metrics and stats with process-safe locks
-    metrics = PipelineMetrics()
+    # Parent-side stats (will be populated from stats_queue)
     stats = PipelineStats()
 
     # Create process controller
@@ -316,7 +338,7 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
     # Create loader process
     loader_process = ctx.Process(
         target=_dataset_loader_worker,
-        args=(cfg, row_queue, error_queue, shutdown_event, metrics),
+        args=(cfg, row_queue, error_queue, shutdown_event),
         name="dataset-loader",
     )
     controller.register_process("loader", loader_process)
@@ -331,10 +353,9 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
             row_queue,
             batch_queue,
             progress_queue,
+            stats_queue,
             error_queue,
             shutdown_event,
-            stats,
-            metrics,
         ),
         name="encoder",
     )
@@ -342,10 +363,9 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
 
     # Create writer process
     shard_writer = _ShardWriter(cfg, paths, git_sha)
-    writer_state = ProcessState()
     writer_process = ctx.Process(
         target=shard_writer.run,
-        args=(batch_queue, _STOP, writer_state, metrics, shard_metadata_queue),
+        args=(batch_queue, _STOP, shard_metadata_queue, error_queue),
         name="shard-writer",
     )
     controller.register_process("writer", writer_process)
@@ -354,26 +374,40 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
     progress = controller.create_progress_bar(disable=not cfg.progress, unit="rows")
 
     def main_work() -> None:
-        """Main work: monitor progress and check for errors."""
-        # Monitor progress updates
+        """Main work: monitor progress, stats, and check for errors."""
+        from .metrics import StatsUpdate
+
+        # Monitor progress and stats updates
         while not shutdown_event.is_set():
+            # Poll progress queue
             try:
-                msg = progress_queue.get(timeout=0.5)
+                msg = progress_queue.get(timeout=0.1)
                 if msg is _STOP:
                     break
                 if isinstance(msg, ProgressUpdate):
                     controller.update_progress(msg.rows_processed)
             except Exception:
-                # Check if all processes are done
-                if not any(p.is_alive() for p in [loader_process, encoder_process, writer_process]):
-                    break
-                # Check for errors
-                try:
-                    stage, exc = error_queue.get_nowait()
-                    raise RuntimeError(f"Process {stage} failed: {exc}") from exc
-                except Exception:
-                    pass
-                continue
+                pass
+
+            # Poll stats queue
+            try:
+                while True:
+                    update = stats_queue.get_nowait()
+                    if isinstance(update, StatsUpdate):
+                        _apply_stats_update(stats, update)
+            except Exception:
+                pass
+
+            # Check if all processes are done
+            if not any(p.is_alive() for p in [loader_process, encoder_process, writer_process]):
+                break
+
+            # Check for errors
+            try:
+                stage, exc = error_queue.get_nowait()
+                raise RuntimeError(f"Process {stage} failed: {exc}") from exc
+            except Exception:
+                pass
 
     try:
         controller.run_with_monitoring(main_work)
@@ -381,6 +415,15 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
         logging.error("Pipeline failed: %s", exc)
         raise
     finally:
+        # Drain any remaining stats updates
+        try:
+            while not stats_queue.empty():
+                update = stats_queue.get_nowait()
+                if isinstance(update, StatsUpdate):
+                    _apply_stats_update(stats, update)
+        except Exception:
+            pass
+
         # Check for any errors in queue
         try:
             while not error_queue.empty():
@@ -397,14 +440,12 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
         shards = []
 
     duration = time.time() - start_time
-    logging.info("Pipeline stage timings: %s", metrics.to_dict(duration))
 
     write_manifest(
         cfg=cfg,
         paths=paths,
         shards=shards,
         stats=stats,
-        metrics=metrics,
         created_at=created_at,
         run_id=run_id,
         duration=duration,

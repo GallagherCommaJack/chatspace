@@ -13,3 +13,6 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# network drive mount symlink
+workspace

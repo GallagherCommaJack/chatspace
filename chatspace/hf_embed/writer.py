@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -16,7 +15,6 @@ import torch
 from chatspace import __version__ as CHATSPACE_VERSION
 
 from .config import SentenceTransformerConfig
-from .metrics import PipelineMetrics
 from .utils import _compute_sha256, _iso_now
 
 
@@ -26,13 +24,6 @@ class EmbeddedBatch:
 
     rows: list[dict[str, Any]]
     embeddings: torch.Tensor
-
-
-@dataclass
-class ProcessState:
-    """Shared state for tracking process errors."""
-
-    error: Optional[BaseException] = None
 
 
 class _ShardWriter:
@@ -56,35 +47,32 @@ class _ShardWriter:
         self,
         batch_queue: mp.Queue[Any],
         stop_token: Any,
-        state: ProcessState,
-        metrics: PipelineMetrics,
         shard_metadata_queue: Optional[mp.Queue[Any]] = None,
+        error_queue: Optional[mp.Queue[tuple[str, Exception]]] = None,
     ) -> None:
         """Run writer loop in background process."""
         try:
             while True:
-                wait_start = time.perf_counter()
                 item = batch_queue.get()
-                wait_end = time.perf_counter()
-                metrics.writer.add_idle(wait_end - wait_start)
 
                 if item is stop_token:
                     break
 
-                busy_start = time.perf_counter()
                 self._append_batch(item)
-                metrics.writer.add_busy(time.perf_counter() - busy_start)
 
-            busy_start = time.perf_counter()
             self._flush_remaining()
-            metrics.writer.add_busy(time.perf_counter() - busy_start)
 
             # Send shard metadata back to main process
             if shard_metadata_queue is not None:
                 shard_metadata_queue.put(self._shards)
 
         except BaseException as exc:  # noqa: BLE001
-            state.error = exc
+            # Propagate error to parent process
+            if error_queue is not None and isinstance(exc, Exception):
+                try:
+                    error_queue.put(("writer", exc))
+                except Exception:
+                    pass  # Best effort
 
     def _append_batch(self, batch: EmbeddedBatch) -> None:
         """Append a batch to the current accumulator."""
@@ -167,7 +155,6 @@ def write_manifest(
     paths: dict[str, Path],
     shards: list[dict[str, Any]],
     stats: Any,
-    metrics: Any,
     created_at: str,
     run_id: str,
     duration: float,
@@ -177,8 +164,6 @@ def write_manifest(
     preprocessing_note = None
     if cfg.extract_first_assistant:
         preprocessing_note = f"Extracted first assistant response from '{cfg.text_field}' field; skipped rows without assistant responses"
-
-    metrics_summary = metrics.to_dict(duration)
 
     manifest = {
         "dataset": cfg.dataset,
@@ -197,7 +182,6 @@ def write_manifest(
         "max_norm": stats.max_norm,
         "preprocessing": preprocessing_note,
         "run_config": _config_to_dict(cfg),
-        "timings": metrics_summary,
     }
 
     manifest_path = paths["manifest_path"]
@@ -221,7 +205,6 @@ def write_manifest(
         "min_norm": stats.min_norm,
         "max_norm": stats.max_norm,
         "tool_version": CHATSPACE_VERSION,
-        "timings": metrics_summary,
     }
 
     run_path = paths["run_path"]
