@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -42,11 +42,11 @@ class PipelineStats:
 
 @dataclass
 class StageTimings:
-    """Thread-safe timing statistics for a pipeline stage."""
+    """Process-safe timing statistics for a pipeline stage."""
 
     busy_seconds: float = 0.0
     idle_seconds: float = 0.0
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _lock: mp.Lock = field(default_factory=mp.Lock, init=False, repr=False)
 
     def add_busy(self, delta: float) -> None:
         """Add busy time (doing work)."""
@@ -82,7 +82,7 @@ class PipelineMetrics:
     loader: StageTimings = field(default_factory=StageTimings)
     encoder: StageTimings = field(default_factory=StageTimings)
     writer: StageTimings = field(default_factory=StageTimings)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _lock: mp.Lock = field(default_factory=mp.Lock, init=False, repr=False)
     encoder_encode_seconds: float = 0.0
 
     def add_encoder_encode(self, delta: float) -> None:

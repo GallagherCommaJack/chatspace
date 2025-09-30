@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .env import load_environment, get_env
-from .hf_embed import SentenceTransformerConfig, run_sentence_transformer
 
 
 def _iso_now() -> str:
@@ -175,6 +174,8 @@ def handle_embed_dataset(args: argparse.Namespace) -> None:
 
 def handle_embed_hf(args: argparse.Namespace) -> None:
     """Embed a dataset using a local/hosted SentenceTransformer model."""
+    # Lazy import to keep CLI startup fast
+    from .hf_embed import SentenceTransformerConfig, run_sentence_transformer
 
     cfg = SentenceTransformerConfig(
         dataset=args.dataset,

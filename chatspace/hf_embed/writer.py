@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import queue
+import multiprocessing as mp
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -29,8 +29,8 @@ class EmbeddedBatch:
 
 
 @dataclass
-class ThreadState:
-    """Shared state for tracking thread errors."""
+class ProcessState:
+    """Shared state for tracking process errors."""
 
     error: Optional[BaseException] = None
 
@@ -52,8 +52,15 @@ class _ShardWriter:
         """Return list of shard metadata."""
         return self._shards
 
-    def run(self, batch_queue: queue.Queue[Any], stop_token: Any, state: ThreadState, metrics: PipelineMetrics) -> None:
-        """Run writer loop in background thread."""
+    def run(
+        self,
+        batch_queue: mp.Queue[Any],
+        stop_token: Any,
+        state: ProcessState,
+        metrics: PipelineMetrics,
+        shard_metadata_queue: Optional[mp.Queue[Any]] = None,
+    ) -> None:
+        """Run writer loop in background process."""
         try:
             while True:
                 wait_start = time.perf_counter()
@@ -71,6 +78,11 @@ class _ShardWriter:
             busy_start = time.perf_counter()
             self._flush_remaining()
             metrics.writer.add_busy(time.perf_counter() - busy_start)
+
+            # Send shard metadata back to main process
+            if shard_metadata_queue is not None:
+                shard_metadata_queue.put(self._shards)
+
         except BaseException as exc:  # noqa: BLE001
             state.error = exc
 
