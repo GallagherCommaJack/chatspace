@@ -17,6 +17,7 @@ dependencies = [
     "torch>=2.8.0",
     "tqdm>=4.67.1",
     "transformers>=4.56.2",
+    "trl>=0.23.1",
     "umap-learn>=0.5.7",
 ]
 description = "Add your description here"
