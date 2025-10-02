@@ -306,14 +306,28 @@ def main():
         if model_errors:
             print(f"✗ {len(model_errors)} errors")
 
+    # Load existing stats if file exists (for merging multiple runs)
+    existing_stats = {}
+    if args.output_json.exists():
+        try:
+            with open(args.output_json, "r") as f:
+                existing_data = json.load(f)
+                existing_stats = existing_data.get("datasets", {})
+            print(f"\nMerging with {len(existing_stats)} existing datasets")
+        except Exception:
+            pass
+
+    # Merge with existing
+    existing_stats.update(all_stats)
+
     # Save results
     output = {
         "metadata": {
-            "total_datasets": len(all_stats),
+            "total_datasets": len(existing_stats),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "git_sha": get_git_sha(),
         },
-        "datasets": all_stats,
+        "datasets": existing_stats,
     }
 
     if all_errors:
