@@ -10,3 +10,4 @@
 
 ## 2025-10-03 (Later)
 - Smoke-tested the steering pipeline with `Qwen/Qwen3-0.6B` on the analytical trait: 1 epoch (~100k tokens) completed in ~2.4s with gradient checkpointing enabled, confirming the CLI changes and lightweight checkpoint path. Run artifacts (`steering_vector.pt`, `steering_config.json`) stored under `/workspace/steering_runs/qwen3-0.6b_analytical_epoch1` and reload successfully via `QwenSteerModel.from_pretrained`.
+- Reran the analytical trait training with `Qwen/Qwen2.5-32B-Instruct` after disabling intermediate checkpoint saves. Run completed in ~30s for ~100k tokens, producing only the steering vector + config at `/workspace/steering_runs/qwen-3-32b__trait__analytical_epoch1`. Verified reload and vector norm (≈0.73).

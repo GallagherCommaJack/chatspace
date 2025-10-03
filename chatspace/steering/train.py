@@ -102,12 +102,14 @@ def build_trainer(args) -> SFTTrainer:
         bf16=getattr(args, "bf16", False),
         num_train_epochs=getattr(args, "num_epochs", 1.0),
         logging_steps=10,
-        save_strategy="epoch",
+        save_strategy="no",
         eval_strategy="no",
         warmup_ratio=args.warmup_ratio,
         report_to=[],
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
+        save_only_model=True,
+        save_total_limit=1,
         # NOTE: assistant_only_loss disabled - Qwen tokenizer doesn't support {% generation %}
         # assistant_only_loss=True,
     )
