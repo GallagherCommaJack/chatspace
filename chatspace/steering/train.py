@@ -72,7 +72,9 @@ def build_trainer(args) -> SFTTrainer:
         eval_strategy="no",
         warmup_ratio=args.warmup_ratio,
         report_to=[],
-        assistant_only_loss=True,
+        gradient_checkpointing=False,  # Disable - only steering vector is trainable
+        # Disabled: Qwen tokenizer doesn't support {% generation %} in chat template
+        # assistant_only_loss=True,
     )
 
     trainer = SFTTrainer(
