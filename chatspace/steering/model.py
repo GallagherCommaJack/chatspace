@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -76,4 +78,41 @@ class QwenSteerModel(nn.Module):
         """Proxy gradient checkpointing to base model."""
         return self.model.gradient_checkpointing_disable(*args, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+
+    def save_pretrained(self, save_directory: str | Path, **_) -> None:
+        """Persist only the steering vector and configuration."""
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+
+        vector_path = path / "steering_vector.pt"
+        torch.save({"steering_vector": self.steering.vector.detach().cpu()}, vector_path)
+
+        config_path = path / "steering_config.json"
+        with config_path.open("w", encoding="utf-8") as fh:
+            json.dump(asdict(self.cfg), fh, indent=2)
+
+    @classmethod
+    def from_pretrained(cls, save_directory: str | Path, **model_kwargs) -> "QwenSteerModel":
+        path = Path(save_directory)
+        config_path = path / "steering_config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing steering configuration at {config_path}")
+        with config_path.open("r", encoding="utf-8") as fh:
+            cfg_dict = json.load(fh)
+
+        cfg = SteeringVectorConfig(**cfg_dict)
+        model = cls(cfg, **model_kwargs)
+
+        vector_path = path / "steering_vector.pt"
+        if vector_path.exists():
+            state = torch.load(vector_path, map_location="cpu")
+            tensor = state.get("steering_vector")
+            if tensor is None:
+                raise ValueError(f"steering_vector.pt missing 'steering_vector' key at {vector_path}")
+            model.steering.vector.data.copy_(tensor)
+
+        return model
 
