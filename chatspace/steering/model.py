@@ -55,6 +55,14 @@ class QwenSteerModel(nn.Module):
         def hook_fn(module, args, output):
             # output is a tuple: (hidden_states, *optional_outputs)
             hidden_states = output[0] if isinstance(output, tuple) else output
+            if (
+                self.steering.vector.device != hidden_states.device
+                or self.steering.vector.dtype != hidden_states.dtype
+            ):
+                with torch.no_grad():
+                    self.steering.vector.data = self.steering.vector.data.to(
+                        device=hidden_states.device, dtype=hidden_states.dtype
+                    )
             steered = self.steering(hidden_states)
             # Return tuple in same format as input
             if isinstance(output, tuple):
@@ -115,4 +123,3 @@ class QwenSteerModel(nn.Module):
             model.steering.vector.data.copy_(tensor)
 
         return model
-
