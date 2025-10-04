@@ -28,6 +28,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-accumulation", type=int, default=16, help="Gradient accumulation steps")
     parser.add_argument("--max-length", type=int, default=4096, help="Max tokens per sequence")
     parser.add_argument("--target-tokens", type=int, default=100_000, help="Total training tokens")
+    parser.add_argument("--val-target-tokens", type=int, default=0, help="Validation tokens (0 disables split)")
     parser.add_argument("--role-score", type=int, default=3, help="Minimum role extract_score")
     parser.add_argument("--trait-score", type=int, default=75, help="Minimum trait extract_score")
     parser.add_argument("--warmup-ratio", type=float, default=0.05, help="Warmup ratio for scheduler")
@@ -50,13 +51,19 @@ def build_argparser() -> argparse.ArgumentParser:
         default=10,
         help="Frequency (in optimizer steps) for Trainer logging",
     )
+    parser.add_argument(
+        "--lr-scheduler",
+        default="constant",
+        choices=["constant", "linear", "cosine", "cosine_with_restarts", "polynomial"],
+        help="Learning rate scheduler type",
+    )
     return parser
 
 
 def prepare_dataset(args, tokenizer) -> Dataset:
     cfg = PersonaSteeringDatasetConfig(
         dataset_names=args.datasets,
-        target_tokens=args.target_tokens,
+        target_tokens=args.target_tokens + max(args.val_target_tokens, 0),
         seed=args.seed,
         tokenizer_name=args.model,
         max_length=args.max_length,
@@ -73,13 +80,42 @@ def build_trainer(args) -> SFTTrainer:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    train_dataset = prepare_dataset(args, tokenizer)
-    token_lengths = train_dataset["length"]
-    total_tokens = int(sum(token_lengths))
-    print(
-        f"Prepared dataset with {len(train_dataset)} sequences / {total_tokens} tokens "
-        f"(target {args.target_tokens})."
+    full_dataset = prepare_dataset(args, tokenizer)
+    token_lengths = list(full_dataset["length"])
+
+    target_tokens = args.target_tokens
+    val_tokens = max(args.val_target_tokens, 0)
+    cumulative = 0
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for idx, length in enumerate(token_lengths):
+        cumulative += int(length)
+        if cumulative <= target_tokens:
+            train_indices.append(idx)
+        elif val_tokens > 0 and cumulative <= target_tokens + val_tokens:
+            val_indices.append(idx)
+        else:
+            break
+
+    if not train_indices:
+        raise ValueError("Unable to allocate any training examples; increase target tokens or relax filters")
+
+    train_dataset = full_dataset.select(train_indices)
+    train_tokens = sum(int(full_dataset[i]["length"]) for i in train_indices)
+
+    val_dataset = None
+    val_selected_tokens = 0
+    if val_indices:
+        val_dataset = full_dataset.select(val_indices)
+        val_selected_tokens = sum(int(full_dataset[i]["length"]) for i in val_indices)
+
+    msg = (
+        f"Prepared dataset with {len(train_dataset)} train sequences / {train_tokens} tokens"
     )
+    if val_dataset is not None:
+        msg += f"; validation {len(val_dataset)} sequences / {val_selected_tokens} tokens"
+    print(msg + ".")
 
     model_cfg = SteeringVectorConfig(
         model_name=args.model,
@@ -103,9 +139,12 @@ def build_trainer(args) -> SFTTrainer:
 
     gradient_checkpointing = getattr(args, "gradient_checkpointing", False)
 
+    eval_strategy = "epoch" if val_dataset is not None else "no"
+
     sft_config = SFTConfig(
         output_dir=str(args.output_dir),
         seed=args.seed,
+        do_eval=val_dataset is not None,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation,
@@ -114,11 +153,12 @@ def build_trainer(args) -> SFTTrainer:
         num_train_epochs=getattr(args, "num_epochs", 1.0),
         logging_steps=max(1, args.logging_steps),
         save_strategy="no",
-        eval_strategy="no",
+        eval_strategy=eval_strategy,
         warmup_ratio=args.warmup_ratio,
         report_to=[],
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
+        lr_scheduler_type=args.lr_scheduler,
         save_only_model=True,
         save_total_limit=1,
         # NOTE: assistant_only_loss disabled - Qwen tokenizer doesn't support {% generation %}
@@ -129,6 +169,7 @@ def build_trainer(args) -> SFTTrainer:
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         processing_class=tokenizer,
     )
 
@@ -151,6 +192,9 @@ def main(argv: list[str] | None = None) -> None:
 
     trainer = build_trainer(args)
     trainer.train()
+    if getattr(trainer, "eval_dataset", None) is not None:
+        eval_metrics = trainer.evaluate()
+        print("Validation metrics:", eval_metrics)
     trainer.save_state()
     trainer.save_model()
 
