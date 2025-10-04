@@ -23,6 +23,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--target-layer", type=int, default=22, help="Residual layer index for steering")
     parser.add_argument("--seed", type=int, default=17, help="Random seed")
     parser.add_argument("--learning-rate", type=float, default=5e-4, help="Learning rate for steering vector")
+    parser.add_argument("--init-scale", type=float, default=0.0, help="Initialization scale for steering vector")
     parser.add_argument("--batch-size", type=int, default=4, help="Per-device train batch size")
     parser.add_argument("--gradient-accumulation", type=int, default=16, help="Gradient accumulation steps")
     parser.add_argument("--max-length", type=int, default=4096, help="Max tokens per sequence")
@@ -42,6 +43,12 @@ def build_argparser() -> argparse.ArgumentParser:
         "--device-map",
         default="auto",
         help="Device map passed to base model loading (e.g. 'auto', 'cuda', 'cpu').",
+    )
+    parser.add_argument(
+        "--logging-steps",
+        type=int,
+        default=10,
+        help="Frequency (in optimizer steps) for Trainer logging",
     )
     return parser
 
@@ -74,7 +81,11 @@ def build_trainer(args) -> SFTTrainer:
         f"(target {args.target_tokens})."
     )
 
-    model_cfg = SteeringVectorConfig(model_name=args.model, target_layer=args.target_layer)
+    model_cfg = SteeringVectorConfig(
+        model_name=args.model,
+        target_layer=args.target_layer,
+        init_scale=args.init_scale,
+    )
     device_map = args.device_map
     model_kwargs: dict[str, object] = {"torch_dtype": "auto"}
     if device_map == "cuda":
@@ -101,7 +112,7 @@ def build_trainer(args) -> SFTTrainer:
         max_steps=getattr(args, "max_steps", -1),
         bf16=getattr(args, "bf16", False),
         num_train_epochs=getattr(args, "num_epochs", 1.0),
-        logging_steps=10,
+        logging_steps=max(1, args.logging_steps),
         save_strategy="no",
         eval_strategy="no",
         warmup_ratio=args.warmup_ratio,

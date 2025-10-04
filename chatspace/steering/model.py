@@ -17,7 +17,11 @@ class ResidualHook(nn.Module):
 
     def __init__(self, hidden_size: int, init_scale: float = 0.01) -> None:
         super().__init__()
-        self.vector = nn.Parameter(torch.randn(hidden_size) * init_scale)
+        if init_scale == 0:
+            init_tensor = torch.zeros(hidden_size)
+        else:
+            init_tensor = torch.randn(hidden_size) * init_scale
+        self.vector = nn.Parameter(init_tensor)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states + self.vector
@@ -27,7 +31,7 @@ class ResidualHook(nn.Module):
 class SteeringVectorConfig:
     model_name: str = "Qwen/Qwen2.5-32B-Instruct"
     target_layer: int = 22
-    init_scale: float = 0.01
+    init_scale: float = 0.0
 
 
 class QwenSteerModel(nn.Module):
