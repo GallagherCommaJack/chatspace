@@ -8,10 +8,13 @@
 - GPU state is degraded: `nvidia-smi` reports ~85 GB VRAM in use with no processes, likely a leaked driver allocation after earlier OOM attempts. `nvidia-smi --gpu-reset` is unsupported; expect to power-cycle/reboot before rerunning the 32B model.
 - Next steps: (1) smoke-test pipeline with a smaller base model (`Qwen/Qwen3-0.6B`) while GPU is unstable, (2) after reset, rerun the 32B trait training for one epoch and verify the compact checkpoint produces usable steering vectors, (3) add reload validation and extend to additional traits once stable.
 
-## 2025-10-03 (Later)
+## 2025-10-04
 - Smoke-tested the steering pipeline with `Qwen/Qwen3-0.6B` on the analytical trait: 1 epoch (~100k tokens) completed in ~2.4s with gradient checkpointing enabled, confirming the CLI changes and lightweight checkpoint path. Run artifacts (`steering_vector.pt`, `steering_config.json`) stored under `/workspace/steering_runs/qwen3-0.6b_analytical_epoch1` and reload successfully via `QwenSteerModel.from_pretrained`.
 - Reran the analytical trait training with `Qwen/Qwen2.5-32B-Instruct` after disabling intermediate checkpoint saves. Run completed in ~30s for ~100k tokens, producing only the steering vector + config at `/workspace/steering_runs/qwen-3-32b__trait__analytical_epoch1`. Verified reload and vector norm (≈0.73).
 - Implemented `chatspace/steering/eval.py` to score steering vectors against persona prompts using a MiniLM logistic classifier. Analytical trait run (48 questions) shows prompted mean score ≈0.81, vanilla baseline ≈0.54, steered ≈0.56 with outputs stored in `/workspace/steering_evals/qwen-3-32b__trait__analytical__20251003T180245Z.json`.
 - Swept learning rates {1, 0.1, 0.01, 0.001, 0.0001} with grad_accum=1 and zero init. High LR (≥0.1) converged to loss ≈0.72 and raised classifier score to 0.70–0.74, while lower LR plateaued >0.85 loss and score ≈0.56–0.58. Evaluation JSONs live in `/workspace/steering_evals/qwen-3-32b__trait__analytical__*.json`.
 - Added 10k-token validation split support, cosine LR, and multi-epoch training. LR=1 with 5 epochs (cosine schedule) hits loss ≈0.75, produces steering mean score 0.772 (vs 0.813 prompted, 0.541 vanilla) [eval: qwen-3-32b__trait__analytical__20251004T043625Z.json].
+
+## 2025-10-05
 - With cosine LR + zero init, 5 epochs (patience 2) on analytical trait reached val perplexity 2.29 (prompted baseline 3.79). Classifier score on 96-question eval: 0.777 mean vs 0.818 prompted, 0.542 vanilla (`/workspace/steering_evals/qwen-3-32b__trait__analytical__20251005T032234Z.json`).
+- Added `scripts/train_all_steering.py` and kicked off a tmux sweep (`steering_sweep`) that fine-tunes steering vectors across all persona traits/roles with ≥100k tokens (default prefixes `qwen-3-32b__trait__*`, `gemma-2-27b__role__*`). Each job logs to `/workspace/steering_runs/steering_sweep.log` and saves compact `steering_vector.pt` + `steering_config.json` per dataset.
