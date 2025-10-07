@@ -18,3 +18,4 @@
 ## 2025-10-05
 - With cosine LR + zero init, 5 epochs (patience 2) on analytical trait reached val perplexity 2.29 (prompted baseline 3.79). Classifier score on 96-question eval: 0.777 mean vs 0.818 prompted, 0.542 vanilla (`/workspace/steering_evals/qwen-3-32b__trait__analytical__20251005T032234Z.json`).
 - Added `scripts/train_all_steering.py` and kicked off a tmux sweep (`steering_sweep`) that fine-tunes steering vectors across all persona traits/roles with ≥100k tokens (default prefixes `qwen-3-32b__trait__*`, `gemma-2-27b__role__*`). Each job logs to `/workspace/steering_runs/steering_sweep.log` and saves compact `steering_vector.pt` + `steering_config.json` per dataset.
+- Added `scripts/compare_activation_steering.py` to summarize cosine similarity and validation perplexity between trained steering vectors and activation-averaged baselines (outputs to `/workspace/steering_runs/steering_vector_comparison.parquet`).
