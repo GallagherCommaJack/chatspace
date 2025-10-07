@@ -82,14 +82,23 @@ def main() -> None:
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--output", type=Path, default=Path("/workspace/steering_runs/steering_vector_comparison.parquet"))
+    parser.add_argument(
+        "--include-prefix",
+        nargs="*",
+        default=["qwen-3-32b__trait__"],
+        help="Only compare datasets whose names start with one of these prefixes",
+    )
     args = parser.parse_args()
 
     if not args.log.exists():
         raise FileNotFoundError(args.log)
 
     records = []
+    prefixes = tuple(args.include_prefix)
     for entry in _iter_log_runs(args.log):
         dataset = entry["dataset"]
+        if not dataset.startswith(prefixes):
+            continue
         run_dir = args.runs / dataset
         trained_vec = _load_trained_vector(run_dir)
         activation_vec = _load_activation_vector(dataset)
