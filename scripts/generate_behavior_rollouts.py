@@ -1,9 +1,10 @@
-"""Generate persona question rollouts for prompted, trained, and activation steering."""
+"""Generate persona question rollouts and optionally score them with MiniLM."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -65,6 +66,189 @@ class SteeringController:
             self._handle.remove()
             self._handle = None
 
+
+def _train_minilm_classifier(dataset, model_name: str, batch_size: int, seed: int):
+    import numpy as np
+    import random
+    from sentence_transformers import SentenceTransformer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    embedder = SentenceTransformer(model_name)
+
+    texts: list[str] = []
+    labels: list[int] = []
+    for row in dataset:
+        assistant_msgs = [m["content"] for m in row["messages"] if m["role"] == "assistant"]
+        if not assistant_msgs:
+            continue
+        texts.append(assistant_msgs[-1])
+        labels.append(1 if row.get("label") == "pos" else 0)
+
+    if not texts:
+        raise ValueError("Dataset does not contain assistant messages for MiniLM training")
+
+    embeddings = embedder.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+    )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        embeddings,
+        labels,
+        test_size=0.2,
+        stratify=labels,
+        random_state=seed,
+    )
+
+    clf = LogisticRegression(max_iter=2000, class_weight="balanced")
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    y_prob = clf.predict_proba(X_test)[:, 1]
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "f1": float(f1_score(y_test, y_pred)),
+        "roc_auc": float(roc_auc_score(y_test, y_prob)),
+        "train_size": int(len(X_train)),
+        "test_size": int(len(X_test)),
+    }
+
+    return embedder, clf, metrics
+
+
+def _score_texts(embedder, clf, texts: Sequence[str], batch_size: int) -> list[float]:
+    import numpy as np
+
+    if not texts:
+        return []
+    embeddings = embedder.encode(
+        list(texts),
+        batch_size=batch_size,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    probs = clf.predict_proba(embeddings)[:, 1]
+    return [float(p) for p in probs]
+
+
+def _summarize_scores(values: Sequence[float]) -> dict[str, float]:
+    import numpy as np
+
+    if not values:
+        return {"count": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan")}
+    arr = np.array(values, dtype=np.float32)
+    return {
+        "count": int(arr.size),
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)) if arr.size > 1 else 0.0,
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
+
+
+def _write_minilm_outputs(dataset: str, records: list[dict], metrics: dict, run_dir: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    score_rows: list[dict] = []
+    variant_groups: dict[str, list[float]] = defaultdict(list)
+    question_groups: dict[tuple[str, int], list[float]] = defaultdict(list)
+
+    for rec in records:
+        score = rec.get("minilm_score")
+        if score is None:
+            continue
+        question_index = rec.get("question_index")
+        row = {
+            "dataset": dataset,
+            "variant": rec.get("variant"),
+            "prompt_index": rec.get("prompt_index"),
+            "question_index": question_index,
+            "rollout_index": rec.get("rollout_index"),
+            "minilm_score": float(score),
+        }
+        score_rows.append(row)
+        if row["variant"] is not None:
+            variant_groups[row["variant"]].append(float(score))
+        if question_index is not None and row["variant"] is not None:
+            question_groups[(row["variant"], question_index)].append(float(score))
+
+    if not score_rows:
+        print(f"[{dataset}] MiniLM eval produced no scores; skipping write")
+        return
+
+    pq.write_table(pa.Table.from_pylist(score_rows), run_dir / "minilm_scores.parquet")
+
+    per_question_rows = []
+    for (variant, q_idx), vals in question_groups.items():
+        summary = _summarize_scores(vals)
+        per_question_rows.append(
+            {
+                "dataset": dataset,
+                "variant": variant,
+                "question_index": q_idx,
+                **summary,
+            }
+        )
+    if per_question_rows:
+        pq.write_table(pa.Table.from_pylist(per_question_rows), run_dir / "minilm_per_question.parquet")
+
+    variant_summary = {variant: _summarize_scores(vals) for variant, vals in variant_groups.items()}
+    summary_payload = {
+        "dataset": dataset,
+        "classifier_metrics": metrics,
+        "variant_summary": variant_summary,
+    }
+    (run_dir / "minilm_summary.json").write_text(json.dumps(summary_payload, indent=2))
+
+    human = ", ".join(f"{variant}={stats['mean']:.3f}" for variant, stats in variant_summary.items())
+    print(f"[{dataset}] MiniLM summary => {human}")
+
+
+def _run_minilm_eval(dataset: str, records: list[dict], args, run_dir: Path) -> None:
+    try:
+        from datasets import load_from_disk
+    except ImportError as exc:
+        print(f"[{dataset}] Skipping MiniLM eval (datasets import failed: {exc})")
+        return
+
+    data_path = args.data_root / dataset
+    if not data_path.exists():
+        print(f"[{dataset}] Skipping MiniLM eval (missing dataset at {data_path})")
+        return
+
+    dataset_dict = load_from_disk(str(data_path))
+    split = dataset_dict["train"] if "train" in dataset_dict else dataset_dict[next(iter(dataset_dict.keys()))]
+
+    try:
+        embedder, clf, metrics = _train_minilm_classifier(
+            split,
+            args.minilm_model,
+            args.minilm_batch_size,
+            args.minilm_seed,
+        )
+    except ValueError as exc:
+        print(f"[{dataset}] MiniLM eval failed: {exc}")
+        return
+
+    scores = _score_texts(embedder, clf, [rec["response"] for rec in records], args.minilm_batch_size)
+    for rec, score in zip(records, scores):
+        rec["minilm_score"] = score
+
+    _write_minilm_outputs(dataset, records, metrics, run_dir)
+
+    del embedder, clf
+    torch.cuda.empty_cache()
 
 def read_log_datasets(log_path: Path, prefixes: Sequence[str]) -> list[str]:
     datasets: list[str] = []
@@ -292,6 +476,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--output-root", type=Path, default=Path("/workspace/steering_rollouts"))
+    parser.add_argument("--data-root", type=Path, default=Path("/workspace/datasets/processed/persona"))
     parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct")
     parser.add_argument("--target-layer", type=int, default=22)
     parser.add_argument("--rollouts", type=int, default=1)
@@ -305,6 +490,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="Drop the system prompt for trained/activation generations",
     )
+    parser.add_argument("--minilm-eval", action="store_true", help="Compute MiniLM scores for generated rollouts")
+    parser.add_argument("--minilm-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--minilm-batch-size", type=int, default=64)
+    parser.add_argument("--minilm-seed", type=int, default=17)
     args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,6 +536,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 continue
 
             print(f"Generating {dataset} -> {output_path}")
+            records: list[dict] = []
             with output_path.open("w", encoding="utf-8") as fout:
                 for record in generate_variants(
                     dataset,
@@ -359,6 +549,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     device,
                 ):
                     fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    records.append(record)
+
+            if args.minilm_eval:
+                _run_minilm_eval(dataset, records, args, run_dir)
+                for rec in records:
+                    rec.pop("response", None)
     finally:
         controller.close()
         del baseline_model
