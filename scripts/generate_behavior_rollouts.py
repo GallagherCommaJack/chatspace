@@ -556,23 +556,37 @@ def _prepare_scaled_variants(
     vector: torch.Tensor | None,
     scales: Sequence[float],
     normalize: bool,
+    *,
+    include_learned: bool = False,
 ) -> list[tuple[str, torch.Tensor, float]]:
     if vector is None:
         return []
 
     vec = vector
+    norm = float(torch.linalg.norm(vec).item())
     if normalize:
-        norm = torch.linalg.norm(vec)
         if norm > 0:
             vec = vec / norm
+        else:
+            normalize = False
 
     variants: list[tuple[str, torch.Tensor, float]] = []
+    if include_learned:
+        learned_name = f"{base_name}_scale_learned"
+        if normalize and norm > 0:
+            variants.append((learned_name, vec * norm, norm))
+        else:
+            variants.append((learned_name, vector, 1.0))
+    existing_names = {name for name, _, _ in variants}
     for scale in scales:
         scaled = vec * float(scale)
         scaled_name = base_name
         if not (len(scales) == 1 and abs(scale - 1.0) < 1e-6):
             scaled_name = f"{base_name}_scale_{scale:g}"
+        if scaled_name in existing_names:
+            continue
         variants.append((scaled_name, scaled, float(scale)))
+        existing_names.add(scaled_name)
     return variants
 
 
@@ -659,8 +673,20 @@ def generate_variants(
     else:
         activation_layer = args.target_layer
 
-    trained_variants = _prepare_scaled_variants("trained", trained_vector, args.trained_scales, args.normalize_steering)
-    activation_variants = _prepare_scaled_variants("activation", activation_vec, args.activation_scales, args.normalize_steering)
+    trained_variants = _prepare_scaled_variants(
+        "trained",
+        trained_vector,
+        args.trained_scales,
+        args.normalize_steering,
+        include_learned=True,
+    )
+    activation_variants = _prepare_scaled_variants(
+        "activation",
+        activation_vec,
+        args.activation_scales,
+        args.normalize_steering,
+        include_learned=False,
+    )
 
     baseline_layer = args.target_layer
     if trained_variants:
