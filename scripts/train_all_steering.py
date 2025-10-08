@@ -83,6 +83,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--compare-prompted", action="store_true")
     parser.add_argument("--trait-prefix", default="qwen-3-32b__trait__")
     parser.add_argument("--role-prefix", default="qwen-3-32b__role__")
+    parser.add_argument("--skip-traits", action="store_true", help="Skip training trait steering vectors")
+    parser.add_argument("--skip-roles", action="store_true", help="Skip training role steering vectors")
     parser.add_argument("--num-workers", type=int, default=1, help="Processed sequentially; argument reserved")
     parser.add_argument("--skip-existing", action="store_true", default=False)
     parser.add_argument("--dry-run", action="store_true", default=False)
@@ -266,10 +268,20 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     torch.manual_seed(args.seed)
     args.output_root.mkdir(parents=True, exist_ok=True)
-    trait_names = _read_names(args.traits_file)
-    role_names = _read_names(args.roles_file)
-    datasets = _iter_datasets(trait_names, args.trait_prefix, args.data_root)
-    datasets += _iter_datasets(role_names, args.role_prefix, args.data_root)
+    datasets: list[str] = []
+
+    if args.skip_traits:
+        print("[INFO] Skipping trait datasets (--skip-traits)")
+    else:
+        trait_names = _read_names(args.traits_file)
+        datasets.extend(_iter_datasets(trait_names, args.trait_prefix, args.data_root))
+
+    if args.skip_roles:
+        print("[INFO] Skipping role datasets (--skip-roles)")
+    else:
+        role_names = _read_names(args.roles_file)
+        datasets.extend(_iter_datasets(role_names, args.role_prefix, args.data_root))
+
     datasets = sorted(set(datasets))
 
     print(f"Found {len(datasets)} datasets with available processed data")
