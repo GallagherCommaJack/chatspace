@@ -26,3 +26,4 @@
 - Added CLI flags to normalize and sweep scale factors for trained/activation steering vectors (`--normalize-steering`, `--trained-scales`, `--activation-scales`), so rollouts and downstream evals can compare multiple magnitudes without reloading models; the learned magnitude is always preserved as `trained_scale_learned` for reference.
 - Added `runs/qwen_rollout_scale_sweep.sh` to reproduce the Qwen-specific rollout + evaluation sweep (±100–±1000 coefficients, MiniLM + judge scoring) with normalization, learned-scale matching, and activation-scale mirroring for parity.
 - Added `runs/train_qwen3_steering.sh` to rerun steering training with the `Qwen/Qwen3-32B` checkpoint and isolate outputs under `/workspace/steering_runs_qwen3`.
+- Added `scripts/sweep_learning_rates.py` to reuse a single `Qwen/Qwen3-32B` load while sweeping constant learning rates with early stopping and per-run metrics.
