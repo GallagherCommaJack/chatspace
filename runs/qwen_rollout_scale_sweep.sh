@@ -21,10 +21,8 @@ python "${ROOT_DIR}/scripts/generate_behavior_rollouts.py" \
   --top-p 0.9 \
   --steering-no-system \
   --normalize-steering \
-  --trained-scales -100 -200 -300 -400 -500 -600 -700 -800 -900 -1000 \
-                   100 200 300 400 500 600 700 800 900 1000 \
-  --activation-scales -100 -200 -300 -400 -500 -600 -700 -800 -900 -1000 \
-                      100 200 300 400 500 600 700 800 900 1000 \
+  --trained-scales 200 400 800 -200 -400 -800 \
+  --activation-scales 200 400 800 -200 -400 -800 \
   --activation-match-learned \
   --minilm-eval \
   --judge-eval
