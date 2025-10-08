@@ -16,7 +16,7 @@ python "${ROOT_DIR}/scripts/generate_behavior_rollouts.py" \
   --log /workspace/steering_runs/steering_sweep.log \
   --include-prefix qwen-3-32b__trait__ qwen-3-32b__role__ \
   --rollouts 1 \
-  --max-new-tokens 64 \
+  --max-new-tokens 256 \
   --temperature 0.7 \
   --top-p 0.9 \
   --steering-no-system \
@@ -25,5 +25,6 @@ python "${ROOT_DIR}/scripts/generate_behavior_rollouts.py" \
                    100 200 300 400 500 600 700 800 900 1000 \
   --activation-scales -100 -200 -300 -400 -500 -600 -700 -800 -900 -1000 \
                       100 200 300 400 500 600 700 800 900 1000 \
+  --activation-match-learned \
   --minilm-eval \
   --judge-eval

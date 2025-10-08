@@ -649,6 +649,7 @@ def generate_variants(
 
     steering_dir = args.run_root / dataset
     trained_vector: torch.Tensor | None = None
+    trained_norm: float | None = None
     trained_layer = args.target_layer
     vector_path = steering_dir / "steering_vector.pt"
     if vector_path.exists():
@@ -659,6 +660,7 @@ def generate_variants(
         trained_vector = tensor.float()
         if torch.cuda.is_available():
             trained_vector = trained_vector.to(device)
+        trained_norm = float(torch.linalg.norm(trained_vector).item()) if trained_vector.numel() > 0 else None
         config_path = steering_dir / "steering_config.json"
         if config_path.exists():
             cfg = json.loads(config_path.read_text())
@@ -687,6 +689,26 @@ def generate_variants(
         args.normalize_steering,
         include_learned=False,
     )
+
+    if (
+        args.activation_match_learned
+        and activation_vec is not None
+        and trained_norm is not None
+        and trained_norm > 0
+    ):
+        base_vec = activation_vec
+        if args.normalize_steering:
+            act_norm = torch.linalg.norm(base_vec)
+            if act_norm > 0:
+                base_vec = base_vec / act_norm
+        existing_names = {name for name, _, _ in activation_variants}
+        pos_name = "activation_scale_learned"
+        if pos_name not in existing_names:
+            activation_variants.append((pos_name, base_vec * trained_norm, trained_norm))
+            existing_names.add(pos_name)
+        neg_name = "activation_scale_-learned"
+        if neg_name not in existing_names:
+            activation_variants.append((neg_name, base_vec * (-trained_norm), -trained_norm))
 
     baseline_layer = args.target_layer
     if trained_variants:
@@ -799,6 +821,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--steering-scales", type=float, nargs="*", default=[1.0], help="Default scale factors for steering vectors")
     parser.add_argument("--trained-scales", type=float, nargs="*", help="Override scale factors for trained vectors")
     parser.add_argument("--activation-scales", type=float, nargs="*", help="Override scale factors for activation vectors")
+    parser.add_argument("--activation-match-learned", action="store_true", help="Add activation variants that match the learned vector magnitude (±norm)")
     args = parser.parse_args(argv)
 
     if not args.steering_scales:
