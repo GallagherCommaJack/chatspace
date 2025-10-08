@@ -34,7 +34,7 @@ class GeneratedSet:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate steering vectors vs persona prompts")
     parser.add_argument("--dataset", required=True, help="Persona dataset name under /workspace/datasets/processed/persona")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct", help="Base model to evaluate")
+    parser.add_argument("--model", default="Qwen/Qwen3-32B", help="Base model to evaluate")
     parser.add_argument("--steering-dir", type=Path, required=True, help="Directory containing steering_vector.pt")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write evaluation artifacts")
     parser.add_argument("--sample-size", type=int, default=64, help="Number of positive trait samples to evaluate")
@@ -311,4 +311,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

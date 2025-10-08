@@ -47,7 +47,7 @@ Successfully debugged and validated the persona steering vector training pipelin
 ### Training Architecture
 
 **Model**: `QwenSteerModel`
-- Base: Qwen2.5-32B-Instruct (frozen)
+- Base: Qwen3-32B (frozen)
 - Trainable component: `ResidualHook` at layer 22
   - Single vector parameter: `torch.randn(hidden_size) * init_scale`
   - Injection: `hidden_states + self.vector`
@@ -65,7 +65,7 @@ Successfully debugged and validated the persona steering vector training pipelin
 
 **Training config**:
 ```
-Model: Qwen/Qwen2.5-32B-Instruct
+Model: Qwen/Qwen3-32B
 Target layer: 22
 Batch size: 4
 Gradient accumulation: 16

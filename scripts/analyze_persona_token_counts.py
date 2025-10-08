@@ -27,7 +27,7 @@ matplotlib.use('Agg')  # Non-interactive backend
 MODEL_TOKENIZERS = {
     "gemma-2-27b": "google/gemma-2-27b-it",
     "llama-3.3-70b": "meta-llama/Llama-3.3-70B-Instruct",
-    "qwen-3-32b": "Qwen/Qwen2.5-32B-Instruct",
+    "qwen-3-32b": "Qwen/Qwen3-32B",
 }
 
 

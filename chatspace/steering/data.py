@@ -18,7 +18,7 @@ class PersonaSteeringDatasetConfig:
     dataset_root: Path = Path("/workspace/datasets/processed/persona")
     target_tokens: int = 100_000
     seed: int = 17
-    tokenizer_name: str = "Qwen/Qwen2.5-32B-Instruct"
+    tokenizer_name: str = "Qwen/Qwen3-32B"
     max_length: int = 4096
     role_min_score: int = 3
     trait_min_score: int = 75

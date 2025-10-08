@@ -538,16 +538,18 @@ def load_activation_vector(dataset: str) -> torch.Tensor | None:
         if not vec_file.exists():
             return None
         data = torch.load(vec_file, map_location="cpu")
-        key = "pos_70" if "pos_70" in data else next(iter(data))
-        return data[key][TARGET_LAYER].float()
-    if "__role__" in dataset:
+        vec = data["pos_neg_50"][TARGET_LAYER]
+        return vec.float()
+    elif "__role__" in dataset:
         role = dataset.split("__role__", 1)[1]
         vec_file = PERSONA_ROOT / f"qwen-3-32b/roles_240/vectors/{role}.pt"
         if not vec_file.exists():
             return None
         data = torch.load(vec_file, map_location="cpu")
-        key = "pos_3" if "pos_3" in data else next(iter(data))
-        return data[key][TARGET_LAYER].float()
+        vec_pos = data["pos_3"][TARGET_LAYER]
+        vec_default = data["default_1"][TARGET_LAYER]
+        vec_contrast = vec_pos - vec_default
+        return vec_contrast.float()
     return None
 
 
@@ -794,7 +796,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--output-root", type=Path, default=Path("/workspace/steering_rollouts"))
     parser.add_argument("--data-root", type=Path, default=Path("/workspace/datasets/processed/persona"))
-    parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen3-32B")
     parser.add_argument("--target-layer", type=int, default=22)
     parser.add_argument("--rollouts", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=256)

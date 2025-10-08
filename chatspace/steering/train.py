@@ -81,7 +81,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train steering vectors with TRL SFTTrainer")
     parser.add_argument("--datasets", nargs="+", required=True, help="Persona dataset names")
     parser.add_argument("--output-dir", type=Path, required=True, help="Training output directory")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct", help="Base model name")
+    parser.add_argument("--model", default="Qwen/Qwen3-32B", help="Base model name")
     parser.add_argument("--target-layer", type=int, default=22, help="Residual layer index for steering")
     parser.add_argument("--seed", type=int, default=17, help="Random seed")
     parser.add_argument("--learning-rate", type=float, default=5e-4, help="Learning rate for steering vector")

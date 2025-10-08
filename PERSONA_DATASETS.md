@@ -215,7 +215,7 @@ Select only the best examples:
 ## Data Provenance
 
 - **Source**: [persona-subspace](https://github.com/lu-christina/persona-subspace) by Christina Lu
-- **Models**: gemma-2-27b-it, Llama-3.3-70B-Instruct, Qwen2.5-32B-Instruct
+- **Models**: gemma-2-27b-it, Llama-3.3-70B-Instruct, Qwen3-32B
 - **Questions**: 240 shared questions across all personas
 - **Prompts**: 5 variants per persona for robustness testing
 - **Quality**: GPT-4-mini scored for roleplay adherence (roles) or trait strength (traits)
