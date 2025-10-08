@@ -3,16 +3,16 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
-
-export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
-
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "OPENAI_API_KEY is not set; judge evaluation requires API access." >&2
-  exit 1
+# if .env exists, export its variables
+if [[ -f .env ]]; then
+  export $(grep -v '^#' .env | xargs)
 fi
 
-python "${ROOT_DIR}/scripts/generate_behavior_rollouts.py" \
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
+
+uv run python "${ROOT_DIR}/scripts/generate_behavior_rollouts.py" \
   --log /workspace/steering_runs/steering_sweep.log \
   --include-prefix qwen-3-32b__trait__ qwen-3-32b__role__ \
   --rollouts 1 \
