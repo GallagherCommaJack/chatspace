@@ -1,13 +1,24 @@
-"""Batch-train steering vectors for persona traits/roles with ≥100k tokens."""
+"""Batch-train steering vectors while reusing a single Qwen base model."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from chatspace.steering import train as train_module
+import torch
+from transformers import AutoTokenizer
+from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
+
+from chatspace.steering.data import (
+    PersonaSteeringDatasetConfig,
+    load_persona_steering_dataset,
+)
+from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
+from chatspace.steering.train import EarlyStopCallback, _compute_average_loss
 
 
 DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
@@ -44,6 +55,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--model", default="Qwen/Qwen3-32B")
     parser.add_argument("--target-layer", type=int, default=22)
+    parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=float, default=5.0)
     parser.add_argument("--learning-rate", type=float, default=1.0)
@@ -51,6 +63,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--train-tokens", type=int, default=100_000)
     parser.add_argument("--val-tokens", type=int, default=10_000)
+    parser.add_argument("--init-scale", type=float, default=0.0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--max-steps", type=int, default=-1)
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--logging-steps", type=int, default=50)
+    parser.add_argument("--eval-steps", type=int, default=200)
+    parser.add_argument(
+        "--lr-scheduler",
+        default="cosine",
+        choices=["constant", "linear", "cosine", "cosine_with_restarts", "polynomial"],
+    )
+    parser.add_argument("--early-stop-patience", type=int, default=2)
+    parser.add_argument("--early-stop-threshold", type=float, default=0.0)
+    parser.add_argument("--role-score", type=int, default=3)
+    parser.add_argument("--trait-score", type=int, default=75)
+    parser.add_argument("--compare-prompted", action="store_true")
     parser.add_argument("--trait-prefix", default="qwen-3-32b__trait__")
     parser.add_argument("--role-prefix", default="qwen-3-32b__role__")
     parser.add_argument("--num-workers", type=int, default=1, help="Processed sequentially; argument reserved")
@@ -59,51 +89,183 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_single(dataset: str, args: argparse.Namespace) -> None:
+def _reset_vector(model: QwenSteerModel, init_scale: float) -> None:
+    if init_scale == 0.0:
+        model.steering.vector.data.zero_()
+    else:
+        torch.nn.init.normal_(model.steering.vector, mean=0.0, std=init_scale)
+    if model.steering.vector.grad is not None:
+        model.steering.vector.grad.zero_()
+
+
+def _prepare_split(dataset_name: str, args: argparse.Namespace, tokenizer) -> tuple:
+    cfg = PersonaSteeringDatasetConfig(
+        dataset_names=[dataset_name],
+        target_tokens=args.train_tokens + max(args.val_tokens, 0),
+        seed=args.seed,
+        tokenizer_name=args.model,
+        max_length=args.max_length,
+        role_min_score=args.role_score,
+        trait_min_score=args.trait_score,
+    )
+    full_dataset = load_persona_steering_dataset(cfg, tokenizer)
+
+    token_lengths = list(full_dataset["length"])
+    cumulative = 0
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+
+    for idx, length in enumerate(token_lengths):
+        cumulative += int(length)
+        if cumulative <= args.train_tokens:
+            train_idx.append(idx)
+        elif args.val_tokens > 0 and cumulative <= args.train_tokens + args.val_tokens:
+            val_idx.append(idx)
+        else:
+            break
+
+    if not train_idx:
+        raise ValueError("No training examples selected; increase tokens or relax score filters")
+
+    train_dataset = full_dataset.select(train_idx)
+    train_tokens = sum(int(full_dataset[i]["length"]) for i in train_idx)
+
+    val_dataset = None
+    val_tokens = 0
+    if val_idx:
+        val_dataset = full_dataset.select(val_idx)
+        val_tokens = sum(int(full_dataset[i]["length"]) for i in val_idx)
+
+    print(
+        f"Prepared {dataset_name}: {len(train_dataset)} train seq / {train_tokens} tokens"
+        + (f"; val {len(val_dataset)} seq / {val_tokens} tokens." if val_dataset is not None else ".")
+    )
+
+    return train_dataset, val_dataset
+
+
+def _train_single(
+    dataset: str,
+    args: argparse.Namespace,
+    model: QwenSteerModel,
+    tokenizer,
+) -> None:
     output_dir = args.output_root / dataset
     if output_dir.exists() and args.skip_existing:
         print(f"Skipping {dataset} (exists)")
         return
 
-    cmd = [
-        "--datasets", dataset,
-        "--output-dir", str(output_dir),
-        "--model", args.model,
-        "--target-layer", str(args.target_layer),
-        "--batch-size", str(args.batch_size),
-        "--gradient-accumulation", str(args.gradient_accumulation),
-        "--num-epochs", str(args.epochs),
-        "--learning-rate", str(args.learning_rate),
-        "--max-length", str(args.max_length),
-        "--target-tokens", str(args.train_tokens),
-        "--val-target-tokens", str(args.val_tokens),
-        "--bf16",
-        "--gradient-checkpointing",
-        "--logging-steps", "1",
-        "--lr-scheduler", "cosine",
-        "--early-stop-patience", "2",
-        "--compare-prompted",
-    ]
-
-    print("\n=== Training", dataset, "===")
+    print(f"\n=== Training {dataset} ===")
     print("Output dir:", output_dir)
+
     if args.dry_run:
-        print("Dry run (command not executed):", "chatspace.steering.train", " ".join(cmd))
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_dataset, val_dataset = _prepare_split(dataset, args, tokenizer)
+
+    _reset_vector(model, args.init_scale)
+    torch.manual_seed(args.seed)
+
+    eval_strategy = "steps" if val_dataset is not None else "no"
+
+    sft_config = SFTConfig(
+        output_dir=str(output_dir),
+        seed=args.seed,
+        do_eval=val_dataset is not None,
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation,
+        max_steps=args.max_steps,
+        bf16=args.bf16,
+        num_train_epochs=args.epochs,
+        logging_steps=max(1, args.logging_steps),
+        eval_strategy=eval_strategy,
+        eval_steps=max(1, args.eval_steps),
+        warmup_ratio=args.warmup_ratio,
+        report_to=[],
+        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
+        lr_scheduler_type=args.lr_scheduler,
+        save_strategy="no",
+        save_only_model=True,
+        save_total_limit=1,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        processing_class=tokenizer,
+    )
+
+    trainer.create_model_card = lambda *_, **__: None
+
+    def _save_model(target: str | None = None, _internal_call: bool = False) -> None:
+        dest = Path(target) if target is not None else output_dir
+        model.save_pretrained(dest)
+
+    trainer.save_model = _save_model  # type: ignore[assignment]
+
+    early_cb = None
+    if val_dataset is not None and args.early_stop_patience > 0:
+        early_cb = EarlyStopCallback(trainer, args.early_stop_patience, args.early_stop_threshold)
+        trainer.add_callback(early_cb)
+
+    metrics: dict[str, float | str] = {"dataset": dataset, "learning_rate": args.learning_rate}
+
     try:
-        train_module.main(cmd)
-    except ValueError as exc:
+        train_result = trainer.train()
+    except ValueError as exc:  # dataset too short etc.
         print(f"Failed on {dataset}: {exc}")
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Error on {dataset}: {exc}")
+        return
+
+    metrics.update(
+        {
+            "train_runtime": train_result.metrics.get("train_runtime"),
+            "train_loss": train_result.metrics.get("train_loss"),
+            "epoch": train_result.metrics.get("epoch"),
+        }
+    )
+
+    if early_cb is not None and getattr(early_cb, "best_vector", None) is not None:
+        best_vec = early_cb.best_vector.to(model.steering.vector.device)
+        model.steering.vector.data.copy_(best_vec)
+
+    if val_dataset is not None:
+        eval_metrics = trainer.evaluate()
+        eval_loss = eval_metrics.get("eval_loss")
+        if eval_loss is None:
+            eval_loss = _compute_average_loss(model, trainer.get_eval_dataloader())
+            eval_metrics["eval_loss"] = eval_loss
+        eval_metrics["eval_ppl"] = math.exp(eval_loss)
+        metrics.update(eval_metrics)
+
+        if args.compare_prompted:
+            stored_vec = model.steering.vector.detach().clone()
+            model.steering.vector.data.zero_()
+            base_loss = _compute_average_loss(model, trainer.get_eval_dataloader())
+            metrics["baseline_loss"] = base_loss
+            metrics["baseline_ppl"] = math.exp(base_loss)
+            model.steering.vector.data.copy_(stored_vec)
+
+    model.save_pretrained(output_dir)
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    if hasattr(trainer, "accelerator"):
+        trainer.accelerator.free_memory()
+    del trainer
+    torch.cuda.empty_cache()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_argparser()
     args = parser.parse_args(argv)
 
+    torch.manual_seed(args.seed)
+    args.output_root.mkdir(parents=True, exist_ok=True)
     trait_names = _read_names(args.traits_file)
     role_names = _read_names(args.roles_file)
     datasets = _iter_datasets(trait_names, args.trait_prefix, args.data_root)
@@ -111,8 +273,35 @@ def main(argv: Sequence[str] | None = None) -> None:
     datasets = sorted(set(datasets))
 
     print(f"Found {len(datasets)} datasets with available processed data")
+    if args.dry_run:
+        for name in datasets:
+            print(f"[DRY RUN] Would train {name} -> {args.output_root / name}")
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    model_cfg = SteeringVectorConfig(
+        model_name=args.model,
+        target_layer=args.target_layer,
+        init_scale=args.init_scale,
+    )
+    model_kwargs: dict[str, object] = {"torch_dtype": "auto"}
+    if args.device_map == "cuda":
+        model_kwargs["device_map"] = None
+    else:
+        model_kwargs["device_map"] = args.device_map
+        if args.device_map == "auto":
+            model_kwargs["low_cpu_mem_usage"] = False
+
+    model = QwenSteerModel(model_cfg, **model_kwargs)
+    if args.device_map == "cuda" and torch.cuda.is_available():
+        model = model.to(torch.device("cuda"))
+
     for name in datasets:
-        _run_single(name, args)
+        _train_single(name, args, model, tokenizer)
 
 
 if __name__ == "__main__":
