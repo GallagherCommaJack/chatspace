@@ -29,8 +29,8 @@ class ResidualHook(nn.Module):
 
 @dataclass
 class SteeringVectorConfig:
-    model_name: str = "Qwen/Qwen2.5-32B-Instruct"
-    target_layer: int = 22
+    model_name: str = "Qwen/Qwen3-32b"
+    target_layer: int = 32
     init_scale: float = 0.0
 
 

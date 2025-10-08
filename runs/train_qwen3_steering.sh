@@ -7,10 +7,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 
-python "${ROOT_DIR}/scripts/train_all_steering.py" \
+uv run python "${ROOT_DIR}/scripts/train_all_steering.py" \
   --model Qwen/Qwen3-32B \
   --trait-prefix qwen-3-32b__trait__ \
   --role-prefix qwen-3-32b__role__ \
-  --output-root /workspace/steering_runs_qwen3 \
+  --output-root /workspace/steering_runs \
   --skip-existing \
   "$@"
