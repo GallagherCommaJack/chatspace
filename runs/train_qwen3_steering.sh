@@ -11,6 +11,8 @@ uv run python "${ROOT_DIR}/scripts/train_all_steering.py" \
   --model Qwen/Qwen3-32B \
   --trait-prefix qwen-3-32b__trait__ \
   --role-prefix qwen-3-32b__role__ \
-  --output-root /workspace/steering_runs \
+  --output-root /workspace/steering_runs_qwen3_layer_30 \
+  --learning-rate 0.5 \
+  --target-layer 30 \
   --skip-existing \
   "$@"
