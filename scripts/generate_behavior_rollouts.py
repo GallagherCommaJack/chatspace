@@ -3,14 +3,40 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm, trange
+
+
+class RateLimiter:
+    """Simple async rate limiter with token bucket semantics."""
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.tokens = rate
+        self.last_update = time.time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.time()
+            self.tokens = min(self.rate, self.tokens + (now - self.last_update) * self.rate)
+            self.last_update = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            wait_time = (1 - self.tokens) / self.rate if self.rate > 0 else 0
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            self.tokens = max(0.0, self.tokens - 1)
 
 
 HOME = Path.home()
@@ -20,6 +46,13 @@ PERSONA_ROOT = Path("/workspace/persona-data")
 INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22
+
+
+@dataclass
+class InstructionData:
+    prompts: list[str]
+    questions: list[str]
+    eval_prompt: str | None
 
 
 class SteeringController:
@@ -250,6 +283,210 @@ def _run_minilm_eval(dataset: str, records: list[dict], args, run_dir: Path) -> 
     del embedder, clf
     torch.cuda.empty_cache()
 
+
+def _parse_judge_score(response_text: str):
+    if not response_text:
+        return None
+    upper = response_text.upper()
+    if "REFUSAL" in upper:
+        return "REFUSAL"
+    import re
+
+    numbers = re.findall(r"\b(\d{1,3})\b", response_text)
+    for num in numbers:
+        try:
+            value = int(num)
+        except ValueError:
+            continue
+        if 0 <= value <= 100:
+            return value
+    return None
+
+
+async def _judge_call(client, prompt: str, args, rate_limiter: RateLimiter):
+    await rate_limiter.acquire()
+    try:
+        response = await client.chat.completions.create(
+            model=args.judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=args.judge_max_tokens,
+            temperature=args.judge_temperature,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"Judge call failed: {exc}")
+        return None
+
+    if not response.choices:
+        return None
+    return response.choices[0].message.content
+
+
+async def _judge_dataset_async(prompts: list[str], args) -> list[str | None]:
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise RuntimeError(f"openai package not installed: {exc}") from exc
+
+    client = AsyncOpenAI()
+    rate_limiter = RateLimiter(args.judge_requests_per_second)
+    results: list[str | None] = []
+
+    for idx in range(0, len(prompts), args.judge_batch_size):
+        batch = prompts[idx : idx + args.judge_batch_size]
+        tasks = [
+            asyncio.create_task(_judge_call(client, prompt, args, rate_limiter))
+            for prompt in batch
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in batch_results:
+            if isinstance(res, Exception):
+                print(f"Judge batch error: {res}")
+                results.append(None)
+            else:
+                results.append(res)
+
+    return results
+
+
+def _write_judge_outputs(dataset: str, records: list[dict], args, run_dir: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = []
+    variant_scores: dict[str, list[float]] = defaultdict(list)
+    variant_refusals: dict[str, int] = defaultdict(int)
+    variant_missing: dict[str, int] = defaultdict(int)
+    question_scores: dict[tuple[str, int], list[float]] = defaultdict(list)
+    question_refusals: dict[tuple[str, int], int] = defaultdict(int)
+
+    for rec in records:
+        if "judge_score" not in rec and "judge_refusal" not in rec:
+            continue
+        variant = rec.get("variant")
+        score = rec.get("judge_score")
+        refusal = bool(rec.get("judge_refusal", False))
+        question_index = rec.get("question_index")
+        row = {
+            "dataset": dataset,
+            "variant": variant,
+            "prompt_index": rec.get("prompt_index"),
+            "question_index": question_index,
+            "rollout_index": rec.get("rollout_index"),
+            "judge_score": float(score) if score is not None else None,
+            "judge_refusal": refusal,
+            "judge_response": rec.get("judge_response"),
+        }
+        rows.append(row)
+        if variant is None:
+            continue
+        if refusal:
+            variant_refusals[variant] += 1
+            if question_index is not None:
+                question_refusals[(variant, question_index)] += 1
+        elif score is None:
+            variant_missing[variant] += 1
+        else:
+            variant_scores[variant].append(float(score))
+            if question_index is not None:
+                question_scores[(variant, question_index)].append(float(score))
+
+    if not rows:
+        print(f"[{dataset}] Judge eval produced no rows; skipping write")
+        return
+
+    pq.write_table(pa.Table.from_pylist(rows), run_dir / "judge_scores.parquet")
+
+    per_question_rows = []
+    for (variant, q_idx), scores in question_scores.items():
+        summary = _summarize_scores(scores)
+        per_question_rows.append(
+            {
+                "dataset": dataset,
+                "variant": variant,
+                "question_index": q_idx,
+                **summary,
+                "refusals": question_refusals.get((variant, q_idx), 0),
+            }
+        )
+    if per_question_rows:
+        pq.write_table(pa.Table.from_pylist(per_question_rows), run_dir / "judge_per_question.parquet")
+
+    all_variants = set(variant_scores) | set(variant_refusals) | set(variant_missing)
+    variant_summary = {}
+    for variant in sorted(all_variants):
+        stats = _summarize_scores(variant_scores.get(variant, []))
+        stats["refusals"] = variant_refusals.get(variant, 0)
+        stats["missing"] = variant_missing.get(variant, 0)
+        variant_summary[variant] = stats
+
+    summary_payload = {
+        "dataset": dataset,
+        "judge_model": args.judge_model,
+        "variant_summary": variant_summary,
+    }
+    (run_dir / "judge_summary.json").write_text(json.dumps(summary_payload, indent=2))
+
+    printable = ", ".join(
+        f"{variant}={variant_summary[variant]['mean']:.1f} (ref {variant_summary[variant]['refusals']})"
+        for variant in sorted(variant_summary)
+    )
+    print(f"[{dataset}] Judge summary => {printable}")
+
+
+def _run_judge_eval(
+    dataset: str,
+    instructions: InstructionData,
+    records: list[dict],
+    args,
+    run_dir: Path,
+) -> None:
+    eval_template = instructions.eval_prompt
+    if not eval_template:
+        print(f"[{dataset}] Skipping judge eval (instruction missing eval_prompt)")
+        return
+
+    prompts: list[str] = []
+    target_records: list[dict] = []
+    for rec in records:
+        response = rec.get("response")
+        question = rec.get("question")
+        if not response or not question:
+            continue
+        try:
+            prompt = eval_template.format(question=question, answer=response)
+        except KeyError as exc:
+            print(f"[{dataset}] Judge prompt format error: {exc}")
+            continue
+        prompts.append(prompt)
+        target_records.append(rec)
+
+    if not prompts:
+        print(f"[{dataset}] No judge prompts to evaluate")
+        return
+
+    print(f"[{dataset}] Running judge eval on {len(prompts)} responses with {args.judge_model}")
+    try:
+        judge_outputs = asyncio.run(_judge_dataset_async(prompts, args))
+    except RuntimeError as exc:
+        print(f"[{dataset}] Judge eval skipped: {exc}")
+        return
+
+    for rec, raw in zip(target_records, judge_outputs):
+        rec["judge_response"] = raw
+        parsed = _parse_judge_score(raw) if raw is not None else None
+        if parsed == "REFUSAL":
+            rec["judge_score"] = None
+            rec["judge_refusal"] = True
+        elif isinstance(parsed, int):
+            rec["judge_score"] = float(parsed)
+            rec["judge_refusal"] = False
+        else:
+            rec["judge_score"] = None
+            rec["judge_refusal"] = False
+
+    _write_judge_outputs(dataset, records, args, run_dir)
+
+
 def read_log_datasets(log_path: Path, prefixes: Sequence[str]) -> list[str]:
     datasets: list[str] = []
     tuples = tuple(prefixes)
@@ -261,7 +498,7 @@ def read_log_datasets(log_path: Path, prefixes: Sequence[str]) -> list[str]:
     return datasets
 
 
-def load_instructions(dataset: str) -> tuple[list[str], list[str]]:
+def load_instructions(dataset: str) -> InstructionData:
     if "__trait__" in dataset:
         name = dataset.split("__trait__", 1)[1]
         path = INSTRUCTIONS_ROOT / "traits" / "data" / "instructions" / f"{name}.json"
@@ -275,7 +512,7 @@ def load_instructions(dataset: str) -> tuple[list[str], list[str]]:
         raise FileNotFoundError(path)
 
     payload = json.loads(path.read_text())
-    prompts = []
+    prompts: list[str] = []
     for entry in payload.get("instruction", []):
         if isinstance(entry, dict):
             prompt = entry.get("pos") or entry.get("prompt")
@@ -288,7 +525,8 @@ def load_instructions(dataset: str) -> tuple[list[str], list[str]]:
     questions = payload.get("questions", [])
     if not questions:
         raise ValueError(f"No questions in {path}")
-    return prompts, questions
+    eval_prompt = payload.get("eval_prompt")
+    return InstructionData(prompts=prompts, questions=questions, eval_prompt=eval_prompt)
 
 
 def load_activation_vector(dataset: str) -> torch.Tensor | None:
@@ -325,8 +563,7 @@ def make_messages(
 
 def generate_variants(
     dataset: str,
-    prompts: list[str],
-    questions: list[str],
+    instructions: InstructionData,
     args,
     tokenizer,
     baseline_model,
@@ -404,12 +641,12 @@ def generate_variants(
     steering_include_system = not args.steering_no_system
 
     # Baseline generations: loop over prompts, batch questions per rollout
-    for prompt_idx, prompt in enumerate(prompts):
-        baseline_batches = [make_messages(prompt, question) for question in questions]
-        progress_desc = f"{dataset} prompted {prompt_idx + 1}/{len(prompts)}"
+    for prompt_idx, prompt in enumerate(instructions.prompts):
+        baseline_batches = [make_messages(prompt, question) for question in instructions.questions]
+        progress_desc = f"{dataset} prompted {prompt_idx + 1}/{len(instructions.prompts)}"
         for rollout_idx in trange(args.rollouts, desc=progress_desc, leave=False):
             responses = run_batch(baseline_batches, vector=None, layer_idx=baseline_layer)
-            for question_idx, (question, response) in enumerate(zip(questions, responses)):
+            for question_idx, (question, response) in enumerate(zip(instructions.questions, responses)):
                 yield {
                     "dataset": dataset,
                     "variant": "prompted",
@@ -421,22 +658,22 @@ def generate_variants(
                     "response": response,
                 }
 
-    if prompts:
+    if instructions.prompts:
         print(
-            f"[{dataset}] Prompted rollouts complete: {len(prompts)} prompts x {args.rollouts} rollouts."
+            f"[{dataset}] Prompted rollouts complete: {len(instructions.prompts)} prompts x {args.rollouts} rollouts."
         )
 
     steering_include_system = not args.steering_no_system
-    steering_prompt = prompts[0] if prompts else None
+    steering_prompt = instructions.prompts[0] if instructions.prompts else None
     steering_batches = [
         make_messages(steering_prompt, question, include_system=steering_include_system)
-        for question in questions
+        for question in instructions.questions
     ]
 
     if trained_vector is not None:
         for rollout_idx in trange(args.rollouts, desc=f"{dataset} trained", leave=False):
             responses = run_batch(steering_batches, vector=trained_vector, layer_idx=trained_layer)
-            for question_idx, (question, response) in enumerate(zip(questions, responses)):
+            for question_idx, (question, response) in enumerate(zip(instructions.questions, responses)):
                 yield {
                     "dataset": dataset,
                     "variant": "trained",
@@ -448,13 +685,13 @@ def generate_variants(
                     "response": response,
                 }
         print(
-            f"[{dataset}] Trained steering rollouts complete: {args.rollouts} rollouts x {len(questions)} questions."
+            f"[{dataset}] Trained steering rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
         )
 
     if activation_vec is not None:
         for rollout_idx in trange(args.rollouts, desc=f"{dataset} activation", leave=False):
             responses = run_batch(steering_batches, vector=activation_vec, layer_idx=activation_layer)
-            for question_idx, (question, response) in enumerate(zip(questions, responses)):
+            for question_idx, (question, response) in enumerate(zip(instructions.questions, responses)):
                 yield {
                     "dataset": dataset,
                     "variant": "activation",
@@ -466,7 +703,7 @@ def generate_variants(
                     "response": response,
                 }
         print(
-            f"[{dataset}] Activation steering rollouts complete: {args.rollouts} rollouts x {len(questions)} questions."
+            f"[{dataset}] Activation steering rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
         )
 
 
@@ -494,6 +731,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--minilm-model", default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--minilm-batch-size", type=int, default=64)
     parser.add_argument("--minilm-seed", type=int, default=17)
+    parser.add_argument("--judge-eval", action="store_true", help="Score responses with persona LLM judge")
+    parser.add_argument("--judge-model", default="gpt-4.1-mini")
+    parser.add_argument("--judge-max-tokens", type=int, default=10)
+    parser.add_argument("--judge-batch-size", type=int, default=32)
+    parser.add_argument("--judge-temperature", type=float, default=1.0)
+    parser.add_argument("--judge-requests-per-second", type=float, default=10.0)
     args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -527,7 +770,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             run_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                prompts, questions = load_instructions(dataset)
+                instructions = load_instructions(dataset)
             except FileNotFoundError:
                 print(f"Missing instructions for {dataset}")
                 continue
@@ -540,8 +783,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             with output_path.open("w", encoding="utf-8") as fout:
                 for record in generate_variants(
                     dataset,
-                    prompts,
-                    questions,
+                    instructions,
                     args,
                     tokenizer,
                     baseline_model,
@@ -553,6 +795,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
             if args.minilm_eval:
                 _run_minilm_eval(dataset, records, args, run_dir)
+
+            if args.judge_eval:
+                _run_judge_eval(dataset, instructions, records, args, run_dir)
+
+            if args.minilm_eval or args.judge_eval:
                 for rec in records:
                     rec.pop("response", None)
     finally:
