@@ -208,6 +208,7 @@ def _write_minilm_outputs(dataset: str, records: list[dict], metrics: dict, run_
             "prompt_index": rec.get("prompt_index"),
             "question_index": question_index,
             "rollout_index": rec.get("rollout_index"),
+            "steering_scale": rec.get("steering_scale"),
             "minilm_score": float(score),
         }
         score_rows.append(row)
@@ -372,6 +373,7 @@ def _write_judge_outputs(dataset: str, records: list[dict], args, run_dir: Path)
             "prompt_index": rec.get("prompt_index"),
             "question_index": question_index,
             "rollout_index": rec.get("rollout_index"),
+            "steering_scale": rec.get("steering_scale"),
             "judge_score": float(score) if score is not None else None,
             "judge_refusal": refusal,
             "judge_response": rec.get("judge_response"),
@@ -549,6 +551,31 @@ def load_activation_vector(dataset: str) -> torch.Tensor | None:
     return None
 
 
+def _prepare_scaled_variants(
+    base_name: str,
+    vector: torch.Tensor | None,
+    scales: Sequence[float],
+    normalize: bool,
+) -> list[tuple[str, torch.Tensor, float]]:
+    if vector is None:
+        return []
+
+    vec = vector
+    if normalize:
+        norm = torch.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+
+    variants: list[tuple[str, torch.Tensor, float]] = []
+    for scale in scales:
+        scaled = vec * float(scale)
+        scaled_name = base_name
+        if not (len(scales) == 1 and abs(scale - 1.0) < 1e-6):
+            scaled_name = f"{base_name}_scale_{scale:g}"
+        variants.append((scaled_name, scaled, float(scale)))
+    return variants
+
+
 def make_messages(
     system_prompt: str | None,
     question: str,
@@ -632,10 +659,13 @@ def generate_variants(
     else:
         activation_layer = args.target_layer
 
+    trained_variants = _prepare_scaled_variants("trained", trained_vector, args.trained_scales, args.normalize_steering)
+    activation_variants = _prepare_scaled_variants("activation", activation_vec, args.activation_scales, args.normalize_steering)
+
     baseline_layer = args.target_layer
-    if trained_vector is not None:
+    if trained_variants:
         baseline_layer = trained_layer
-    elif activation_vec is not None:
+    elif activation_variants:
         baseline_layer = activation_layer
 
     steering_include_system = not args.steering_no_system
@@ -670,40 +700,42 @@ def generate_variants(
         for question in instructions.questions
     ]
 
-    if trained_vector is not None:
-        for rollout_idx in trange(args.rollouts, desc=f"{dataset} trained", leave=False):
-            responses = run_batch(steering_batches, vector=trained_vector, layer_idx=trained_layer)
+    for variant_name, variant_vec, scale in trained_variants:
+        for rollout_idx in trange(args.rollouts, desc=f"{dataset} {variant_name}", leave=False):
+            responses = run_batch(steering_batches, vector=variant_vec, layer_idx=trained_layer)
             for question_idx, (question, response) in enumerate(zip(instructions.questions, responses)):
                 yield {
                     "dataset": dataset,
-                    "variant": "trained",
+                    "variant": variant_name,
                     "prompt_index": None,
                     "question_index": question_idx,
                     "rollout_index": rollout_idx,
                     "question": question,
                     "system_prompt": steering_prompt if steering_include_system else None,
+                    "steering_scale": scale,
                     "response": response,
                 }
         print(
-            f"[{dataset}] Trained steering rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
+            f"[{dataset}] {variant_name} rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
         )
 
-    if activation_vec is not None:
-        for rollout_idx in trange(args.rollouts, desc=f"{dataset} activation", leave=False):
-            responses = run_batch(steering_batches, vector=activation_vec, layer_idx=activation_layer)
+    for variant_name, variant_vec, scale in activation_variants:
+        for rollout_idx in trange(args.rollouts, desc=f"{dataset} {variant_name}", leave=False):
+            responses = run_batch(steering_batches, vector=variant_vec, layer_idx=activation_layer)
             for question_idx, (question, response) in enumerate(zip(instructions.questions, responses)):
                 yield {
                     "dataset": dataset,
-                    "variant": "activation",
+                    "variant": variant_name,
                     "prompt_index": None,
                     "question_index": question_idx,
                     "rollout_index": rollout_idx,
                     "question": question,
                     "system_prompt": steering_prompt if steering_include_system else None,
+                    "steering_scale": scale,
                     "response": response,
                 }
         print(
-            f"[{dataset}] Activation steering rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
+            f"[{dataset}] {variant_name} rollouts complete: {args.rollouts} rollouts x {len(instructions.questions)} questions."
         )
 
 
@@ -737,7 +769,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--judge-batch-size", type=int, default=32)
     parser.add_argument("--judge-temperature", type=float, default=1.0)
     parser.add_argument("--judge-requests-per-second", type=float, default=10.0)
+    parser.add_argument("--normalize-steering", action="store_true", help="L2-normalize steering vectors before scaling")
+    parser.add_argument("--steering-scales", type=float, nargs="*", default=[1.0], help="Default scale factors for steering vectors")
+    parser.add_argument("--trained-scales", type=float, nargs="*", help="Override scale factors for trained vectors")
+    parser.add_argument("--activation-scales", type=float, nargs="*", help="Override scale factors for activation vectors")
     args = parser.parse_args(argv)
+
+    if not args.steering_scales:
+        args.steering_scales = [1.0]
+    args.steering_scales = [float(s) for s in args.steering_scales]
+    args.trained_scales = [float(s) for s in (args.trained_scales if args.trained_scales else args.steering_scales)]
+    args.activation_scales = [float(s) for s in (args.activation_scales if args.activation_scales else args.steering_scales)]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
