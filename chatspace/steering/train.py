@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Dict
 
 import torch
 from datasets import Dataset
@@ -77,10 +77,14 @@ class EarlyStopCallback(TrainerCallback):
 
 
 
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train steering vectors with TRL SFTTrainer")
+def add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--datasets", nargs="+", required=True, help="Persona dataset names")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Training output directory")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Training output directory (required unless a runner injects it)",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-32B", help="Base model name")
     parser.add_argument("--target-layer", type=int, default=22, help="Residual layer index for steering")
     parser.add_argument("--seed", type=int, default=17, help="Random seed")
@@ -136,7 +140,49 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="After training, report validation perplexity for baseline persona prompts",
     )
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train steering vectors with TRL SFTTrainer")
+    add_training_arguments(parser)
     return parser
+
+
+def prepare_tokenizer(model_name: str):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+
+def build_model(cfg: SteeringVectorConfig, device_map: str) -> QwenSteerModel:
+    model_kwargs: dict[str, object] = {"torch_dtype": "auto"}
+    if device_map == "cuda":
+        model_kwargs["device_map"] = None
+    else:
+        model_kwargs["device_map"] = device_map
+        if device_map == "auto":
+            # Avoid meta tensors so Trainer's .to() call succeeds.
+            model_kwargs["low_cpu_mem_usage"] = False
+
+    model = QwenSteerModel(cfg, **model_kwargs)
+
+    if device_map == "cuda" and torch.cuda.is_available():
+        model = model.to(torch.device("cuda"))
+
+    return model
+
+
+def reset_steering_vector(model: QwenSteerModel, init_scale: float) -> None:
+    vector = model.steering.vector
+    with torch.no_grad():
+        if init_scale == 0.0:
+            vector.zero_()
+        else:
+            torch.nn.init.normal_(vector, mean=0.0, std=init_scale)
+    if vector.grad is not None:
+        vector.grad.zero_()
 
 
 def prepare_dataset(args, tokenizer) -> Dataset:
@@ -153,11 +199,12 @@ def prepare_dataset(args, tokenizer) -> Dataset:
     return dataset
 
 
-def build_trainer(args) -> SFTTrainer:
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+def build_trainer(
+    args,
+    model: QwenSteerModel | None = None,
+    tokenizer=None,
+) -> SFTTrainer:
+    tokenizer = tokenizer or prepare_tokenizer(args.model)
 
     full_dataset = prepare_dataset(args, tokenizer)
     token_lengths = list(full_dataset["length"])
@@ -196,25 +243,13 @@ def build_trainer(args) -> SFTTrainer:
         msg += f"; validation {len(val_dataset)} sequences / {val_selected_tokens} tokens"
     print(msg + ".")
 
-    model_cfg = SteeringVectorConfig(
-        model_name=args.model,
-        target_layer=args.target_layer,
-        init_scale=args.init_scale,
-    )
-    device_map = args.device_map
-    model_kwargs: dict[str, object] = {"torch_dtype": "auto"}
-    if device_map == "cuda":
-        model_kwargs["device_map"] = None
-    else:
-        model_kwargs["device_map"] = device_map
-        if device_map == "auto":
-            # Avoid meta tensors so Trainer's .to() call succeeds.
-            model_kwargs["low_cpu_mem_usage"] = False
-
-    model = QwenSteerModel(model_cfg, **model_kwargs)
-
-    if device_map == "cuda" and torch.cuda.is_available():
-        model = model.to(torch.device("cuda"))
+    if model is None:
+        model_cfg = SteeringVectorConfig(
+            model_name=args.model,
+            target_layer=args.target_layer,
+            init_scale=args.init_scale,
+        )
+        model = build_model(model_cfg, args.device_map)
 
     gradient_checkpointing = getattr(args, "gradient_checkpointing", False)
 
@@ -253,6 +288,16 @@ def build_trainer(args) -> SFTTrainer:
         processing_class=tokenizer,
     )
 
+    trainer._dataset_stats = {  # type: ignore[attr-defined]
+        "datasets": list(args.datasets),
+        "train_sequences": len(train_dataset),
+        "train_tokens": train_tokens,
+        "val_sequences": len(val_dataset) if val_dataset is not None else 0,
+        "val_tokens": val_selected_tokens,
+        "target_tokens": target_tokens,
+        "val_target_tokens": val_tokens,
+    }
+
     # Avoid Hugging Face model card writes that can fail on quota-restricted filesystems.
     trainer.create_model_card = lambda *_, **__: None
     # Persist only the steering vector + config to keep checkpoints small and resumable.
@@ -274,12 +319,30 @@ def build_trainer(args) -> SFTTrainer:
     return trainer
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = build_argparser()
-    args = parser.parse_args(argv)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+def _collect_artifacts(output_dir: Path) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    for name in ("steering_vector.pt", "steering_config.json", "trainer_state.json"):
+        path = output_dir / name
+        if path.exists():
+            artifacts[name] = str(path)
+    return artifacts
 
-    trainer = build_trainer(args)
+
+def run_training(
+    args,
+    *,
+    model: QwenSteerModel | None = None,
+    tokenizer=None,
+    reset_vector: bool = True,
+) -> Dict[str, Any]:
+    if args.output_dir is None:
+        raise ValueError("--output-dir must be provided for training runs")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if model is not None and reset_vector:
+        reset_steering_vector(model, args.init_scale)
+
+    trainer = build_trainer(args, model=model, tokenizer=tokenizer)
     train_result = trainer.train()
     val_dataset = getattr(trainer, "_val_dataset", None)
     early_cb = getattr(trainer, "_early_stop_callback", None)
@@ -288,6 +351,7 @@ def main(argv: list[str] | None = None) -> None:
         vector = early_cb.best_vector.to(trainer.model.steering.vector.device)
         trainer.model.steering.vector.data.copy_(vector)
 
+    eval_metrics: Dict[str, Any] | None = None
     if val_dataset is not None:
         eval_metrics = trainer.evaluate()
         if "eval_loss" not in eval_metrics:
@@ -298,26 +362,52 @@ def main(argv: list[str] | None = None) -> None:
         eval_metrics["eval_ppl"] = math.exp(eval_loss)
         print("Validation metrics:", eval_metrics)
 
-        if args.compare_prompted:
-            if torch.cuda.is_available():
-                trainer.model.to("cpu")
-                torch.cuda.empty_cache()
-            base_model = AutoModelForCausalLM.from_pretrained(
-                args.model,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto",
-                low_cpu_mem_usage=False,
-            )
-            base_model.eval()
-            base_loss = _compute_average_loss(base_model, trainer.get_eval_dataloader())
-            base_metrics = {
-                "eval_loss": base_loss,
-                "eval_ppl": math.exp(base_loss),
-            }
-            print("Prompted baseline metrics:", base_metrics)
+    baseline_metrics: Dict[str, Any] | None = None
+    if val_dataset is not None and args.compare_prompted:
+        if torch.cuda.is_available():
+            trainer.model.to("cpu")
+            torch.cuda.empty_cache()
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            low_cpu_mem_usage=False,
+        )
+        base_model.eval()
+        base_loss = _compute_average_loss(base_model, trainer.get_eval_dataloader())
+        baseline_metrics = {
+            "eval_loss": base_loss,
+            "eval_ppl": math.exp(base_loss),
+        }
+        print("Prompted baseline metrics:", baseline_metrics)
 
     trainer.save_state()
     trainer.save_model()
+
+    summary: Dict[str, Any] = {
+        "train_metrics": dict(train_result.metrics or {}),
+        "train_result": {
+            "global_step": getattr(train_result, "global_step", None),
+            "training_loss": getattr(train_result, "training_loss", None),
+        },
+        "eval_metrics": eval_metrics,
+        "baseline_metrics": baseline_metrics,
+        "dataset_stats": getattr(trainer, "_dataset_stats", None),
+        "artifacts": _collect_artifacts(args.output_dir),
+        "output_dir": str(args.output_dir),
+        "model": args.model,
+        "datasets": list(args.datasets),
+        "compare_prompted": bool(getattr(args, "compare_prompted", False)),
+    }
+    return summary
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+    if args.output_dir is None:
+        parser.error("--output-dir is required when running chatspace.steering.train directly")
+    run_training(args)
 
 
 if __name__ == "__main__":

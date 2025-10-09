@@ -279,6 +279,16 @@ def handle_visualize_embeddings(args: argparse.Namespace) -> None:
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 
+def handle_steering_train_forward(args: argparse.Namespace) -> None:
+    """Forward subcommand arguments to the steering job runner."""
+    from .steering import job as steering_job
+
+    argv = list(args.job_args)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    steering_job.main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chatspace", description="Dataset download and embedding toolkit")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -347,6 +357,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_viz.add_argument("--debug", action="store_true", help="Enable debug mode")
     p_viz.set_defaults(func=handle_visualize_embeddings)
 
+    p_steer = sub.add_parser(
+        "steering-train",
+        help="Run a steering-vector training job with filesystem coordination",
+    )
+    p_steer.add_argument(
+        "job_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to chatspace.steering.job",
+    )
+    p_steer.set_defaults(func=handle_steering_train_forward)
+
     return parser
 
 
@@ -359,5 +380,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-

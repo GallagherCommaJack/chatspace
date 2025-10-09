@@ -26,6 +26,8 @@ DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
 DEFAULT_DATA_ROOT = Path("/workspace/datasets/processed/persona")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
 
+SKIP_DATASET_SUFFIXES = {"__role__1_default"}
+
 
 def _read_names(path: Path) -> list[str]:
     if not path.exists():
@@ -42,8 +44,12 @@ def _iter_datasets(
     for raw in names:
         dataset_name = f"{prefix}{raw}"
         dataset_path = data_root / dataset_name
-        if dataset_path.exists():
-            valid.append(dataset_name)
+        if not dataset_path.exists():
+            continue
+        if any(dataset_name.endswith(suffix) for suffix in SKIP_DATASET_SUFFIXES):
+            print(f"Skipping dataset {dataset_name} (excluded suffix)")
+            continue
+        valid.append(dataset_name)
     return sorted(set(valid))
 
 

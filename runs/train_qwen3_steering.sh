@@ -15,5 +15,4 @@ uv run python "${ROOT_DIR}/scripts/train_all_steering.py" \
   --learning-rate 0.5 \
   --target-layer 31 \
   --skip-existing \
-  --skip-roles \
   "$@"
