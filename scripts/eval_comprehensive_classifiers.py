@@ -20,6 +20,8 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from chatspace.steering import runs as run_utils
+
 
 def load_dataset_with_all_scores(
     dataset_name: str,
@@ -239,34 +241,17 @@ def find_steering_vectors(
     dataset_type: Literal["role", "trait"] | None = None,
 ) -> list[tuple[str, Path]]:
     """Find all steering vectors in the given root directory."""
-    latest: dict[str, tuple[float, Path]] = {}
-
-    for vec_path in steering_root.rglob("steering_vector.pt"):
-        parts = vec_path.parts
-        if len(parts) < 3:
+    index = run_utils.collect_run_dirs(steering_root)
+    results: list[tuple[str, Path]] = []
+    for dataset, run_dir in index.items():
+        if dataset_type == "role" and "__role__" not in dataset:
             continue
-
-        # Find the dataset name (should contain __role__ or __trait__)
-        dataset_name = None
-        for part in parts:
-            if "__role__" in part or "__trait__" in part:
-                dataset_name = part
-                break
-
-        if dataset_name is None:
+        if dataset_type == "trait" and "__trait__" not in dataset:
             continue
-
-        # Filter by type if requested
-        if dataset_type == "role" and "__role__" not in dataset_name:
-            continue
-        if dataset_type == "trait" and "__trait__" not in dataset_name:
-            continue
-        mtime = vec_path.stat().st_mtime
-        current = latest.get(dataset_name)
-        if current is None or mtime > current[0]:
-            latest[dataset_name] = (mtime, vec_path)
-
-    return sorted((name, path) for name, (_, path) in latest.items())
+        vec_path = run_dir / "steering_vector.pt"
+        if vec_path.exists():
+            results.append((dataset, vec_path))
+    return sorted(results)
 
 
 def main(argv: list[str] | None = None) -> None:

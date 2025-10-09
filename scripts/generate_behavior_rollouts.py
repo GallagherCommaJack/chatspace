@@ -15,6 +15,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm, trange
 
+from chatspace.steering import runs as run_utils
 from chatspace.utils import sanitize_component
 
 
@@ -49,8 +50,7 @@ INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22
 _ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
-_TRAINED_VECTOR_INDEX: dict[str, Path] | None = None
-_TRAINED_VECTOR_ROOT: Path | None = None
+_VECTOR_INDEX_CACHE: dict[str, dict[str, Path]] = {}
 _ROLE_DEFAULT_SUFFIXES = ("0_default", "1_default")
 
 
@@ -69,30 +69,20 @@ def _load_role_default_vectors() -> dict[str, torch.Tensor] | None:
     return _ROLE_DEFAULT_CACHE
 
 
-def _build_trained_vector_index(run_root: Path) -> dict[str, Path]:
-    mapping: dict[str, Path] = {}
-    for vec_path in run_root.rglob("steering_vector.pt"):
-        dataset_name = next((part for part in vec_path.parts if "__role__" in part or "__trait__" in part), None)
-        if dataset_name is None:
-            continue
-        current = mapping.get(dataset_name)
-        if current is None or vec_path.stat().st_mtime > current.stat().st_mtime:
-            mapping[dataset_name] = vec_path
-    return mapping
-
-
 def _locate_trained_vector(dataset: str, run_root: Path) -> tuple[Path | None, Path | None]:
-    global _TRAINED_VECTOR_INDEX, _TRAINED_VECTOR_ROOT
-    if _TRAINED_VECTOR_INDEX is None or _TRAINED_VECTOR_ROOT != run_root:
-        _TRAINED_VECTOR_INDEX = _build_trained_vector_index(run_root)
-        _TRAINED_VECTOR_ROOT = run_root
-    if not _TRAINED_VECTOR_INDEX:
+    key = str(run_root.resolve())
+    index = _VECTOR_INDEX_CACHE.get(key)
+    if index is None:
+        index = run_utils.collect_run_dirs(run_root)
+        _VECTOR_INDEX_CACHE[key] = index
+    run_dir = index.get(dataset)
+    if run_dir is None:
         return None, None
-    vec_path = _TRAINED_VECTOR_INDEX.get(dataset)
-    if vec_path is None:
+    vector_path = run_dir / "steering_vector.pt"
+    if not vector_path.exists():
         return None, None
-    config_path = vec_path.parent / "steering_config.json"
-    return vec_path, config_path if config_path.exists() else None
+    config_path = run_dir / "steering_config.json"
+    return vector_path, config_path if config_path.exists() else None
 
 
 @dataclass

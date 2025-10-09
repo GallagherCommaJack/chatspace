@@ -6,7 +6,6 @@ import argparse
 import ast
 import json
 import math
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -14,8 +13,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from chatspace.steering.job import SUMMARY_FILENAME
-from chatspace.utils import sanitize_component
+from chatspace.steering import runs as run_utils
 
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
@@ -81,59 +79,6 @@ def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a_n * b_n).sum().item())
 
 
-def _index_scheduler_runs(run_root: Path) -> dict[str, list[tuple[str, Path]]]:
-    """Collect attempt directories keyed by dataset using scheduler summaries."""
-    index: dict[str, list[tuple[str, Path]]] = defaultdict(list)
-    for summary_path in run_root.rglob(SUMMARY_FILENAME):
-        try:
-            payload = json.loads(summary_path.read_text())
-        except Exception:
-            continue
-        dataset = payload.get("dataset")
-        if not dataset:
-            continue
-        ended_at = payload.get("ended_at") or ""
-        index[dataset].append((ended_at, summary_path.parent))
-    return index
-
-
-def _select_run_dir(
-    dataset: str,
-    run_root: Path,
-    scheduler_index: dict[str, list[tuple[str, Path]]],
-) -> Optional[Path]:
-    """Locate the most recent directory containing artifacts for a dataset."""
-    candidates: list[tuple[str, Path]] = []
-
-    # Direct path (train_all_steering style)
-    direct = run_root / dataset
-    if (direct / "steering_vector.pt").exists():
-        candidates.append(("", direct))
-
-    # Scheduler outputs (new job runner)
-    candidates.extend(scheduler_index.get(dataset, []))
-
-    if not candidates:
-        # Fallback: scan sanitized path (for manual launches that rely on sanitize_component)
-        dataset_slug = sanitize_component(dataset)
-        for summary_path in run_root.glob(f"*/{dataset_slug}/**/{SUMMARY_FILENAME}"):
-            try:
-                payload = json.loads(summary_path.read_text())
-            except Exception:
-                continue
-            ended_at = payload.get("ended_at") or ""
-            candidates.append((ended_at, summary_path.parent))
-        for vec_path in run_root.glob(f"*/{dataset_slug}/**/steering_vector.pt"):
-            candidates.append(("", vec_path.parent))
-
-    if not candidates:
-        return None
-
-    # Sort by ended_at lexicographically (ISO timestamps compare correctly); empty strings fall back to mtime
-    candidates.sort(key=lambda item: (item[0], item[1].stat().st_mtime))
-    return candidates[-1][1]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
@@ -152,13 +97,13 @@ def main() -> None:
 
     records = []
     prefixes = tuple(args.include_prefix)
-    scheduler_index = _index_scheduler_runs(args.runs)
+    run_index = run_utils.collect_run_dirs(args.runs)
 
     for entry in _iter_log_runs(args.log):
         dataset = entry["dataset"]
         if not dataset.startswith(prefixes):
             continue
-        run_dir = _select_run_dir(dataset, args.runs, scheduler_index)
+        run_dir = run_index.get(dataset) or run_utils.latest_run_dir(args.runs, dataset)
         if run_dir is None:
             print(f"warning: unable to locate artifacts for {dataset}")
             continue

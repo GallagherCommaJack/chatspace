@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from ..utils import ensure_dir, iso_now, sanitize_component
+from . import runs as run_utils
 from .model import SteeringVectorConfig
 from .train import add_training_arguments, build_model, prepare_tokenizer, run_training
 
@@ -107,12 +108,6 @@ def _resolve_output_paths(
     return dataset_root, attempt_dir
 
 
-def _has_successful_run(dataset_root: Path) -> bool:
-    if not dataset_root.exists():
-        return False
-    return any((dataset_root).glob("*/try*/" + SUMMARY_FILENAME))
-
-
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as handle:
@@ -155,7 +150,7 @@ def _run_single_dataset(
 ) -> None:
     dataset_root, output_dir = _resolve_output_paths(args.run_root, args.model, dataset_name, run_id, args.attempt)
 
-    if args.skip_if_committed and _has_successful_run(dataset_root):
+    if args.skip_if_committed and run_utils.has_successful_run(args.run_root, dataset_name):
         print(f"Skipping {dataset_name}: existing summary detected under {dataset_root}")
         return
 
