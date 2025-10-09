@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional
 
-from .job import SUMMARY_FILENAME
+from .constants import SUMMARY_FILENAME
 from ..utils import sanitize_component
 
 

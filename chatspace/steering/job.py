@@ -15,12 +15,11 @@ import torch
 
 from ..utils import ensure_dir, iso_now, sanitize_component
 from . import runs as run_utils
+from .constants import ERROR_FILENAME, SUMMARY_FILENAME
 from .model import SteeringVectorConfig
 from .train import add_training_arguments, build_model, prepare_tokenizer, run_training
 
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
-SUMMARY_FILENAME = "summary.json"
-ERROR_FILENAME = "error.json"
 
 
 def add_job_arguments(parser: argparse.ArgumentParser) -> None:
