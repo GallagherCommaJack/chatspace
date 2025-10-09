@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from tqdm import tqdm, trange
 
 from chatspace.steering import runs as run_utils
@@ -90,51 +90,6 @@ class InstructionData:
     prompts: list[str]
     questions: list[str]
     eval_prompt: str | None
-
-
-class SteeringController:
-    """Attach a single residual hook and swap steering vectors on demand."""
-
-    def __init__(self, model: AutoModelForCausalLM) -> None:
-        self.model = model
-        self.layer_idx: int | None = None
-        self._handle = None
-        self.vector: torch.Tensor | None = None
-
-    def _hook(self, module, args, output):
-        if self.vector is None:
-            return output
-        hidden = output[0] if isinstance(output, tuple) else output
-        vec = self.vector
-        if vec.device != hidden.device or vec.dtype != hidden.dtype:
-            vec = vec.to(device=hidden.device, dtype=hidden.dtype)
-            self.vector = vec
-        steered = hidden + vec
-        if isinstance(output, tuple):
-            return (steered,) + output[1:]
-        return steered
-
-    def set_layer(self, layer_idx: int) -> None:
-        if self.layer_idx == layer_idx:
-            return
-        if self._handle is not None:
-            self._handle.remove()
-        layer = self.model.model.layers[layer_idx]
-        self._handle = layer.register_forward_hook(self._hook)
-        self.layer_idx = layer_idx
-
-    def set_vector(self, vector: torch.Tensor | None) -> None:
-        if vector is None:
-            self.vector = None
-            return
-        if vector.ndim != 1:
-            raise ValueError("Steering vector must be 1D")
-        self.vector = vector
-
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
 
 
 def _train_minilm_classifier(dataset, model_name: str, batch_size: int, seed: int):
@@ -747,8 +702,7 @@ def generate_variants(
     instructions: InstructionData,
     args,
     tokenizer,
-    baseline_model,
-    controller: SteeringController,
+    steering_model: QwenSteerModel,
     device: torch.device,
 ) -> Iterable[dict[str, object]]:
     def run_batch(
@@ -757,8 +711,8 @@ def generate_variants(
         layer_idx: int | None = None,
     ) -> list[str]:
         target_layer = layer_idx if layer_idx is not None else args.target_layer
-        controller.set_layer(target_layer)
-        controller.set_vector(vector)
+        steering_model.set_target_layer(target_layer)
+        steering_model.set_vector(vector)
 
         chat_texts = [
             tokenizer.apply_chat_template(
@@ -775,7 +729,7 @@ def generate_variants(
             input_lens = torch.tensor([enc.size(0) for enc in encoded["input_ids"]], device=device)
         else:
             input_lens = attention_mask.sum(dim=1)
-        outputs = baseline_model.generate(
+        outputs = steering_model.generate(
             **encoded,
             max_new_tokens=args.max_new_tokens,
             do_sample=True,
@@ -1002,8 +956,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         device_map="auto",
         low_cpu_mem_usage=False,
     )
-    baseline_model = AutoModelForCausalLM.from_pretrained(args.model, **base_kwargs).eval()
-    controller = SteeringController(baseline_model)
+    model_cfg = SteeringVectorConfig(
+        model_name=args.model,
+        target_layer=args.target_layer,
+        init_scale=0.0,
+    )
+    steering_model = QwenSteerModel(model_cfg, **base_kwargs).eval()
+    if torch.cuda.is_available():
+        steering_model.to(device)
 
     if args.datasets:
         datasets = args.datasets
@@ -1059,8 +1019,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     instructions,
                     args,
                     tokenizer,
-                    baseline_model,
-                    controller,
+                    steering_model,
                     device,
                 ):
                     fout.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1076,8 +1035,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for rec in records:
                     rec.pop("response", None)
     finally:
-        controller.close()
-        del baseline_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

@@ -54,6 +54,9 @@ class QwenSteerModel(nn.Module):
 
     def _install_hook(self) -> None:
         """Install forward hook to inject steering vector at target layer."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+
         layer = self.model.model.layers[self.cfg.target_layer]
 
         def hook_fn(module, args, output):
@@ -77,6 +80,30 @@ class QwenSteerModel(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Steering utilities
+    # ------------------------------------------------------------------
+
+    def set_target_layer(self, layer_idx: int) -> None:
+        """Reinstall the steering hook at a different residual layer."""
+        if layer_idx == self.cfg.target_layer:
+            return
+        self.cfg.target_layer = int(layer_idx)
+        self._install_hook()
+
+    def set_vector(self, vector: torch.Tensor | None) -> None:
+        """Assign a steering vector for inference."""
+        with torch.no_grad():
+            if vector is None:
+                self.steering.vector.zero_()
+                return
+            vec = vector.view(-1).to(device=self.steering.vector.device, dtype=self.steering.vector.dtype)
+            if vec.shape != self.steering.vector.data.shape:
+                raise ValueError(
+                    f"Steering vector shape mismatch: expected {tuple(self.steering.vector.shape)}, got {tuple(vec.shape)}"
+                )
+            self.steering.vector.data.copy_(vec)
 
     def generate(self, *args, **kwargs):
         """Expose generate method for inference."""
