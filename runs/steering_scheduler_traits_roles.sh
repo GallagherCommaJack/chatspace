@@ -15,8 +15,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
   --datasets qwen-3-32b__role__leviathan \
   -- \
   --learning-rate 0.5 \
-  --num-epochs 1 \
+  --num-epochs 5 \
   "$@" \
   # avoid gpu0 to allow concurrent interactive exploration
   # --avoid-gpu0 
+  # if you want to use all traits and/or roles
+  # --traits-file /workspace/persona_traits_over_100k.txt \
+  # --roles-file /workspace/persona_roles_over_100k.txt \
 
