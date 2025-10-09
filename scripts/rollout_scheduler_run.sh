@@ -1,57 +1,56 @@
 #!/usr/bin/env bash
-# Kick off persona steering-vector jobs via the new chatspace scheduler.
+# Distribute behavior rollout generation across GPUs using simple-gpu-scheduler.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 
-# Defaults mirror the earlier train_all_steering sweep.
 TRAITS_FILE="${TRAITS_FILE:-/workspace/persona_traits_over_100k.txt}"
 ROLES_FILE="${ROLES_FILE:-/workspace/persona_roles_over_100k.txt}"
-RUN_ROOT="${RUN_ROOT:-/workspace/steering_runs_scheduler}"
+RUN_ROOT="${RUN_ROOT:-/workspace/steering_runs}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/workspace/steering_rollouts}"
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
-TARGET_LAYER="${TARGET_LAYER:-31}"
+TARGET_LAYER="${TARGET_LAYER:-22}"
 TRAIT_PREFIX="${TRAIT_PREFIX:-qwen-3-32b__trait__}"
 ROLE_PREFIX="${ROLE_PREFIX:-qwen-3-32b__role__}"
 NUM_GPUS_REQUEST="${NUM_GPUS:-}"
-ATTEMPT="${ATTEMPT:-1}"
 
 INCLUDE_TRAITS=1
 INCLUDE_ROLES=0
 SKIP_EXISTING=0
 EXTRA_ARGS=()
 EXCLUDE_GPUS=()
+DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Usage: steering_scheduler_run.sh [options] [-- extra-job-args]
+Usage: rollout_scheduler_run.sh [options] [-- extra-rollout-args]
 
 Options:
-  --traits-file PATH     Override trait dataset list (default: $TRAITS_FILE)
-  --roles-file PATH      Override role dataset list (default: $ROLES_FILE)
+  --traits-file PATH     Traits dataset list (default: $TRAITS_FILE)
+  --roles-file PATH      Roles dataset list (default: $ROLES_FILE)
   --trait-prefix PREFIX  Prefix for trait datasets (default: qwen-3-32b__trait__)
-  --role-prefix PREFIX   Prefix for role datasets (default: qwen-3-32b__role__)
-  --include-roles        Include roles in addition to traits
-  --traits-only          Disable roles (default behaviour)
-  --run-root PATH        Output root for scheduler attempts
-  --model NAME           Base model to fine-tune (default: Qwen/Qwen3-32B)
-  --target-layer INDEX   Residual layer to hook steering vector (default: 31)
-  --skip-existing        Map to scheduler --skip-if-committed so finished runs are skipped
+  --role-prefix  PREFIX  Prefix for role datasets (default: qwen-3-32b__role__)
+  --include-roles        Include role datasets in addition to traits
+  --traits-only          Use trait datasets only (default behaviour)
   --no-traits            Disable trait datasets entirely
-  --reuse-base-model     Force reuse within job (enabled by default)
-  --no-reuse-base-model  Disable reuse and reload per dataset
-  --exclude-gpu INDEX    Exclude a GPU index from CUDA_VISIBLE_DEVICES (can repeat)
-  --avoid-gpu0           Convenience flag equal to --exclude-gpu 0
-  --num-gpus COUNT       Limit the number of GPUs/workers launched (default: detect all available)
-  --datasets NAME...     Explicit dataset names (can be repeated)
+  --run-root PATH        Steering vector root (default: $RUN_ROOT)
+  --output-root PATH     Rollout output root (default: $OUTPUT_ROOT)
+  --model NAME           Base model to load (default: Qwen/Qwen3-32B)
+  --target-layer INDEX   Layer index for steering (default: 22)
+  --skip-existing        Skip datasets with existing rollouts.jsonl
+  --dry-run              Print planned commands without launching workers
+  --exclude-gpu INDEX    Exclude a GPU index (repeatable)
+  --avoid-gpu0           Shortcut for --exclude-gpu 0
+  --num-gpus COUNT       Limit the number of GPU workers (auto-detect otherwise)
+  --datasets NAME...     Explicit dataset names (repeatable, overrides trait/role files)
   --help                 Show this message
 
-Any arguments after "--" are forwarded to `chatspace steering-train`.
+Arguments after "--" are forwarded to generate_behavior_rollouts.py.
 EOF
 }
 
 DATASETS=()
-REUSE_BASE_MODEL=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,6 +80,10 @@ while [[ $# -gt 0 ]]; do
       RUN_ROOT="$2"; shift 2 ;;
     --run-root=*)
       RUN_ROOT="${1#*=}"; shift ;;
+    --output-root)
+      OUTPUT_ROOT="$2"; shift 2 ;;
+    --output-root=*)
+      OUTPUT_ROOT="${1#*=}"; shift ;;
     --model)
       MODEL="$2"; shift 2 ;;
     --model=*)
@@ -91,10 +94,8 @@ while [[ $# -gt 0 ]]; do
       TARGET_LAYER="${1#*=}"; shift ;;
     --skip-existing)
       SKIP_EXISTING=1; shift ;;
-    --reuse-base-model)
-      REUSE_BASE_MODEL=1; shift ;;
-    --no-reuse-base-model)
-      REUSE_BASE_MODEL=0; shift ;;
+    --dry-run)
+      DRY_RUN=1; shift ;;
     --exclude-gpu)
       EXCLUDE_GPUS+=("$2"); shift 2 ;;
     --exclude-gpu=*)
@@ -124,7 +125,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Populate dataset list from files only when explicit datasets were not provided.
 if [[ ${#DATASETS[@]} -eq 0 ]]; then
   if [[ $INCLUDE_TRAITS -eq 1 ]]; then
     if [[ -f "$TRAITS_FILE" ]]; then
@@ -149,7 +149,7 @@ if [[ ${#DATASETS[@]} -eq 0 ]]; then
 fi
 
 if [[ ${#DATASETS[@]} -eq 0 ]]; then
-  echo "error: no datasets resolved; provide --datasets or a traits/roles file" >&2
+  echo "error: no datasets resolved; provide --datasets or trait/role files" >&2
   exit 1
 fi
 
@@ -170,7 +170,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 if [[ -z "$PYTHON_BIN" ]]; then
-  echo "error: python interpreter not found (expected .venv or system python)" >&2
+  echo "error: python interpreter not found" >&2
   exit 1
 fi
 
@@ -179,7 +179,7 @@ import sys
 
 try:
     import torch
-except Exception as exc:  # pragma: no cover
+except Exception as exc:
     print(f"Failed to import torch: {exc}", file=sys.stderr)
     sys.exit(1)
 
@@ -221,7 +221,7 @@ fi
 
 if [[ -n "$NUM_GPUS_REQUEST" ]]; then
   if (( NUM_GPUS_REQUEST > ${#AVAILABLE_GPUS[@]} )); then
-    echo "warning: requested $NUM_GPUS_REQUEST GPU(s) but only ${#AVAILABLE_GPUS[@]} available after exclusions" >&2
+    echo "warning: requested $NUM_GPUS_REQUEST GPU(s) but only ${#AVAILABLE_GPUS[@]} available" >&2
   fi
   if (( ${#AVAILABLE_GPUS[@]} > NUM_GPUS_REQUEST )); then
     AVAILABLE_GPUS=("${AVAILABLE_GPUS[@]:0:NUM_GPUS_REQUEST}")
@@ -267,24 +267,25 @@ for (( worker_idx=0; worker_idx<WORKER_COUNT; worker_idx++ )); do
   echo "  worker ${worker_idx} (${AVAILABLE_GPUS[worker_idx]}): ${#worker_datasets[@]} dataset(s)" >&2
 
   CMD=(
-    "uv" "run" "chatspace" "steering-train" "--"
+    "uv" "run" "python" "scripts/generate_behavior_rollouts.py"
     "--run-root" "$RUN_ROOT"
+    "--output-root" "$OUTPUT_ROOT"
     "--model" "$MODEL"
     "--target-layer" "$TARGET_LAYER"
-    "--attempt" "$ATTEMPT"
+    "--steering-no-system"
   )
 
-  if [[ $REUSE_BASE_MODEL -eq 1 ]]; then
-    CMD+=("--reuse-base-model")
-  fi
-
   if [[ $SKIP_EXISTING -eq 1 ]]; then
-    CMD+=("--skip-if-committed")
+    CMD+=("--skip-existing")
   fi
 
-  CMD+=("--dataset-stride" "$WORKER_COUNT" "--dataset-offset" "$worker_idx")
-  CMD+=("--datasets")
-  CMD+=("${DATASETS[@]}")
+  CMD+=(
+    "--dataset-stride" "$WORKER_COUNT"
+    "--dataset-offset" "$worker_idx"
+    "--datasets"
+  )
+
+  CMD+=("${worker_datasets[@]}")
   CMD+=("${EXTRA_ARGS[@]}")
 
   COMMAND_LINES+=("$(join_command "${CMD[@]}")")
@@ -298,6 +299,16 @@ fi
 if (( TOTAL_ASSIGNED != ${#DATASETS[@]} )); then
   echo "error: dataset assignment mismatch (${TOTAL_ASSIGNED}/${#DATASETS[@]}). Check stride logic." >&2
   exit 1
+fi
+
+if (( DRY_RUN == 1 )); then
+  echo "Dry-run: printing planned commands only." >&2
+  {
+    for line in "${COMMAND_LINES[@]}"; do
+      printf '%s\n' "$line"
+    done
+  } | sed 's/^/  /'
+  exit 0
 fi
 
 echo "Dispatching ${TOTAL_ASSIGNED}/${#DATASETS[@]} dataset(s) via simple-gpu-scheduler" >&2

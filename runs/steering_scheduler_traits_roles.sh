@@ -9,11 +9,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
   --include-roles \
   --skip-existing \
   --reuse-base-model \
-  --run-root /workspace/steering_runs_scheduler_test \
+  --run-root /workspace/steering_runs_scheduler \
+  --trait-prefix "qwen-3-32b__trait__" \
+  --role-prefix "qwen-3-32b__role__" \
+  --traits-file /workspace/persona_traits_over_100k.txt \
+  --roles-file /workspace/persona_roles_over_100k.txt \
   --model Qwen/Qwen3-32B \
   --target-layer 31 \
-  --datasets qwen-3-32b__role__leviathan \
   -- \
+  --device-map cuda \
   --learning-rate 0.5 \
   --lr-scheduler cosine \
   --target-tokens 100000 \
@@ -22,7 +26,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
   "$@" \
   # avoid gpu0 to allow concurrent interactive exploration
   # --avoid-gpu0 
-  # if you want to use all traits and/or roles
-  # --traits-file /workspace/persona_traits_over_100k.txt \
-  # --roles-file /workspace/persona_roles_over_100k.txt \
+  # smoke test
+  # --run-root /workspace/steering_runs_scheduler_test \
+  # --datasets qwen-3-32b__role__leviathan \
 

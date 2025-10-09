@@ -14,6 +14,7 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
     "sentence-transformers>=5.1.1",
+    "simple-gpu-scheduler>=0.1.4",
     "tiktoken>=0.11.0",
     "torch>=2.8.0",
     "tqdm>=4.67.1",
