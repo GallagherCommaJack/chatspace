@@ -11,12 +11,12 @@ from tqdm import tqdm
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from chatspace.persona_to_hf import (
-    load_single_role_conversations,
-    load_single_trait_conversations,
+from chatspace.persona import (
+    DEFAULT_PROCESSED_PERSONA_ROOT,
+    load_persona_dataset,
     list_available_roles,
     list_available_traits,
-    save_dataset,
+    save_persona_dataset,
 )
 
 
@@ -24,9 +24,10 @@ def create_role_dataset_wrapper(args):
     """Wrapper for parallel execution."""
     model, role, output_dir, min_score = args
     try:
-        dataset = load_single_role_conversations(
-            model_name=model,
-            role_name=role,
+        dataset = load_persona_dataset(
+            model=model,
+            dataset_type="role",
+            name=role,
             min_score=min_score,
         )
 
@@ -34,7 +35,7 @@ def create_role_dataset_wrapper(args):
         if min_score:
             output_name += f"__min{min_score}"
 
-        save_dataset(dataset, output_dir, output_name)
+        save_persona_dataset(dataset, output_dir, output_name)
         return (model, role, len(dataset), None)
     except Exception as e:
         return (model, role, 0, str(e))
@@ -44,9 +45,10 @@ def create_trait_dataset_wrapper(args):
     """Wrapper for parallel execution."""
     model, trait, output_dir, min_score, label_filter = args
     try:
-        dataset = load_single_trait_conversations(
-            model_name=model,
-            trait_name=trait,
+        dataset = load_persona_dataset(
+            model=model,
+            dataset_type="trait",
+            name=trait,
             min_score=min_score,
             label_filter=label_filter,
         )
@@ -57,7 +59,7 @@ def create_trait_dataset_wrapper(args):
         if label_filter:
             output_name += f"__{label_filter}"
 
-        save_dataset(dataset, output_dir, output_name)
+        save_persona_dataset(dataset, output_dir, output_name)
         return (model, trait, len(dataset), None)
     except Exception as e:
         return (model, trait, 0, str(e))
@@ -65,7 +67,7 @@ def create_trait_dataset_wrapper(args):
 
 def generate_all_roles(
     models=["gemma-2-27b", "llama-3.3-70b", "qwen-3-32b"],
-    output_dir=Path("/workspace/datasets/processed/persona"),
+    output_dir: Path = DEFAULT_PROCESSED_PERSONA_ROOT,
     min_score=None,
     max_workers=8,
 ):
@@ -109,7 +111,7 @@ def generate_all_roles(
 
 def generate_all_traits(
     models=["gemma-2-27b", "llama-3.3-70b", "qwen-3-32b"],
-    output_dir=Path("/workspace/datasets/processed/persona"),
+    output_dir: Path = DEFAULT_PROCESSED_PERSONA_ROOT,
     min_score=None,
     label_filter=None,
     max_workers=8,
@@ -181,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/datasets/processed/persona"),
+        default=DEFAULT_PROCESSED_PERSONA_ROOT,
         help="Output directory"
     )
     parser.add_argument(

@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
-from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
 
-from .data import PersonaSteeringDatasetConfig, load_persona_steering_dataset
+from ..persona import TokenBudgetResult
+from .data import PersonaSteeringDatasetConfig, prepare_persona_token_budget
 from .model import QwenSteerModel, SteeringVectorConfig
 
 
@@ -185,18 +185,19 @@ def reset_steering_vector(model: QwenSteerModel, init_scale: float) -> None:
         vector.grad.zero_()
 
 
-def prepare_dataset(args, tokenizer) -> Dataset:
+def prepare_dataset(args, tokenizer) -> TokenBudgetResult:
     cfg = PersonaSteeringDatasetConfig(
         dataset_names=args.datasets,
-        target_tokens=args.target_tokens + max(args.val_target_tokens, 0),
+        train_tokens=args.target_tokens,
+        val_tokens=max(args.val_target_tokens, 0),
         seed=args.seed,
         tokenizer_name=args.model,
         max_length=args.max_length,
         role_min_score=args.role_score,
         trait_min_score=args.trait_score,
+        trait_positive_only=not getattr(args, "include_trait_negatives", False),
     )
-    dataset = load_persona_steering_dataset(cfg, tokenizer)
-    return dataset
+    return prepare_persona_token_budget(cfg, tokenizer)
 
 
 def build_trainer(
@@ -206,41 +207,21 @@ def build_trainer(
 ) -> SFTTrainer:
     tokenizer = tokenizer or prepare_tokenizer(args.model)
 
-    full_dataset = prepare_dataset(args, tokenizer)
-    token_lengths = list(full_dataset["length"])
+    split_result = prepare_dataset(args, tokenizer)
 
-    target_tokens = args.target_tokens
-    val_tokens = max(args.val_target_tokens, 0)
-    cumulative = 0
-    train_indices: list[int] = []
-    val_indices: list[int] = []
+    train_dataset = split_result.splits["train"]
+    train_tokens = split_result.token_counts.get("train", 0)
 
-    for idx, length in enumerate(token_lengths):
-        cumulative += int(length)
-        if cumulative <= target_tokens:
-            train_indices.append(idx)
-        elif val_tokens > 0 and cumulative <= target_tokens + val_tokens:
-            val_indices.append(idx)
-        else:
-            break
+    val_dataset = split_result.splits.get("val")
+    val_tokens = split_result.token_counts.get("val", 0)
+    if val_dataset is not None and len(val_dataset) == 0:
+        val_dataset = None
 
-    if not train_indices:
-        raise ValueError("Unable to allocate any training examples; increase target tokens or relax filters")
-
-    train_dataset = full_dataset.select(train_indices)
-    train_tokens = sum(int(full_dataset[i]["length"]) for i in train_indices)
-
-    val_dataset = None
-    val_selected_tokens = 0
-    if val_indices:
-        val_dataset = full_dataset.select(val_indices)
-        val_selected_tokens = sum(int(full_dataset[i]["length"]) for i in val_indices)
-
-    msg = (
-        f"Prepared dataset with {len(train_dataset)} train sequences / {train_tokens} tokens"
-    )
+    msg = f"Prepared dataset with {len(train_dataset)} train sequences / {train_tokens} tokens"
     if val_dataset is not None:
-        msg += f"; validation {len(val_dataset)} sequences / {val_selected_tokens} tokens"
+        msg += f"; validation {len(val_dataset)} sequences / {val_tokens} tokens"
+    if split_result.remaining_candidates:
+        msg += f"; {split_result.remaining_candidates} unused sequences ({split_result.remaining_tokens} tokens) remain"
     print(msg + ".")
 
     if model is None:
@@ -293,9 +274,11 @@ def build_trainer(
         "train_sequences": len(train_dataset),
         "train_tokens": train_tokens,
         "val_sequences": len(val_dataset) if val_dataset is not None else 0,
-        "val_tokens": val_selected_tokens,
-        "target_tokens": target_tokens,
-        "val_target_tokens": val_tokens,
+        "val_tokens": val_tokens if val_dataset is not None else 0,
+        "requested_train_tokens": args.target_tokens,
+        "requested_val_tokens": max(args.val_target_tokens, 0),
+        "unused_sequences": split_result.remaining_candidates,
+        "unused_tokens": split_result.remaining_tokens,
     }
 
     # Avoid Hugging Face model card writes that can fail on quota-restricted filesystems.
