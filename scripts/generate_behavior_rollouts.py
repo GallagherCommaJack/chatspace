@@ -15,6 +15,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm, trange
 
+from chatspace.utils import sanitize_component
+
 
 class RateLimiter:
     """Simple async rate limiter with token bucket semantics."""
@@ -50,24 +52,6 @@ _ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
 _TRAINED_VECTOR_INDEX: dict[str, Path] | None = None
 _TRAINED_VECTOR_ROOT: Path | None = None
 _ROLE_DEFAULT_SUFFIXES = ("0_default", "1_default")
-
-
-def _sanitize_component(value: str) -> str:
-    lowered = value.lower().strip()
-    if not lowered:
-        return "unnamed"
-    safe: list[str] = []
-    for char in lowered:
-        if char.isalnum() or char in {"-", "_"}:
-            safe.append(char)
-        elif char == "/":
-            safe.append("__")
-        else:
-            safe.append("-")
-    sanitized = "".join(safe)
-    while "--" in sanitized:
-        sanitized = sanitized.replace("--", "-")
-    return sanitized.lstrip("-") or "unnamed"
 
 
 def _load_role_default_vectors() -> dict[str, torch.Tensor] | None:
@@ -1061,7 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         for dataset in tqdm(datasets, desc="Datasets"):
-            run_dir = args.output_root / dataset
+            run_dir = args.output_root / sanitize_component(dataset)
             output_path = run_dir / "rollouts.jsonl"
             if output_path.exists() and args.skip_existing:
                 print(f"Skipping {dataset} (rollouts exist)")

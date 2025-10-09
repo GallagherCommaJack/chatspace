@@ -3,19 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from .env import load_environment, get_env
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _ensure_dir(path: str | Path) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+from .utils import ensure_dir, iso_now
 
 
 def handle_download_dataset(args: argparse.Namespace) -> None:
@@ -34,13 +26,13 @@ def handle_download_dataset(args: argparse.Namespace) -> None:
     ds = load_dataset(dataset_name, split=split) if split else load_dataset(dataset_name)
 
     base_dir = Path("/workspace/datasets/raw") / source / dataset_name.replace("/", "__") / (split or "all")
-    _ensure_dir(base_dir)
+    ensure_dir(base_dir)
 
     descriptor: Dict[str, Any] = {
         "dataset": dataset_name,
         "source": source,
         "split": split,
-        "created_at": _iso_now(),
+        "created_at": iso_now(),
         "num_rows": int(getattr(ds, "num_rows", 0)) if split else None,
         "features": getattr(getattr(ds, "features", None), "keys", lambda: [])(),
         "note": "Lightweight descriptor; full materialization deferred to processing steps.",
@@ -66,8 +58,8 @@ def handle_embed_dataset(args: argparse.Namespace) -> None:
     # Paths
     emb_dir = Path("/workspace/embeddings") / model / dataset_name.replace("/", "__")
     idx_dir = Path("/workspace/indexes") / model / dataset_name.replace("/", "__")
-    _ensure_dir(emb_dir)
-    _ensure_dir(idx_dir)
+    ensure_dir(emb_dir)
+    ensure_dir(idx_dir)
 
     plan = {
         "dataset": dataset_name,
@@ -132,7 +124,7 @@ def handle_embed_dataset(args: argparse.Namespace) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    created_at = _iso_now()
+    created_at = iso_now()
     shard_path = emb_dir / "shard-00000.parquet"
 
     num_rows = len(embeddings)

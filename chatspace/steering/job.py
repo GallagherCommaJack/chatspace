@@ -16,6 +16,7 @@ from typing import Any, Dict
 
 import torch
 
+from ..utils import iso_now as _iso_now_shared, sanitize_component as _sanitize_component_shared
 from .model import SteeringVectorConfig
 from .train import add_training_arguments, build_model, prepare_tokenizer, run_training
 
@@ -48,27 +49,11 @@ class AttemptExistsError(RuntimeError):
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _iso_now_shared()
 
 
 def _sanitize_component(value: str) -> str:
-    lowered = value.lower().strip()
-    if not lowered:
-        return "unnamed"
-    safe = []
-    for char in lowered:
-        if char.isalnum() or char in {"-", "_"}:
-            safe.append(char)
-        elif char == "/":
-            safe.append("__")
-        else:
-            safe.append("-")
-    sanitized = "".join(safe)
-    while "--" in sanitized:
-        sanitized = sanitized.replace("--", "-")
-    while sanitized.startswith("-"):
-        sanitized = sanitized[1:]
-    return sanitized or "unnamed"
+    return _sanitize_component_shared(value)
 
 
 def _json_ready(obj: Any) -> Any:
