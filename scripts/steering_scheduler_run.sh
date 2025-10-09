@@ -11,6 +11,8 @@ ROLES_FILE="${ROLES_FILE:-/workspace/persona_roles_over_100k.txt}"
 RUN_ROOT="${RUN_ROOT:-/workspace/steering_runs_scheduler}"
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
 TARGET_LAYER="${TARGET_LAYER:-31}"
+TRAIT_PREFIX="${TRAIT_PREFIX:-qwen-3-32b__trait__}"
+ROLE_PREFIX="${ROLE_PREFIX:-qwen-3-32b__role__}"
 
 INCLUDE_TRAITS=1
 INCLUDE_ROLES=0
@@ -25,6 +27,8 @@ Usage: steering_scheduler_run.sh [options] [-- extra-job-args]
 Options:
   --traits-file PATH     Override trait dataset list (default: $TRAITS_FILE)
   --roles-file PATH      Override role dataset list (default: $ROLES_FILE)
+  --trait-prefix PREFIX  Prefix for trait datasets (default: qwen-3-32b__trait__)
+  --role-prefix PREFIX   Prefix for role datasets (default: qwen-3-32b__role__)
   --include-roles        Include roles in addition to traits
   --traits-only          Disable roles (default behaviour)
   --run-root PATH        Output root for scheduler attempts
@@ -56,6 +60,14 @@ while [[ $# -gt 0 ]]; do
       ROLES_FILE="$2"; shift 2 ;;
     --roles-file=*)
       ROLES_FILE="${1#*=}"; shift ;;
+    --trait-prefix)
+      TRAIT_PREFIX="$2"; shift 2 ;;
+    --trait-prefix=*)
+      TRAIT_PREFIX="${1#*=}"; shift ;;
+    --role-prefix)
+      ROLE_PREFIX="$2"; shift 2 ;;
+    --role-prefix=*)
+      ROLE_PREFIX="${1#*=}"; shift ;;
     --include-roles)
       INCLUDE_ROLES=1; shift ;;
     --traits-only|--no-roles)
@@ -111,7 +123,7 @@ if [[ ${#DATASETS[@]} -eq 0 ]]; then
     if [[ -f "$TRAITS_FILE" ]]; then
       while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^# ]] && continue
-        DATASETS+=("$line")
+        DATASETS+=("${TRAIT_PREFIX}${line}")
       done <"$TRAITS_FILE"
     else
       echo "warning: traits file not found: $TRAITS_FILE" >&2
@@ -121,7 +133,7 @@ if [[ ${#DATASETS[@]} -eq 0 ]]; then
     if [[ -f "$ROLES_FILE" ]]; then
       while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^# ]] && continue
-        DATASETS+=("$line")
+        DATASETS+=("${ROLE_PREFIX}${line}")
       done <"$ROLES_FILE"
     else
       echo "warning: roles file not found: $ROLES_FILE" >&2
