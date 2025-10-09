@@ -441,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 if dataset_type == "trait":
                     model_prefix, trait_name = dataset_name.split("__trait__", 1)
-                    activation_vec_path = args.activation_root.parent / "traits_240/vectors" / f"{trait_name}.pt"
+                    activation_vec_path = args.activation_root / f"{trait_name}.pt"
 
                     if activation_vec_path.exists():
                         print(f"  Loading activation vector: {activation_vec_path}")
