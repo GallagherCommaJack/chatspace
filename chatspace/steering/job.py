@@ -30,6 +30,8 @@ JOB_ONLY_FIELDS = {
     "force",
     "dry_run",
     "reuse_base_model",
+    "dataset_stride",
+    "dataset_offset",
 }
 
 
@@ -244,6 +246,18 @@ def add_job_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Load the base model/tokenizer once and reuse across datasets processed sequentially",
     )
+    parser.add_argument(
+        "--dataset-stride",
+        type=int,
+        default=None,
+        help="Stride to select datasets from the provided list (combine with --dataset-offset)",
+    )
+    parser.add_argument(
+        "--dataset-offset",
+        type=int,
+        default=None,
+        help="Offset when applying --dataset-stride (defaults to 0)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -278,6 +292,16 @@ def _validate_datasets(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("Multiple datasets require --reuse-base-model so the base model is reused in-process")
 
     return datasets
+
+
+def _apply_dataset_stride(
+    datasets: list[str],
+    stride: int | None,
+    offset: int,
+) -> list[str]:
+    if stride is None or stride <= 1:
+        return datasets
+    return [name for idx, name in enumerate(datasets) if idx % stride == offset]
 
 
 def _load_shared_components(args: argparse.Namespace):
@@ -367,6 +391,44 @@ def _run_single_dataset(
             tokenizer=shared_tokenizer_arg,
             reset_vector=True,
         )
+    except FileNotFoundError as exc:
+        duration = time.monotonic() - start_time
+        coordinator.write_error(
+            {
+                "status": "skipped_missing_dataset",
+                "dataset": dataset_name,
+                "model": args.model,
+                "run_id": run_id,
+                "attempt": args.attempt,
+                "started_at": started_at,
+                "ended_at": _iso_now(),
+                "duration_seconds": duration,
+                "exception": repr(exc),
+                "traceback": traceback.format_exc(),
+                "gpu": gpu_info,
+            }
+        )
+        print(f"Skipping dataset {dataset_name}: missing dataset ({exc}).")
+        return
+    except ValueError as exc:
+        duration = time.monotonic() - start_time
+        coordinator.write_error(
+            {
+                "status": "skipped_insufficient_examples",
+                "dataset": dataset_name,
+                "model": args.model,
+                "run_id": run_id,
+                "attempt": args.attempt,
+                "started_at": started_at,
+                "ended_at": _iso_now(),
+                "duration_seconds": duration,
+                "exception": repr(exc),
+                "traceback": traceback.format_exc(),
+                "gpu": gpu_info,
+            }
+        )
+        print(f"Skipping dataset {dataset_name}: unable to prepare examples ({exc}).")
+        return
     except Exception as exc:  # pragma: no cover - requires failing training
         duration = time.monotonic() - start_time
         coordinator.write_error(
@@ -413,12 +475,34 @@ def main(argv: list[str] | None = None) -> None:
     if args.attempt < 1:
         parser.error("--attempt must be >= 1")
 
+    if args.dataset_stride is not None and args.dataset_stride < 1:
+        parser.error("--dataset-stride must be >= 1")
+
+    if args.dataset_offset is not None and args.dataset_stride is None:
+        parser.error("--dataset-offset requires --dataset-stride")
+
+    dataset_offset = args.dataset_offset if args.dataset_offset is not None else 0
+    if dataset_offset < 0:
+        parser.error("--dataset-offset must be >= 0")
+
     datasets = _validate_datasets(args, parser)
+    if args.dataset_stride is not None and dataset_offset >= args.dataset_stride:
+        parser.error("--dataset-offset must be < --dataset-stride")
+
+    datasets = _apply_dataset_stride(datasets, args.dataset_stride, dataset_offset)
+    if not datasets:
+        print(
+            f"No datasets matched this worker (stride={args.dataset_stride}, offset={dataset_offset}). "
+            "Nothing to do."
+        )
+        return
+
+    args.datasets = datasets
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     shared_model = None
     shared_tokenizer = None
-    if args.reuse_base_model:
+    if args.reuse_base_model and not args.dry_run:
         shared_model, shared_tokenizer = _load_shared_components(args)
 
     for dataset in datasets:

@@ -46,6 +46,69 @@ PERSONA_ROOT = Path("/workspace/persona-data")
 INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22
+_ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
+_TRAINED_VECTOR_INDEX: dict[str, Path] | None = None
+_TRAINED_VECTOR_ROOT: Path | None = None
+_ROLE_DEFAULT_SUFFIXES = ("0_default", "1_default")
+
+
+def _sanitize_component(value: str) -> str:
+    lowered = value.lower().strip()
+    if not lowered:
+        return "unnamed"
+    safe: list[str] = []
+    for char in lowered:
+        if char.isalnum() or char in {"-", "_"}:
+            safe.append(char)
+        elif char == "/":
+            safe.append("__")
+        else:
+            safe.append("-")
+    sanitized = "".join(safe)
+    while "--" in sanitized:
+        sanitized = sanitized.replace("--", "-")
+    return sanitized.lstrip("-") or "unnamed"
+
+
+def _load_role_default_vectors() -> dict[str, torch.Tensor] | None:
+    global _ROLE_DEFAULT_CACHE
+    if _ROLE_DEFAULT_CACHE is not None:
+        return _ROLE_DEFAULT_CACHE
+    default_path = PERSONA_ROOT / "qwen-3-32b/roles_240/default_vectors.pt"
+    if not default_path.exists():
+        return None
+    default_data = torch.load(default_path, map_location="cpu", weights_only=False)
+    activations = default_data.get("activations")
+    if activations is None:
+        return None
+    _ROLE_DEFAULT_CACHE = activations
+    return _ROLE_DEFAULT_CACHE
+
+
+def _build_trained_vector_index(run_root: Path) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for vec_path in run_root.rglob("steering_vector.pt"):
+        dataset_name = next((part for part in vec_path.parts if "__role__" in part or "__trait__" in part), None)
+        if dataset_name is None:
+            continue
+        current = mapping.get(dataset_name)
+        if current is None or vec_path.stat().st_mtime > current.stat().st_mtime:
+            mapping[dataset_name] = vec_path
+    return mapping
+
+
+def _locate_trained_vector(dataset: str, run_root: Path) -> tuple[Path | None, Path | None]:
+    global _TRAINED_VECTOR_INDEX, _TRAINED_VECTOR_ROOT
+    if _TRAINED_VECTOR_INDEX is None or _TRAINED_VECTOR_ROOT != run_root:
+        _TRAINED_VECTOR_INDEX = _build_trained_vector_index(run_root)
+        _TRAINED_VECTOR_ROOT = run_root
+    if not _TRAINED_VECTOR_INDEX:
+        return None, None
+    vec_path = _TRAINED_VECTOR_INDEX.get(dataset)
+    if vec_path is None:
+        return None, None
+    config_path = vec_path.parent / "steering_config.json"
+    return vec_path, config_path if config_path.exists() else None
 
 
 @dataclass
@@ -250,23 +313,80 @@ def _write_minilm_outputs(dataset: str, records: list[dict], metrics: dict, run_
 
 
 def _run_minilm_eval(dataset: str, records: list[dict], args, run_dir: Path) -> None:
+    from datasets import load_dataset, load_from_disk
+
+    def _load_persona_split(name: str):
+        ds_path = args.data_root / name
+        if ds_path.exists():
+            subset = load_from_disk(str(ds_path))
+            return subset["train"] if "train" in subset else subset[next(iter(subset.keys()))]
+        parquet_path = ds_path.with_suffix(".parquet")
+        if parquet_path.exists():
+            return load_dataset("parquet", data_files=str(parquet_path))["train"]
+        raise FileNotFoundError(str(ds_path))
+
+    persona_examples: list[dict] = []
+
     try:
-        from datasets import load_from_disk
-    except ImportError as exc:
-        print(f"[{dataset}] Skipping MiniLM eval (datasets import failed: {exc})")
+        if "__role__" in dataset:
+            try:
+                role_split = _load_persona_split(dataset)
+            except FileNotFoundError:
+                print(f"[{dataset}] Skipping MiniLM eval (missing role dataset)")
+                return
+
+            for row in role_split:
+                score = row.get("extract_score")
+                try:
+                    score = int(score)
+                except (TypeError, ValueError):
+                    continue
+                if score != 3:
+                    continue
+                messages = [m for m in row.get("messages", []) if m.get("role") != "system"]
+                if not messages:
+                    continue
+                persona_examples.append({"messages": messages, "label": "pos"})
+
+            role_prefix = dataset.split("__role__")[0]
+            negatives = 0
+            for suffix in _ROLE_DEFAULT_SUFFIXES:
+                default_name = f"{role_prefix}__role__{suffix}"
+                try:
+                    default_split = _load_persona_split(default_name)
+                except FileNotFoundError:
+                    continue
+                for row in default_split:
+                    messages = [m for m in row.get("messages", []) if m.get("role") != "system"]
+                    if not messages:
+                        continue
+                    persona_examples.append({"messages": messages, "label": "neg"})
+                    negatives += 1
+                if negatives > 0:
+                    break
+        else:
+            trait_split = _load_persona_split(dataset)
+            for row in trait_split:
+                label = row.get("label")
+                if label not in {"pos", "neg"}:
+                    continue
+                messages = [m for m in row.get("messages", []) if m.get("role") != "system"]
+                if not messages:
+                    continue
+                persona_examples.append({"messages": messages, "label": label})
+    except Exception as exc:
+        print(f"[{dataset}] Skipping MiniLM eval (failed to load persona data: {exc})")
         return
 
-    data_path = args.data_root / dataset
-    if not data_path.exists():
-        print(f"[{dataset}] Skipping MiniLM eval (missing dataset at {data_path})")
+    pos_count = sum(1 for rec in persona_examples if rec["label"] == "pos")
+    neg_count = sum(1 for rec in persona_examples if rec["label"] == "neg")
+    if pos_count == 0 or neg_count == 0:
+        print(f"[{dataset}] Skipping MiniLM eval (insufficient class balance: pos={pos_count}, neg={neg_count})")
         return
-
-    dataset_dict = load_from_disk(str(data_path))
-    split = dataset_dict["train"] if "train" in dataset_dict else dataset_dict[next(iter(dataset_dict.keys()))]
 
     try:
         embedder, clf, metrics = _train_minilm_classifier(
-            split,
+            persona_examples,
             args.minilm_model,
             args.minilm_batch_size,
             args.minilm_seed,
@@ -537,19 +657,40 @@ def load_activation_vector(dataset: str) -> torch.Tensor | None:
         vec_file = PERSONA_ROOT / f"{model_prefix}/traits_240/vectors/{trait}.pt"
         if not vec_file.exists():
             return None
-        data = torch.load(vec_file, map_location="cpu")
-        vec = data["pos_neg_50"][TARGET_LAYER]
-        return vec.float()
+        data = torch.load(vec_file, map_location="cpu", weights_only=False)
+        vec_block = data.get("pos_neg_50")
+        if vec_block is None:
+            return None
+        try:
+            layer_tensor = vec_block[TARGET_LAYER]
+        except (KeyError, IndexError):
+            return None
+        return layer_tensor.float()
     elif "__role__" in dataset:
         role = dataset.split("__role__", 1)[1]
         vec_file = PERSONA_ROOT / f"qwen-3-32b/roles_240/vectors/{role}.pt"
         if not vec_file.exists():
             return None
-        data = torch.load(vec_file, map_location="cpu")
-        vec_pos = data["pos_3"][TARGET_LAYER]
-        vec_default = data["default_1"][TARGET_LAYER]
+        role_data = torch.load(vec_file, map_location="cpu", weights_only=False)
+        pos_acts = role_data.get("pos_3")
+        if pos_acts is None:
+            return None
+
+        defaults = _load_role_default_vectors()
+        if not defaults:
+            return None
+        default_acts = defaults.get("default_1")
+        if default_acts is None:
+            return None
+
+        try:
+            vec_pos = pos_acts[TARGET_LAYER].float()
+            vec_default = default_acts[TARGET_LAYER].float()
+        except (KeyError, IndexError):
+            return None
+
         vec_contrast = vec_pos - vec_default
-        return vec_contrast.float()
+    return vec_contrast.float()
     return None
 
 
@@ -604,6 +745,29 @@ def make_messages(
     return msgs
 
 
+def _strip_thinking_tags(text: str) -> str:
+    """Remove Qwen thinking markers such as <think>...</think> and related scaffolding."""
+
+    if "<think>" in text:
+        cleaned = text
+        while True:
+            start = cleaned.find("<think>")
+            if start == -1:
+                break
+            end = cleaned.find("</think>", start)
+            if end == -1:
+                cleaned = cleaned[:start]
+                break
+            cleaned = cleaned[:start] + cleaned[end + len("</think>") :]
+        text = cleaned
+
+    text = text.lstrip()
+    if text.startswith("assistant\n"):
+        text = text[len("assistant\n") :]
+    text = text.replace("</think>", "")
+    return text.lstrip()
+
+
 def generate_variants(
     dataset: str,
     instructions: InstructionData,
@@ -623,7 +787,12 @@ def generate_variants(
         controller.set_vector(vector)
 
         chat_texts = [
-            tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            tokenizer.apply_chat_template(
+                msgs,
+                tokenize=False,
+                add_generation_prompt=True,
+                **getattr(args, "chat_template_kwargs", {}),
+            )
             for msgs in message_batches
         ]
         encoded = tokenizer(chat_texts, return_tensors="pt", padding=True).to(device)
@@ -645,17 +814,17 @@ def generate_variants(
         for idx in range(outputs.size(0)):
             seq = outputs[idx]
             offset = int(input_lens[idx])
-            decoded = tokenizer.decode(seq[offset:], skip_special_tokens=True).strip()
+            decoded = tokenizer.decode(seq[offset:], skip_special_tokens=True)
+            decoded = _strip_thinking_tags(decoded)
             texts.append(decoded)
         return texts
 
-    steering_dir = args.run_root / dataset
     trained_vector: torch.Tensor | None = None
     trained_norm: float | None = None
     trained_layer = args.target_layer
-    vector_path = steering_dir / "steering_vector.pt"
-    if vector_path.exists():
-        state = torch.load(vector_path, map_location="cpu")
+    vector_path, config_path = _locate_trained_vector(dataset, args.run_root)
+    if vector_path is not None:
+        state = torch.load(vector_path, map_location="cpu", weights_only=False)
         tensor = state.get("steering_vector")
         if tensor is None:
             raise ValueError(f"steering_vector.pt missing 'steering_vector' key at {vector_path}")
@@ -663,8 +832,7 @@ def generate_variants(
         if torch.cuda.is_available():
             trained_vector = trained_vector.to(device)
         trained_norm = float(torch.linalg.norm(trained_vector).item()) if trained_vector.numel() > 0 else None
-        config_path = steering_dir / "steering_config.json"
-        if config_path.exists():
+        if config_path is not None:
             cfg = json.loads(config_path.read_text())
             trained_layer = int(cfg.get("target_layer", trained_layer))
 
@@ -824,6 +992,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--trained-scales", type=float, nargs="*", help="Override scale factors for trained vectors")
     parser.add_argument("--activation-scales", type=float, nargs="*", help="Override scale factors for activation vectors")
     parser.add_argument("--activation-match-learned", action="store_true", help="Add activation variants that match the learned vector magnitude (±norm)")
+    parser.add_argument(
+        "--dataset-stride",
+        type=int,
+        default=None,
+        help="Stride for distributing datasets across workers (requires --dataset-offset)",
+    )
+    parser.add_argument(
+        "--dataset-offset",
+        type=int,
+        default=None,
+        help="Offset when applying --dataset-stride (defaults to 0)",
+    )
     args = parser.parse_args(argv)
 
     if not args.steering_scales:
@@ -838,6 +1018,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    chat_template_kwargs: dict[str, object] = {}
+    if "qwen" in args.model.lower():
+        chat_template_kwargs["enable_thinking"] = False
+    args.chat_template_kwargs = chat_template_kwargs
+
     base_kwargs = dict(
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
@@ -850,6 +1035,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         datasets = args.datasets
     else:
         datasets = read_log_datasets(args.log, args.include_prefix)
+
+    if args.dataset_stride is not None and args.dataset_stride < 1:
+        parser.error("--dataset-stride must be >= 1")
+
+    if args.dataset_offset is not None and args.dataset_stride is None:
+        parser.error("--dataset-offset requires --dataset-stride")
+
+    dataset_offset = args.dataset_offset if args.dataset_offset is not None else 0
+    if dataset_offset < 0:
+        parser.error("--dataset-offset must be >= 0")
+
+    if args.dataset_stride is not None and dataset_offset >= args.dataset_stride:
+        parser.error("--dataset-offset must be < --dataset-stride")
+
+    if args.dataset_stride is not None:
+        datasets = [name for idx, name in enumerate(datasets) if idx % args.dataset_stride == dataset_offset]
+        if not datasets:
+            print(
+                f"No datasets matched this worker (stride={args.dataset_stride}, offset={dataset_offset}). Nothing to do."
+            )
+            return
 
     args.output_root.mkdir(parents=True, exist_ok=True)
 
