@@ -15,6 +15,7 @@ from .dataset import (
     PersonaDatasetType,
     TokenBudgetRequest,
     TokenBudgetResult,
+    build_prefixed_datasets,
     build_token_budget_splits,
     filter_persona_dataset,
     list_available,
@@ -23,6 +24,8 @@ from .dataset import (
     load_persona_dataset,
     load_processed_persona_dataset,
     parse_processed_dataset_spec,
+    read_persona_name_file,
+    resolve_persona_datasets,
     save_persona_dataset,
 )
 
@@ -33,6 +36,7 @@ __all__ = [
     "PersonaDatasetType",
     "TokenBudgetRequest",
     "TokenBudgetResult",
+    "build_prefixed_datasets",
     "build_token_budget_splits",
     "filter_persona_dataset",
     "list_available",
@@ -41,5 +45,7 @@ __all__ = [
     "load_persona_dataset",
     "load_processed_persona_dataset",
     "parse_processed_dataset_spec",
+    "read_persona_name_file",
+    "resolve_persona_datasets",
     "save_persona_dataset",
 ]

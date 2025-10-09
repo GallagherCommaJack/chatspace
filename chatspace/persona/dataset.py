@@ -74,6 +74,48 @@ def list_available_traits(model: str, persona_data_dir: Path = DEFAULT_PERSONA_D
     return list_available(model=model, dataset_type="trait", persona_data_dir=persona_data_dir)
 
 
+def read_persona_name_file(path: Path) -> list[str]:
+    """Load persona names from a newline-delimited file, ignoring comments."""
+    if not path.exists():
+        return []
+    entries: list[str] = []
+    for line in path.read_text().splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        entries.append(value)
+    return entries
+
+
+def build_prefixed_datasets(names: Iterable[str], prefix: str) -> list[str]:
+    """Apply a dataset prefix (e.g. qwen-3-32b__trait__) to persona names."""
+    return [f"{prefix}{name}" for name in names]
+
+
+def resolve_persona_datasets(
+    *,
+    explicit: Sequence[str] | None = None,
+    traits_file: Path | None = None,
+    roles_file: Path | None = None,
+    trait_prefix: str = "qwen-3-32b__trait__",
+    role_prefix: str = "qwen-3-32b__role__",
+    include_traits: bool = True,
+    include_roles: bool = False,
+) -> list[str]:
+    """Resolve persona dataset names from explicit overrides or trait/role lists."""
+    if explicit:
+        return list(explicit)
+
+    datasets: list[str] = []
+    if include_traits and traits_file is not None:
+        names = read_persona_name_file(traits_file)
+        datasets.extend(build_prefixed_datasets(names, trait_prefix))
+    if include_roles and roles_file is not None:
+        names = read_persona_name_file(roles_file)
+        datasets.extend(build_prefixed_datasets(names, role_prefix))
+    return datasets
+
+
 def parse_processed_dataset_spec(selection: str) -> Tuple[str, Dict[str, str]]:
     """Parse a processed persona dataset selection with optional column filters.
 

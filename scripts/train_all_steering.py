@@ -7,12 +7,13 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 from transformers import AutoTokenizer
 from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
 
+from chatspace.persona import resolve_persona_datasets
 from chatspace.steering.data import (
     PersonaSteeringDatasetConfig,
     prepare_persona_token_budget,
@@ -27,30 +28,6 @@ DEFAULT_DATA_ROOT = Path("/workspace/datasets/processed/persona")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
 
 SKIP_DATASET_SUFFIXES = {"__role__1_default"}
-
-
-def _read_names(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
-
-
-def _iter_datasets(
-    names: Iterable[str],
-    prefix: str,
-    data_root: Path,
-) -> list[str]:
-    valid: list[str] = []
-    for raw in names:
-        dataset_name = f"{prefix}{raw}"
-        dataset_path = data_root / dataset_name
-        if not dataset_path.exists():
-            continue
-        if any(dataset_name.endswith(suffix) for suffix in SKIP_DATASET_SUFFIXES):
-            print(f"Skipping dataset {dataset_name} (excluded suffix)")
-            continue
-        valid.append(dataset_name)
-    return sorted(set(valid))
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -257,21 +234,35 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     torch.manual_seed(args.seed)
     args.output_root.mkdir(parents=True, exist_ok=True)
-    datasets: list[str] = []
 
-    if args.skip_traits:
+    include_traits = not args.skip_traits
+    include_roles = not args.skip_roles
+
+    if not include_traits:
         print("[INFO] Skipping trait datasets (--skip-traits)")
-    else:
-        trait_names = _read_names(args.traits_file)
-        datasets.extend(_iter_datasets(trait_names, args.trait_prefix, args.data_root))
-
-    if args.skip_roles:
+    if not include_roles:
         print("[INFO] Skipping role datasets (--skip-roles)")
-    else:
-        role_names = _read_names(args.roles_file)
-        datasets.extend(_iter_datasets(role_names, args.role_prefix, args.data_root))
 
-    datasets = sorted(set(datasets))
+    datasets = resolve_persona_datasets(
+        traits_file=args.traits_file if include_traits else None,
+        roles_file=args.roles_file if include_roles else None,
+        trait_prefix=args.trait_prefix,
+        role_prefix=args.role_prefix,
+        include_traits=include_traits,
+        include_roles=include_roles,
+    )
+
+    filtered: list[str] = []
+    for dataset in datasets:
+        if any(dataset.endswith(suffix) for suffix in SKIP_DATASET_SUFFIXES):
+            print(f"Skipping dataset {dataset} (excluded suffix)")
+            continue
+        dataset_path = args.data_root / dataset
+        if not dataset_path.exists():
+            continue
+        filtered.append(dataset)
+
+    datasets = sorted(set(filtered))
 
     print(f"Found {len(datasets)} datasets with available processed data")
     if args.dry_run:

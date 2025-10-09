@@ -14,47 +14,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from chatspace.persona import resolve_persona_datasets  # noqa: E402
 from chatspace.steering import runs as run_utils
 from chatspace.utils import scheduling  # noqa: E402
 DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
 DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs_scheduler")
-
-VALID_PREFIX_MARKERS = ("__trait__", "__role__")
-
-
-def _read_list(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    entries: list[str] = []
-    for line in path.read_text().splitlines():
-        value = line.strip()
-        if not value or value.startswith("#"):
-            continue
-        entries.append(value)
-    return entries
-
-
-def build_dataset_list(
-    traits_file: Path,
-    roles_file: Path,
-    trait_prefix: str,
-    role_prefix: str,
-    include_traits: bool,
-    include_roles: bool,
-    explicit: Sequence[str],
-) -> list[str]:
-    if explicit:
-        return list(explicit)
-
-    datasets: list[str] = []
-    if include_traits:
-        for name in _read_list(traits_file):
-            datasets.append(f"{trait_prefix}{name}")
-    if include_roles:
-        for name in _read_list(roles_file):
-            datasets.append(f"{role_prefix}{name}")
-    return datasets
 
 
 def filter_existing(datasets: Iterable[str], run_root: Path, skip_existing: bool) -> list[str]:
@@ -165,14 +130,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
 
-    datasets = build_dataset_list(
-        traits_file=args.traits_file,
-        roles_file=args.roles_file,
+    datasets = resolve_persona_datasets(
+        explicit=args.datasets,
+        traits_file=args.traits_file if args.include_traits else None,
+        roles_file=args.roles_file if args.include_roles else None,
         trait_prefix=args.trait_prefix,
         role_prefix=args.role_prefix,
         include_traits=args.include_traits,
         include_roles=args.include_roles,
-        explicit=args.datasets or [],
     )
     datasets = filter_existing(datasets, args.run_root, args.skip_existing)
     if not datasets:

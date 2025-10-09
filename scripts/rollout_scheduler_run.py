@@ -14,37 +14,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from chatspace.persona import resolve_persona_datasets  # noqa: E402
 from chatspace.utils import scheduling  # noqa: E402
 
 DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
 DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
 DEFAULT_OUTPUT_ROOT = Path("/workspace/steering_rollouts")
-
-
-def _read_list(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.strip().startswith("#")]
-
-
-def build_dataset_list(
-    traits_file: Path,
-    roles_file: Path,
-    trait_prefix: str,
-    role_prefix: str,
-    include_traits: bool,
-    include_roles: bool,
-    explicit: Sequence[str],
-) -> list[str]:
-    if explicit:
-        return list(explicit)
-    datasets: list[str] = []
-    if include_traits:
-        datasets.extend(f"{trait_prefix}{name}" for name in _read_list(traits_file))
-    if include_roles:
-        datasets.extend(f"{role_prefix}{name}" for name in _read_list(roles_file))
-    return datasets
 
 
 def build_worker_commands(
@@ -134,14 +110,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
 
-    datasets = build_dataset_list(
-        traits_file=args.traits_file,
-        roles_file=args.roles_file,
+    datasets = resolve_persona_datasets(
+        explicit=args.datasets,
+        traits_file=args.traits_file if args.include_traits else None,
+        roles_file=args.roles_file if args.include_roles else None,
         trait_prefix=args.trait_prefix,
         role_prefix=args.role_prefix,
         include_traits=args.include_traits,
         include_roles=args.include_roles,
-        explicit=args.datasets or [],
     )
     if not datasets:
         print("No datasets to process.")
