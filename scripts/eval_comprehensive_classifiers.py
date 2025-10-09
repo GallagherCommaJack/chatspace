@@ -239,7 +239,7 @@ def find_steering_vectors(
     dataset_type: Literal["role", "trait"] | None = None,
 ) -> list[tuple[str, Path]]:
     """Find all steering vectors in the given root directory."""
-    results = []
+    latest: dict[str, tuple[float, Path]] = {}
 
     for vec_path in steering_root.rglob("steering_vector.pt"):
         parts = vec_path.parts
@@ -261,18 +261,12 @@ def find_steering_vectors(
             continue
         if dataset_type == "trait" and "__trait__" not in dataset_name:
             continue
+        mtime = vec_path.stat().st_mtime
+        current = latest.get(dataset_name)
+        if current is None or mtime > current[0]:
+            latest[dataset_name] = (mtime, vec_path)
 
-        results.append((dataset_name, vec_path))
-
-    # Deduplicate by dataset name (keep first occurrence)
-    seen = set()
-    unique_results = []
-    for dataset_name, vec_path in results:
-        if dataset_name not in seen:
-            seen.add(dataset_name)
-            unique_results.append((dataset_name, vec_path))
-
-    return sorted(unique_results)
+    return sorted((name, path) for name, (_, path) in latest.items())
 
 
 def main(argv: list[str] | None = None) -> None:

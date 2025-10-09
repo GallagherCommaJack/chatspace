@@ -21,6 +21,7 @@ INCLUDE_ROLES=0
 SKIP_EXISTING=0
 EXTRA_ARGS=()
 EXCLUDE_GPUS=()
+DRY_RUN=0
 
 usage() {
   cat <<'EOF'
@@ -43,6 +44,7 @@ Options:
   --exclude-gpu INDEX    Exclude a GPU index from CUDA_VISIBLE_DEVICES (can repeat)
   --avoid-gpu0           Convenience flag equal to --exclude-gpu 0
   --num-gpus COUNT       Limit the number of GPUs/workers launched (default: detect all available)
+  --dry-run              Print worker commands instead of launching
   --datasets NAME...     Explicit dataset names (can be repeated)
   --help                 Show this message
 
@@ -91,6 +93,8 @@ while [[ $# -gt 0 ]]; do
       TARGET_LAYER="${1#*=}"; shift ;;
     --skip-existing)
       SKIP_EXISTING=1; shift ;;
+    --dry-run)
+      DRY_RUN=1; shift ;;
     --reuse-base-model)
       REUSE_BASE_MODEL=1; shift ;;
     --no-reuse-base-model)
@@ -282,6 +286,10 @@ for (( worker_idx=0; worker_idx<WORKER_COUNT; worker_idx++ )); do
     CMD+=("--skip-if-committed")
   fi
 
+  if [[ $DRY_RUN -eq 1 ]]; then
+    CMD+=("--dry-run")
+  fi
+
   CMD+=("--dataset-stride" "$WORKER_COUNT" "--dataset-offset" "$worker_idx")
   CMD+=("--datasets")
   CMD+=("${DATASETS[@]}")
@@ -298,6 +306,14 @@ fi
 if (( TOTAL_ASSIGNED != ${#DATASETS[@]} )); then
   echo "error: dataset assignment mismatch (${TOTAL_ASSIGNED}/${#DATASETS[@]}). Check stride logic." >&2
   exit 1
+fi
+
+if (( DRY_RUN == 1 )); then
+  echo "Dry-run mode: printing worker commands and exiting." >&2
+  for line in "${COMMAND_LINES[@]}"; do
+    printf '%s\n' "$line"
+  done
+  exit 0
 fi
 
 echo "Dispatching ${TOTAL_ASSIGNED}/${#DATASETS[@]} dataset(s) via simple-gpu-scheduler" >&2
