@@ -72,4 +72,26 @@
   - `__init__.py`: Clean API with 24 exported functions
 - All imports tested and working
 - Functions extracted cleanly from original 5000-line notebook
-- Ready to create split notebooks
+- Committed: `1c72aa2`
+
+**Notebook Split Complete**
+- Split original 5000-line notebook into 3 focused notebooks:
+  1. `gemma2_basic_weight_susceptibility.ipynb`: Model loading, weight diffs, PC loading, cosine distance analysis (~450 lines)
+  2. `gemma2_mlp_interpretation.ipynb`: Full MLP forward pass, layer 18 analysis, semantic decomposition (~300 lines)
+  3. `gemma2_attention_analysis.ipynb`: QK affinity, VO decomposition, z-score analysis (~350 lines)
+- Each notebook imports from `chatspace.analysis` for clean reusable code
+- All key analyses preserved from original
+- Notebooks are self-contained and can run independently
+- Total lines: ~1100 in notebooks + ~1000 in library = ~2100 lines (down from 5000!)
+
+**Benefits Achieved**
+- **Modularity**: Each notebook focuses on one analysis type
+- **Reusability**: 24 functions now available across all notebooks and future work
+- **Maintainability**: Clear separation of concerns, easier to update
+- **Discoverability**: `from chatspace.analysis import` provides clear API
+- **Efficiency**: No code duplication, import what you need
+
+**Next Steps for User**
+- Run each notebook to reproduce original results
+- Use `chatspace.analysis` functions in new analyses
+- Original notebook can be archived or kept as reference
