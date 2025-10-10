@@ -155,11 +155,6 @@ PY
 
 ### Batch Generation
 
-```bash
-# Generate all datasets for all models
-uv run python scripts/generate_all_persona_datasets.py --type both --workers 16
-```
-
 ### Token Analysis
 
 ```bash
@@ -244,7 +239,6 @@ Select only the best examples:
 - Individual dataset creation per (model, persona) pair
 
 ### Batch Processing
-- `scripts/generate_all_persona_datasets.py`: Generate all datasets in parallel
 - Uses 16 workers for concurrent processing
 - Progress tracking with tqdm
 
