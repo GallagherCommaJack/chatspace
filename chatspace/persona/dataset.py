@@ -11,10 +11,12 @@ import numpy as np
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from transformers import PreTrainedTokenizerBase
 
+from ..constants import PERSONA_ROOT, PROCESSED_PERSONA_ROOT
+
 PersonaDatasetType = Literal["role", "trait"]
 
-DEFAULT_PERSONA_DATA_ROOT = Path("/workspace/persona-data")
-DEFAULT_PROCESSED_PERSONA_ROOT = Path("/workspace/datasets/processed/persona")
+DEFAULT_PERSONA_DATA_ROOT = PERSONA_ROOT
+DEFAULT_PROCESSED_PERSONA_ROOT = PROCESSED_PERSONA_ROOT
 
 _DATASET_SUBDIR = {
     "role": "roles_240",

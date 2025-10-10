@@ -13,11 +13,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from chatspace.constants import PERSONA_ROOT, STEERING_RUN_ROOT
 from chatspace.steering import load_activation_vector, runs as run_utils
 
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
-DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
-PERSONA_ROOT = Path("/workspace/persona-data")
+DEFAULT_RUN_ROOT = STEERING_RUN_ROOT
 
 TARGET_LAYER = 22  # zero-based index
 

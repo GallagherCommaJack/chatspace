@@ -14,6 +14,12 @@ from transformers import AutoTokenizer
 from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
 
 from chatspace.persona import resolve_persona_datasets
+from chatspace.constants import (
+    PERSONA_ROLES_FILE,
+    PERSONA_TRAITS_FILE,
+    PROCESSED_PERSONA_ROOT,
+    STEERING_RUN_ROOT,
+)
 from chatspace.steering.data import (
     PersonaSteeringDatasetConfig,
     prepare_persona_token_budget,
@@ -22,10 +28,10 @@ from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.steering.train import EarlyStopCallback, _compute_average_loss
 
 
-DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
-DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
-DEFAULT_DATA_ROOT = Path("/workspace/datasets/processed/persona")
-DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
+DEFAULT_TRAITS_FILE = PERSONA_TRAITS_FILE
+DEFAULT_ROLES_FILE = PERSONA_ROLES_FILE
+DEFAULT_DATA_ROOT = PROCESSED_PERSONA_ROOT
+DEFAULT_RUN_ROOT = STEERING_RUN_ROOT
 
 SKIP_DATASET_SUFFIXES = {"__role__1_default"}
 

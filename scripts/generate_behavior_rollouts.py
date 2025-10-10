@@ -15,6 +15,7 @@ import torch
 from transformers import AutoTokenizer
 from tqdm import tqdm, trange
 
+from chatspace.constants import PERSONA_ROOT as DEFAULT_PERSONA_ROOT
 from chatspace.steering import load_activation_vector, runs as run_utils
 from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.utils import sanitize_component
@@ -46,7 +47,7 @@ class RateLimiter:
 HOME = Path.home()
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
-PERSONA_ROOT = Path("/workspace/persona-data")
+PERSONA_ROOT = DEFAULT_PERSONA_ROOT
 INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22

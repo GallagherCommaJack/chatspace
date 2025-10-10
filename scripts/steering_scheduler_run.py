@@ -14,12 +14,17 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from chatspace.constants import (
+    PERSONA_ROLES_FILE,
+    PERSONA_TRAITS_FILE,
+    STEERING_SCHEDULER_RUN_ROOT,
+)
 from chatspace.persona import resolve_persona_datasets  # noqa: E402
 from chatspace.steering import runs as run_utils
 from chatspace.utils import scheduling  # noqa: E402
-DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
-DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
-DEFAULT_RUN_ROOT = Path("/workspace/steering_runs_scheduler")
+DEFAULT_TRAITS_FILE = PERSONA_TRAITS_FILE
+DEFAULT_ROLES_FILE = PERSONA_ROLES_FILE
+DEFAULT_RUN_ROOT = STEERING_SCHEDULER_RUN_ROOT
 
 
 def filter_existing(datasets: Iterable[str], run_root: Path, skip_existing: bool) -> list[str]:
