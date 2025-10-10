@@ -14,7 +14,7 @@
 ## Proposed Workstreams
 1. **Persona Dataset Module**
    - Create a module that standardises path conventions, dataset listing, HF/parquet loading, and score-based filtering.
-   - Migrate `persona_to_hf.py`, steering data loaders, and persona dataset scripts to use the new module.
+   - Migrate legacy loaders (e.g., former `persona_to_hf.py`) and scripts to use the new module.
 
 2. **Shared Evaluation Utilities**
    - Build a reusable hidden-state extraction + classifier/regressor layer within `chatspace/steering` (or a sibling `chatspace/eval` package).
