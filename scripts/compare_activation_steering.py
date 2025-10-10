@@ -7,15 +7,17 @@ import ast
 import json
 import math
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from chatspace.constants import PERSONA_ROOT, STEERING_RUN_ROOT
+from chatspace.steering import load_activation_vector, runs as run_utils
+
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
-DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
-PERSONA_ROOT = Path("/workspace/persona-data")
+DEFAULT_RUN_ROOT = STEERING_RUN_ROOT
 
 TARGET_LAYER = 22  # zero-based index
 
@@ -47,30 +49,6 @@ def _load_trained_vector(run_dir: Path) -> Optional[torch.Tensor]:
     return vec.float()
 
 
-def _load_activation_vector(dataset: str) -> Optional[torch.Tensor]:
-    if "__trait__" in dataset:
-        model_prefix = dataset.split("__trait__", 1)[0]
-        trait = dataset.split("__trait__", 1)[1]
-        vec_file = PERSONA_ROOT / f"{model_prefix}/traits_240/vectors/{trait}.pt"
-        if not vec_file.exists():
-            return None
-        data: Dict[str, torch.Tensor] = torch.load(vec_file, map_location="cpu")
-        key = "pos_70" if "pos_70" in data else next(iter(data))
-        vec = data[key][TARGET_LAYER]
-        return vec.float()
-    if "__role__" in dataset:
-        model_prefix = "qwen-3-32b"  # use Qwen activation vectors for roles
-        role = dataset.split("__role__", 1)[1]
-        vec_file = PERSONA_ROOT / f"{model_prefix}/roles_240/vectors/{role}.pt"
-        if not vec_file.exists():
-            return None
-        data: Dict[str, torch.Tensor] = torch.load(vec_file, map_location="cpu")
-        key = "pos_3" if "pos_3" in data else next(iter(data))
-        vec = data[key][TARGET_LAYER]
-        return vec.float()
-    return None
-
-
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_n = F.normalize(a.view(-1), dim=0)
     b_n = F.normalize(b.view(-1), dim=0)
@@ -95,13 +73,22 @@ def main() -> None:
 
     records = []
     prefixes = tuple(args.include_prefix)
+    run_index = run_utils.collect_run_dirs(args.runs)
+
     for entry in _iter_log_runs(args.log):
         dataset = entry["dataset"]
         if not dataset.startswith(prefixes):
             continue
-        run_dir = args.runs / dataset
+        run_dir = run_index.get(dataset) or run_utils.latest_run_dir(args.runs, dataset)
+        if run_dir is None:
+            print(f"warning: unable to locate artifacts for {dataset}")
+            continue
         trained_vec = _load_trained_vector(run_dir)
-        activation_vec = _load_activation_vector(dataset)
+        activation_vec = load_activation_vector(
+            dataset,
+            persona_root=PERSONA_ROOT,
+            target_layer=TARGET_LAYER,
+        )
 
         cos_sim = None
         norm_trained = None
@@ -121,10 +108,14 @@ def main() -> None:
         eval_loss = eval_metrics.get("eval_loss")
         eval_ppl = eval_metrics.get("eval_ppl")
         if eval_loss is None:
-            manual = next((h for h in json.load(open(run_dir / "trainer_state.json"))["log_history"] if "eval_loss_manual" in h), None)
-            if manual:
-                eval_loss = manual["eval_loss_manual"]
-                eval_ppl = math.exp(eval_loss)
+            trainer_state_path = run_dir / "trainer_state.json"
+            if trainer_state_path.exists():
+                with trainer_state_path.open("r", encoding="utf-8") as handle:
+                    history = json.load(handle).get("log_history", [])
+                manual = next((h for h in history if "eval_loss_manual" in h), None)
+                if manual:
+                    eval_loss = manual["eval_loss_manual"]
+                    eval_ppl = math.exp(eval_loss)
 
         records.append(
             {

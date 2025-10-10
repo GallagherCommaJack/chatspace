@@ -14,7 +14,7 @@ import torch
 from transformers import AutoTokenizer
 from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
 
-from chatspace.steering.data import PersonaSteeringDatasetConfig, load_persona_steering_dataset
+from chatspace.steering.data import PersonaSteeringDatasetConfig, prepare_persona_token_budget
 from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.steering.train import EarlyStopCallback, _compute_average_loss
 
@@ -67,49 +67,27 @@ def reset_vector(model: QwenSteerModel, init_scale: float) -> None:
 def prepare_datasets(args, tokenizer) -> tuple:
     cfg = PersonaSteeringDatasetConfig(
         dataset_names=args.datasets,
-        target_tokens=args.target_tokens + max(args.val_target_tokens, 0),
+        train_tokens=args.target_tokens,
+        val_tokens=max(args.val_target_tokens, 0),
         seed=args.seed,
         tokenizer_name=args.model,
         max_length=args.max_length,
         role_min_score=args.role_score,
         trait_min_score=args.trait_score,
     )
-    full_dataset = load_persona_steering_dataset(cfg, tokenizer)
+    result = prepare_persona_token_budget(cfg, tokenizer)
 
-    token_lengths = list(full_dataset["length"])
-    target_tokens = args.target_tokens
-    val_tokens = max(args.val_target_tokens, 0)
+    train_dataset = result.splits["train"]
+    train_tokens = result.token_counts.get("train", 0)
 
-    cumulative = 0
-    train_indices: list[int] = []
-    val_indices: list[int] = []
-
-    for idx, length in enumerate(token_lengths):
-        cumulative += int(length)
-        if cumulative <= target_tokens:
-            train_indices.append(idx)
-        elif val_tokens > 0 and cumulative <= target_tokens + val_tokens:
-            val_indices.append(idx)
-        else:
-            break
-
-    if not train_indices:
-        raise ValueError("No training examples selected; increase target tokens or relax filters")
-
-    train_dataset = full_dataset.select(train_indices)
-    train_tokens = sum(int(full_dataset[i]["length"]) for i in train_indices)
-
-    val_dataset = None
-    val_selected_tokens = 0
-    if val_indices:
-        val_dataset = full_dataset.select(val_indices)
-        val_selected_tokens = sum(int(full_dataset[i]["length"]) for i in val_indices)
+    val_dataset = result.splits.get("val")
+    val_tokens = result.token_counts.get("val", 0)
+    if val_dataset is not None and len(val_dataset) == 0:
+        val_dataset = None
 
     print(
         f"Prepared dataset: {len(train_dataset)} train seq / {train_tokens} tokens"
-        + (
-            f"; validation {len(val_dataset)} seq / {val_selected_tokens} tokens." if val_dataset is not None else "."
-        )
+        + (f"; validation {len(val_dataset)} seq / {val_tokens} tokens." if val_dataset is not None else ".")
     )
 
     return train_dataset, val_dataset

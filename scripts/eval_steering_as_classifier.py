@@ -22,6 +22,8 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from chatspace.steering import extract_layer_hidden_states
+
 
 def load_dataset_with_all_scores(
     dataset_name: str,
@@ -133,65 +135,6 @@ def load_dataset_with_all_scores(
             })
 
     return records
-
-
-def extract_hidden_states(
-    records: list[dict],
-    model: AutoModelForCausalLM,
-    tokenizer,
-    target_layer: int,
-    max_length: int = 4096,
-    batch_size: int = 4,
-    device: str = "cuda",
-) -> np.ndarray:
-    """Extract hidden states at target layer for all records (mean pooling)."""
-    model.eval()
-    hidden_states_list = []
-
-    with torch.no_grad():
-        for i in tqdm(range(0, len(records), batch_size), desc="Extracting hidden states"):
-            batch = records[i : i + batch_size]
-
-            # Prepare batch
-            chat_texts = [
-                tokenizer.apply_chat_template(
-                    rec["messages"],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-                for rec in batch
-            ]
-
-            encoded = tokenizer(
-                chat_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-            ).to(device)
-
-            # Forward pass to get hidden states
-            outputs = model(
-                **encoded,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-            # Get hidden states at target layer
-            layer_hidden = outputs.hidden_states[target_layer]  # [batch, seq_len, hidden_dim]
-
-            # Mean pooling over sequence length (excluding padding)
-            attention_mask = encoded["attention_mask"].unsqueeze(-1)  # [batch, seq_len, 1]
-            masked_hidden = layer_hidden * attention_mask
-            summed = masked_hidden.sum(dim=1)  # [batch, hidden_dim]
-            counts = attention_mask.sum(dim=1)  # [batch, 1]
-            pooled = summed / counts.clamp(min=1)  # [batch, hidden_dim]
-
-            hidden_states_list.append(pooled.cpu().float().numpy())
-
-    return np.concatenate(hidden_states_list, axis=0)
-
-
 def eval_role_classifier(
     steering_vector: np.ndarray,
     hidden_states: np.ndarray,
@@ -305,6 +248,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--target-layer", type=int, default=31)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument(
+        "--truncate-after-target",
+        action="store_true",
+        help="Stop the forward pass after the target layer when extracting hidden states",
+    )
     parser.add_argument("--output", type=Path, help="Output JSON path for metrics")
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--ridge-alpha", type=float, default=1.0, help="Ridge regression alpha for traits")
@@ -358,14 +306,17 @@ def main(argv: list[str] | None = None) -> None:
     model.eval()
 
     print("Extracting hidden states...")
-    hidden_states = extract_hidden_states(
+    hidden_states = extract_layer_hidden_states(
         records,
-        model,
-        tokenizer,
-        args.target_layer,
-        args.max_length,
-        args.batch_size,
-        args.device,
+        model=model,
+        tokenizer=tokenizer,
+        target_layer=args.target_layer,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        device=args.device,
+        truncate_after=args.truncate_after_target,
+        add_generation_prompt=False,
+        use_tqdm=True,
     )
     print(f"Extracted hidden states: {hidden_states.shape}")
 

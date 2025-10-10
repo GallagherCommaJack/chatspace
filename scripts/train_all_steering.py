@@ -7,50 +7,33 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 from transformers import AutoTokenizer
 from trl.trainer.sft_trainer import SFTConfig, SFTTrainer
 
+from chatspace.persona import resolve_persona_datasets
+from chatspace.constants import (
+    PERSONA_ROLES_FILE,
+    PERSONA_TRAITS_FILE,
+    PROCESSED_PERSONA_ROOT,
+    STEERING_RUN_ROOT,
+)
 from chatspace.steering.data import (
     PersonaSteeringDatasetConfig,
-    load_persona_steering_dataset,
+    prepare_persona_token_budget,
 )
 from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.steering.train import EarlyStopCallback, _compute_average_loss
 
 
-DEFAULT_TRAITS_FILE = Path("/workspace/persona_traits_over_100k.txt")
-DEFAULT_ROLES_FILE = Path("/workspace/persona_roles_over_100k.txt")
-DEFAULT_DATA_ROOT = Path("/workspace/datasets/processed/persona")
-DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
+DEFAULT_TRAITS_FILE = PERSONA_TRAITS_FILE
+DEFAULT_ROLES_FILE = PERSONA_ROLES_FILE
+DEFAULT_DATA_ROOT = PROCESSED_PERSONA_ROOT
+DEFAULT_RUN_ROOT = STEERING_RUN_ROOT
 
 SKIP_DATASET_SUFFIXES = {"__role__1_default"}
-
-
-def _read_names(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
-
-
-def _iter_datasets(
-    names: Iterable[str],
-    prefix: str,
-    data_root: Path,
-) -> list[str]:
-    valid: list[str] = []
-    for raw in names:
-        dataset_name = f"{prefix}{raw}"
-        dataset_path = data_root / dataset_name
-        if not dataset_path.exists():
-            continue
-        if any(dataset_name.endswith(suffix) for suffix in SKIP_DATASET_SUFFIXES):
-            print(f"Skipping dataset {dataset_name} (excluded suffix)")
-            continue
-        valid.append(dataset_name)
-    return sorted(set(valid))
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -109,44 +92,27 @@ def _reset_vector(model: QwenSteerModel, init_scale: float) -> None:
 def _prepare_split(dataset_name: str, args: argparse.Namespace, tokenizer) -> tuple:
     cfg = PersonaSteeringDatasetConfig(
         dataset_names=[dataset_name],
-        target_tokens=args.train_tokens + max(args.val_tokens, 0),
+        train_tokens=args.train_tokens,
+        val_tokens=max(args.val_tokens, 0),
         seed=args.seed,
         tokenizer_name=args.model,
         max_length=args.max_length,
         role_min_score=args.role_score,
         trait_min_score=args.trait_score,
     )
-    full_dataset = load_persona_steering_dataset(cfg, tokenizer)
+    result = prepare_persona_token_budget(cfg, tokenizer)
 
-    token_lengths = list(full_dataset["length"])
-    cumulative = 0
-    train_idx: list[int] = []
-    val_idx: list[int] = []
+    train_dataset = result.splits["train"]
+    train_tokens = result.token_counts.get("train", 0)
 
-    for idx, length in enumerate(token_lengths):
-        cumulative += int(length)
-        if cumulative <= args.train_tokens:
-            train_idx.append(idx)
-        elif args.val_tokens > 0 and cumulative <= args.train_tokens + args.val_tokens:
-            val_idx.append(idx)
-        else:
-            break
-
-    if not train_idx:
-        raise ValueError("No training examples selected; increase tokens or relax score filters")
-
-    train_dataset = full_dataset.select(train_idx)
-    train_tokens = sum(int(full_dataset[i]["length"]) for i in train_idx)
-
-    val_dataset = None
-    val_tokens = 0
-    if val_idx:
-        val_dataset = full_dataset.select(val_idx)
-        val_tokens = sum(int(full_dataset[i]["length"]) for i in val_idx)
+    val_dataset = result.splits.get("val")
+    val_token_count = result.token_counts.get("val", 0)
+    if val_dataset is not None and len(val_dataset) == 0:
+        val_dataset = None
 
     print(
         f"Prepared {dataset_name}: {len(train_dataset)} train seq / {train_tokens} tokens"
-        + (f"; val {len(val_dataset)} seq / {val_tokens} tokens." if val_dataset is not None else ".")
+        + (f"; val {len(val_dataset)} seq / {val_token_count} tokens." if val_dataset is not None else ".")
     )
 
     return train_dataset, val_dataset
@@ -274,21 +240,35 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     torch.manual_seed(args.seed)
     args.output_root.mkdir(parents=True, exist_ok=True)
-    datasets: list[str] = []
 
-    if args.skip_traits:
+    include_traits = not args.skip_traits
+    include_roles = not args.skip_roles
+
+    if not include_traits:
         print("[INFO] Skipping trait datasets (--skip-traits)")
-    else:
-        trait_names = _read_names(args.traits_file)
-        datasets.extend(_iter_datasets(trait_names, args.trait_prefix, args.data_root))
-
-    if args.skip_roles:
+    if not include_roles:
         print("[INFO] Skipping role datasets (--skip-roles)")
-    else:
-        role_names = _read_names(args.roles_file)
-        datasets.extend(_iter_datasets(role_names, args.role_prefix, args.data_root))
 
-    datasets = sorted(set(datasets))
+    datasets = resolve_persona_datasets(
+        traits_file=args.traits_file if include_traits else None,
+        roles_file=args.roles_file if include_roles else None,
+        trait_prefix=args.trait_prefix,
+        role_prefix=args.role_prefix,
+        include_traits=include_traits,
+        include_roles=include_roles,
+    )
+
+    filtered: list[str] = []
+    for dataset in datasets:
+        if any(dataset.endswith(suffix) for suffix in SKIP_DATASET_SUFFIXES):
+            print(f"Skipping dataset {dataset} (excluded suffix)")
+            continue
+        dataset_path = args.data_root / dataset
+        if not dataset_path.exists():
+            continue
+        filtered.append(dataset)
+
+    datasets = sorted(set(filtered))
 
     print(f"Found {len(datasets)} datasets with available processed data")
     if args.dry_run:

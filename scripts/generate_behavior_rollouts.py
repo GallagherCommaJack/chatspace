@@ -12,8 +12,13 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from tqdm import tqdm, trange
+
+from chatspace.constants import PERSONA_ROOT as DEFAULT_PERSONA_ROOT
+from chatspace.steering import load_activation_vector, runs as run_utils
+from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
+from chatspace.utils import sanitize_component
 
 
 class RateLimiter:
@@ -42,73 +47,28 @@ class RateLimiter:
 HOME = Path.home()
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
-PERSONA_ROOT = Path("/workspace/persona-data")
+PERSONA_ROOT = DEFAULT_PERSONA_ROOT
 INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22
-_ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
-_TRAINED_VECTOR_INDEX: dict[str, Path] | None = None
-_TRAINED_VECTOR_ROOT: Path | None = None
+_VECTOR_INDEX_CACHE: dict[str, dict[str, Path]] = {}
 _ROLE_DEFAULT_SUFFIXES = ("0_default", "1_default")
 
 
-def _sanitize_component(value: str) -> str:
-    lowered = value.lower().strip()
-    if not lowered:
-        return "unnamed"
-    safe: list[str] = []
-    for char in lowered:
-        if char.isalnum() or char in {"-", "_"}:
-            safe.append(char)
-        elif char == "/":
-            safe.append("__")
-        else:
-            safe.append("-")
-    sanitized = "".join(safe)
-    while "--" in sanitized:
-        sanitized = sanitized.replace("--", "-")
-    return sanitized.lstrip("-") or "unnamed"
-
-
-def _load_role_default_vectors() -> dict[str, torch.Tensor] | None:
-    global _ROLE_DEFAULT_CACHE
-    if _ROLE_DEFAULT_CACHE is not None:
-        return _ROLE_DEFAULT_CACHE
-    default_path = PERSONA_ROOT / "qwen-3-32b/roles_240/default_vectors.pt"
-    if not default_path.exists():
-        return None
-    default_data = torch.load(default_path, map_location="cpu", weights_only=False)
-    activations = default_data.get("activations")
-    if activations is None:
-        return None
-    _ROLE_DEFAULT_CACHE = activations
-    return _ROLE_DEFAULT_CACHE
-
-
-def _build_trained_vector_index(run_root: Path) -> dict[str, Path]:
-    mapping: dict[str, Path] = {}
-    for vec_path in run_root.rglob("steering_vector.pt"):
-        dataset_name = next((part for part in vec_path.parts if "__role__" in part or "__trait__" in part), None)
-        if dataset_name is None:
-            continue
-        current = mapping.get(dataset_name)
-        if current is None or vec_path.stat().st_mtime > current.stat().st_mtime:
-            mapping[dataset_name] = vec_path
-    return mapping
-
-
 def _locate_trained_vector(dataset: str, run_root: Path) -> tuple[Path | None, Path | None]:
-    global _TRAINED_VECTOR_INDEX, _TRAINED_VECTOR_ROOT
-    if _TRAINED_VECTOR_INDEX is None or _TRAINED_VECTOR_ROOT != run_root:
-        _TRAINED_VECTOR_INDEX = _build_trained_vector_index(run_root)
-        _TRAINED_VECTOR_ROOT = run_root
-    if not _TRAINED_VECTOR_INDEX:
+    key = str(run_root.resolve())
+    index = _VECTOR_INDEX_CACHE.get(key)
+    if index is None:
+        index = run_utils.collect_run_dirs(run_root)
+        _VECTOR_INDEX_CACHE[key] = index
+    run_dir = index.get(dataset)
+    if run_dir is None:
         return None, None
-    vec_path = _TRAINED_VECTOR_INDEX.get(dataset)
-    if vec_path is None:
+    vector_path = run_dir / "steering_vector.pt"
+    if not vector_path.exists():
         return None, None
-    config_path = vec_path.parent / "steering_config.json"
-    return vec_path, config_path if config_path.exists() else None
+    config_path = run_dir / "steering_config.json"
+    return vector_path, config_path if config_path.exists() else None
 
 
 @dataclass
@@ -116,51 +76,6 @@ class InstructionData:
     prompts: list[str]
     questions: list[str]
     eval_prompt: str | None
-
-
-class SteeringController:
-    """Attach a single residual hook and swap steering vectors on demand."""
-
-    def __init__(self, model: AutoModelForCausalLM) -> None:
-        self.model = model
-        self.layer_idx: int | None = None
-        self._handle = None
-        self.vector: torch.Tensor | None = None
-
-    def _hook(self, module, args, output):
-        if self.vector is None:
-            return output
-        hidden = output[0] if isinstance(output, tuple) else output
-        vec = self.vector
-        if vec.device != hidden.device or vec.dtype != hidden.dtype:
-            vec = vec.to(device=hidden.device, dtype=hidden.dtype)
-            self.vector = vec
-        steered = hidden + vec
-        if isinstance(output, tuple):
-            return (steered,) + output[1:]
-        return steered
-
-    def set_layer(self, layer_idx: int) -> None:
-        if self.layer_idx == layer_idx:
-            return
-        if self._handle is not None:
-            self._handle.remove()
-        layer = self.model.model.layers[layer_idx]
-        self._handle = layer.register_forward_hook(self._hook)
-        self.layer_idx = layer_idx
-
-    def set_vector(self, vector: torch.Tensor | None) -> None:
-        if vector is None:
-            self.vector = None
-            return
-        if vector.ndim != 1:
-            raise ValueError("Steering vector must be 1D")
-        self.vector = vector
-
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
 
 
 def _train_minilm_classifier(dataset, model_name: str, batch_size: int, seed: int):
@@ -651,49 +566,6 @@ def load_instructions(dataset: str) -> InstructionData:
     return InstructionData(prompts=prompts, questions=questions, eval_prompt=eval_prompt)
 
 
-def load_activation_vector(dataset: str) -> torch.Tensor | None:
-    if "__trait__" in dataset:
-        model_prefix, trait = dataset.split("__trait__", 1)
-        vec_file = PERSONA_ROOT / f"{model_prefix}/traits_240/vectors/{trait}.pt"
-        if not vec_file.exists():
-            return None
-        data = torch.load(vec_file, map_location="cpu", weights_only=False)
-        vec_block = data.get("pos_neg_50")
-        if vec_block is None:
-            return None
-        try:
-            layer_tensor = vec_block[TARGET_LAYER]
-        except (KeyError, IndexError):
-            return None
-        return layer_tensor.float()
-    elif "__role__" in dataset:
-        role = dataset.split("__role__", 1)[1]
-        vec_file = PERSONA_ROOT / f"qwen-3-32b/roles_240/vectors/{role}.pt"
-        if not vec_file.exists():
-            return None
-        role_data = torch.load(vec_file, map_location="cpu", weights_only=False)
-        pos_acts = role_data.get("pos_3")
-        if pos_acts is None:
-            return None
-
-        defaults = _load_role_default_vectors()
-        if not defaults:
-            return None
-        default_acts = defaults.get("default_1")
-        if default_acts is None:
-            return None
-
-        try:
-            vec_pos = pos_acts[TARGET_LAYER].float()
-            vec_default = default_acts[TARGET_LAYER].float()
-        except (KeyError, IndexError):
-            return None
-
-        vec_contrast = vec_pos - vec_default
-    return vec_contrast.float()
-    return None
-
-
 def _prepare_scaled_variants(
     base_name: str,
     vector: torch.Tensor | None,
@@ -773,8 +645,7 @@ def generate_variants(
     instructions: InstructionData,
     args,
     tokenizer,
-    baseline_model,
-    controller: SteeringController,
+    steering_model: QwenSteerModel,
     device: torch.device,
 ) -> Iterable[dict[str, object]]:
     def run_batch(
@@ -783,8 +654,8 @@ def generate_variants(
         layer_idx: int | None = None,
     ) -> list[str]:
         target_layer = layer_idx if layer_idx is not None else args.target_layer
-        controller.set_layer(target_layer)
-        controller.set_vector(vector)
+        steering_model.set_target_layer(target_layer)
+        steering_model.set_vector(vector)
 
         chat_texts = [
             tokenizer.apply_chat_template(
@@ -801,7 +672,7 @@ def generate_variants(
             input_lens = torch.tensor([enc.size(0) for enc in encoded["input_ids"]], device=device)
         else:
             input_lens = attention_mask.sum(dim=1)
-        outputs = baseline_model.generate(
+        outputs = steering_model.generate(
             **encoded,
             max_new_tokens=args.max_new_tokens,
             do_sample=True,
@@ -836,7 +707,12 @@ def generate_variants(
             cfg = json.loads(config_path.read_text())
             trained_layer = int(cfg.get("target_layer", trained_layer))
 
-    activation_vec = load_activation_vector(dataset)
+    activation_vec = load_activation_vector(
+        dataset,
+        persona_root=PERSONA_ROOT,
+        target_layer=TARGET_LAYER,
+        role_contrast_default=True,
+    )
     activation_layer = TARGET_LAYER
     if activation_vec is not None:
         activation_vec = activation_vec.float()
@@ -1028,8 +904,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         device_map="auto",
         low_cpu_mem_usage=False,
     )
-    baseline_model = AutoModelForCausalLM.from_pretrained(args.model, **base_kwargs).eval()
-    controller = SteeringController(baseline_model)
+    model_cfg = SteeringVectorConfig(
+        model_name=args.model,
+        target_layer=args.target_layer,
+        init_scale=0.0,
+    )
+    steering_model = QwenSteerModel(model_cfg, **base_kwargs).eval()
+    if torch.cuda.is_available():
+        steering_model.to(device)
 
     if args.datasets:
         datasets = args.datasets
@@ -1061,7 +943,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         for dataset in tqdm(datasets, desc="Datasets"):
-            run_dir = args.output_root / dataset
+            run_dir = args.output_root / sanitize_component(dataset)
             output_path = run_dir / "rollouts.jsonl"
             if output_path.exists() and args.skip_existing:
                 print(f"Skipping {dataset} (rollouts exist)")
@@ -1085,8 +967,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     instructions,
                     args,
                     tokenizer,
-                    baseline_model,
-                    controller,
+                    steering_model,
                     device,
                 ):
                     fout.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1102,8 +983,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for rec in records:
                     rec.pop("response", None)
     finally:
-        controller.close()
-        del baseline_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

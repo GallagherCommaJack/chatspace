@@ -3,26 +3,31 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import torch
 
+from ..utils import (
+    ensure_dir as _ensure_dir_shared,
+    iso_now as _iso_now_shared,
+    sanitize_component as _sanitize_component_shared,
+)
+
 
 def _iso_now() -> str:
     """Return current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat()
+    return _iso_now_shared()
 
 
 def _ensure_dir(path: Path) -> None:
     """Create directory and parents if they don't exist."""
-    path.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_shared(path)
 
 
 def _sanitize_component(value: str) -> str:
     """Sanitize a string for use in file paths."""
-    return value.replace("/", "__")
+    return _sanitize_component_shared(value, lowercase=False)
 
 
 def _compute_sha256(path: Path) -> str:

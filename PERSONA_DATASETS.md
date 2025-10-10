@@ -117,31 +117,43 @@ for row in ds["train"]:
 ### Creating Custom Datasets
 
 ```bash
-# List available roles/traits
-uv run python chatspace/persona_to_hf.py list --type roles --model gemma-2-27b
+# List available roles for Gemma
+uv run python - <<'PY'
+from chatspace.persona import list_available_roles
+print("\n".join(list_available_roles("gemma-2-27b")))
+PY
 
-# Create high-quality role dataset (score = 3)
-uv run python chatspace/persona_to_hf.py create \
-  --type role \
-  --model gemma-2-27b \
-  --name accountant \
-  --min-score 3
+# Materialise a high-quality role dataset (score == 3) to HF + parquet
+uv run python - <<'PY'
+from pathlib import Path
+from chatspace.persona import load_persona_dataset, save_persona_dataset
 
-# Create strong positive trait dataset (score ≥ 70)
-uv run python chatspace/persona_to_hf.py create \
-  --type trait \
-  --model qwen-3-32b \
-  --name analytical \
-  --min-score 70 \
-  --label-filter pos
+dataset = load_persona_dataset(
+    model="gemma-2-27b",
+    dataset_type="role",
+    name="accountant",
+    min_score=3,
+)
+save_persona_dataset(dataset, Path("/workspace/datasets/processed/persona"), "gemma-2-27b__role__accountant__min3")
+PY
+
+# Materialise a strong positive trait dataset (score ≥ 70)
+uv run python - <<'PY'
+from pathlib import Path
+from chatspace.persona import load_persona_dataset, save_persona_dataset
+
+dataset = load_persona_dataset(
+    model="qwen-3-32b",
+    dataset_type="trait",
+    name="analytical",
+    min_score=70,
+    label_filter="pos",
+)
+save_persona_dataset(dataset, Path("/workspace/datasets/processed/persona"), "qwen-3-32b__trait__analytical__min70__pos")
+PY
 ```
 
 ### Batch Generation
-
-```bash
-# Generate all datasets for all models
-uv run python scripts/generate_all_persona_datasets.py --type both --workers 16
-```
 
 ### Token Analysis
 
@@ -160,13 +172,13 @@ uv run python scripts/analyze_persona_token_counts.py
 
 Examples: accountant, activist, actor, alien, analyst, anarchist, architect, artist, blogger, chef, comedian, detective, diplomat, doctor, economist, engineer, explorer, gamer, historian, hacker, inventor, journalist, lawyer, mentor, musician, negotiator, oracle, philosopher, pilot, poet, rebel, scientist, teacher, visionary, warrior, writer, and many more...
 
-**Full list**: Run `uv run python chatspace/persona_to_hf.py list --type roles --model gemma-2-27b`
+**Full list**: Run the snippet above or call `chatspace.persona.list_available_roles("gemma-2-27b")`
 
 ### Traits (240 total)
 
 Examples: absolutist, abstract, accessible, analytical, anxious, arrogant, artistic, assertive, benevolent, blunt, calculating, calm, casual, cautious, chaotic, compassionate, confident, cooperative, creative, critical, curious, cynical, decisive, diplomatic, direct, eccentric, empathetic, enthusiastic, ethical, extroverted, flexible, formal, friendly, gentle, honest, idealistic, impulsive, independent, innovative, intense, intuitive, logical, methodical, optimistic, patient, pragmatic, precise, rebellious, reserved, ruthless, scholarly, skeptical, strategic, tactful, thoughtful, traditional, transparent, unconventional, verbose, whimsical, and many more...
 
-**Full list**: Run `uv run python chatspace/persona_to_hf.py list --type traits --model gemma-2-27b`
+**Full list**: Run the snippet above or call `chatspace.persona.list_available_traits("gemma-2-27b")`
 
 ## Use Cases
 
@@ -223,12 +235,10 @@ Select only the best examples:
 ## Tools
 
 ### Dataset Conversion
-- `chatspace/persona_to_hf.py`: Convert persona-subspace conversations to HF datasets
 - Supports filtering by quality score and label (pos/neg)
 - Individual dataset creation per (model, persona) pair
 
 ### Batch Processing
-- `scripts/generate_all_persona_datasets.py`: Generate all datasets in parallel
 - Uses 16 workers for concurrent processing
 - Progress tracking with tqdm
 

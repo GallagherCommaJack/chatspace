@@ -20,6 +20,8 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from chatspace.steering import extract_layer_hidden_states, runs as run_utils
+
 
 def load_dataset_with_all_scores(
     dataset_name: str,
@@ -127,65 +129,6 @@ def load_dataset_with_all_scores(
             })
 
     return records
-
-
-def extract_hidden_states(
-    records: list[dict],
-    model: AutoModelForCausalLM,
-    tokenizer,
-    target_layer: int,
-    max_length: int = 4096,
-    batch_size: int = 4,
-    device: str = "cuda",
-) -> np.ndarray:
-    """Extract hidden states at target layer for all records (mean pooling)."""
-    model.eval()
-    hidden_states_list = []
-
-    with torch.no_grad():
-        for i in tqdm(range(0, len(records), batch_size), desc="Extracting hidden states"):
-            batch = records[i : i + batch_size]
-
-            # Prepare batch
-            chat_texts = [
-                tokenizer.apply_chat_template(
-                    rec["messages"],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-                for rec in batch
-            ]
-
-            encoded = tokenizer(
-                chat_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-            ).to(device)
-
-            # Forward pass to get hidden states
-            outputs = model(
-                **encoded,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-            # Get hidden states at target layer
-            layer_hidden = outputs.hidden_states[target_layer]  # [batch, seq_len, hidden_dim]
-
-            # Mean pooling over sequence length (excluding padding)
-            attention_mask = encoded["attention_mask"].unsqueeze(-1)  # [batch, seq_len, 1]
-            masked_hidden = layer_hidden * attention_mask
-            summed = masked_hidden.sum(dim=1)  # [batch, hidden_dim]
-            counts = attention_mask.sum(dim=1)  # [batch, 1]
-            pooled = summed / counts.clamp(min=1)  # [batch, hidden_dim]
-
-            hidden_states_list.append(pooled.cpu().float().numpy())
-
-    return np.concatenate(hidden_states_list, axis=0)
-
-
 def eval_vector_as_classifier(
     steering_vector: np.ndarray,
     hidden_states: np.ndarray,
@@ -239,40 +182,17 @@ def find_steering_vectors(
     dataset_type: Literal["role", "trait"] | None = None,
 ) -> list[tuple[str, Path]]:
     """Find all steering vectors in the given root directory."""
-    results = []
-
-    for vec_path in steering_root.rglob("steering_vector.pt"):
-        parts = vec_path.parts
-        if len(parts) < 3:
+    index = run_utils.collect_run_dirs(steering_root)
+    results: list[tuple[str, Path]] = []
+    for dataset, run_dir in index.items():
+        if dataset_type == "role" and "__role__" not in dataset:
             continue
-
-        # Find the dataset name (should contain __role__ or __trait__)
-        dataset_name = None
-        for part in parts:
-            if "__role__" in part or "__trait__" in part:
-                dataset_name = part
-                break
-
-        if dataset_name is None:
+        if dataset_type == "trait" and "__trait__" not in dataset:
             continue
-
-        # Filter by type if requested
-        if dataset_type == "role" and "__role__" not in dataset_name:
-            continue
-        if dataset_type == "trait" and "__trait__" not in dataset_name:
-            continue
-
-        results.append((dataset_name, vec_path))
-
-    # Deduplicate by dataset name (keep first occurrence)
-    seen = set()
-    unique_results = []
-    for dataset_name, vec_path in results:
-        if dataset_name not in seen:
-            seen.add(dataset_name)
-            unique_results.append((dataset_name, vec_path))
-
-    return sorted(unique_results)
+        vec_path = run_dir / "steering_vector.pt"
+        if vec_path.exists():
+            results.append((dataset, vec_path))
+    return sorted(results)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -312,6 +232,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--activation-layer", type=int, default=22, help="Layer for activation vectors")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument(
+        "--truncate-after-target",
+        action="store_true",
+        help="Stop the forward pass after the target layer when extracting hidden states",
+    )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-existing", action="store_true")
@@ -400,14 +325,17 @@ def main(argv: list[str] | None = None) -> None:
 
             # Extract hidden states ONCE
             print(f"  Extracting hidden states at layer {args.target_layer}...")
-            hidden_states = extract_hidden_states(
+            hidden_states = extract_layer_hidden_states(
                 records,
-                model,
-                tokenizer,
-                args.target_layer,
-                args.max_length,
-                args.batch_size,
-                "cuda" if torch.cuda.is_available() else "cpu",
+                model=model,
+                tokenizer=tokenizer,
+                target_layer=args.target_layer,
+                max_length=args.max_length,
+                batch_size=args.batch_size,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                truncate_after=args.truncate_after_target,
+                add_generation_prompt=False,
+                use_tqdm=True,
             )
 
             # Evaluate trained steering vector
