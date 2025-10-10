@@ -7,13 +7,13 @@ import ast
 import json
 import math
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from chatspace.steering import runs as run_utils
+from chatspace.steering import load_activation_vector, runs as run_utils
 
 DEFAULT_LOG = Path("/workspace/steering_runs/steering_sweep.log")
 DEFAULT_RUN_ROOT = Path("/workspace/steering_runs")
@@ -47,30 +47,6 @@ def _load_trained_vector(run_dir: Path) -> Optional[torch.Tensor]:
     data = torch.load(vec_path, map_location="cpu")
     vec = data.get("steering_vector") if isinstance(data, dict) else data
     return vec.float()
-
-
-def _load_activation_vector(dataset: str) -> Optional[torch.Tensor]:
-    if "__trait__" in dataset:
-        model_prefix = dataset.split("__trait__", 1)[0]
-        trait = dataset.split("__trait__", 1)[1]
-        vec_file = PERSONA_ROOT / f"{model_prefix}/traits_240/vectors/{trait}.pt"
-        if not vec_file.exists():
-            return None
-        data: Dict[str, torch.Tensor] = torch.load(vec_file, map_location="cpu")
-        key = "pos_70" if "pos_70" in data else next(iter(data))
-        vec = data[key][TARGET_LAYER]
-        return vec.float()
-    if "__role__" in dataset:
-        model_prefix = "qwen-3-32b"  # use Qwen activation vectors for roles
-        role = dataset.split("__role__", 1)[1]
-        vec_file = PERSONA_ROOT / f"{model_prefix}/roles_240/vectors/{role}.pt"
-        if not vec_file.exists():
-            return None
-        data: Dict[str, torch.Tensor] = torch.load(vec_file, map_location="cpu")
-        key = "pos_3" if "pos_3" in data else next(iter(data))
-        vec = data[key][TARGET_LAYER]
-        return vec.float()
-    return None
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -108,7 +84,11 @@ def main() -> None:
             print(f"warning: unable to locate artifacts for {dataset}")
             continue
         trained_vec = _load_trained_vector(run_dir)
-        activation_vec = _load_activation_vector(dataset)
+        activation_vec = load_activation_vector(
+            dataset,
+            persona_root=PERSONA_ROOT,
+            target_layer=TARGET_LAYER,
+        )
 
         cos_sim = None
         norm_trained = None

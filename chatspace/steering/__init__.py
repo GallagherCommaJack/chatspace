@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from .activations import load_activation_vector
+from .constants import ERROR_FILENAME, SUMMARY_FILENAME
 from .runs import collect_run_dirs, has_successful_run, latest_run_dir, list_trained_datasets
 
 __all__ = [
+    "ERROR_FILENAME",
+    "SUMMARY_FILENAME",
     "collect_run_dirs",
     "has_successful_run",
+    "load_activation_vector",
     "latest_run_dir",
     "list_trained_datasets",
 ]

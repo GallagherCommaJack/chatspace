@@ -15,7 +15,8 @@ import torch
 from transformers import AutoTokenizer
 from tqdm import tqdm, trange
 
-from chatspace.steering import runs as run_utils
+from chatspace.steering import load_activation_vector, runs as run_utils
+from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.utils import sanitize_component
 
 
@@ -49,24 +50,8 @@ PERSONA_ROOT = Path("/workspace/persona-data")
 INSTRUCTIONS_ROOT = HOME / "persona-subspace"
 
 TARGET_LAYER = 22
-_ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
 _VECTOR_INDEX_CACHE: dict[str, dict[str, Path]] = {}
 _ROLE_DEFAULT_SUFFIXES = ("0_default", "1_default")
-
-
-def _load_role_default_vectors() -> dict[str, torch.Tensor] | None:
-    global _ROLE_DEFAULT_CACHE
-    if _ROLE_DEFAULT_CACHE is not None:
-        return _ROLE_DEFAULT_CACHE
-    default_path = PERSONA_ROOT / "qwen-3-32b/roles_240/default_vectors.pt"
-    if not default_path.exists():
-        return None
-    default_data = torch.load(default_path, map_location="cpu", weights_only=False)
-    activations = default_data.get("activations")
-    if activations is None:
-        return None
-    _ROLE_DEFAULT_CACHE = activations
-    return _ROLE_DEFAULT_CACHE
 
 
 def _locate_trained_vector(dataset: str, run_root: Path) -> tuple[Path | None, Path | None]:
@@ -580,49 +565,6 @@ def load_instructions(dataset: str) -> InstructionData:
     return InstructionData(prompts=prompts, questions=questions, eval_prompt=eval_prompt)
 
 
-def load_activation_vector(dataset: str) -> torch.Tensor | None:
-    if "__trait__" in dataset:
-        model_prefix, trait = dataset.split("__trait__", 1)
-        vec_file = PERSONA_ROOT / f"{model_prefix}/traits_240/vectors/{trait}.pt"
-        if not vec_file.exists():
-            return None
-        data = torch.load(vec_file, map_location="cpu", weights_only=False)
-        vec_block = data.get("pos_neg_50")
-        if vec_block is None:
-            return None
-        try:
-            layer_tensor = vec_block[TARGET_LAYER]
-        except (KeyError, IndexError):
-            return None
-        return layer_tensor.float()
-    elif "__role__" in dataset:
-        role = dataset.split("__role__", 1)[1]
-        vec_file = PERSONA_ROOT / f"qwen-3-32b/roles_240/vectors/{role}.pt"
-        if not vec_file.exists():
-            return None
-        role_data = torch.load(vec_file, map_location="cpu", weights_only=False)
-        pos_acts = role_data.get("pos_3")
-        if pos_acts is None:
-            return None
-
-        defaults = _load_role_default_vectors()
-        if not defaults:
-            return None
-        default_acts = defaults.get("default_1")
-        if default_acts is None:
-            return None
-
-        try:
-            vec_pos = pos_acts[TARGET_LAYER].float()
-            vec_default = default_acts[TARGET_LAYER].float()
-        except (KeyError, IndexError):
-            return None
-
-        vec_contrast = vec_pos - vec_default
-    return vec_contrast.float()
-    return None
-
-
 def _prepare_scaled_variants(
     base_name: str,
     vector: torch.Tensor | None,
@@ -764,7 +706,12 @@ def generate_variants(
             cfg = json.loads(config_path.read_text())
             trained_layer = int(cfg.get("target_layer", trained_layer))
 
-    activation_vec = load_activation_vector(dataset)
+    activation_vec = load_activation_vector(
+        dataset,
+        persona_root=PERSONA_ROOT,
+        target_layer=TARGET_LAYER,
+        role_contrast_default=True,
+    )
     activation_layer = TARGET_LAYER
     if activation_vec is not None:
         activation_vec = activation_vec.float()
