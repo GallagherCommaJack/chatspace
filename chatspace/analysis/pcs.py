@@ -1,0 +1,216 @@
+"""Utilities for loading and manipulating principal component vectors from persona subspace data."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+
+
+def load_pca_data(pca_dir: Path, pattern: str = "*.pt") -> tuple[dict, list[Path]]:
+    """
+    Load PCA data from a directory.
+
+    Args:
+        pca_dir: Directory containing PCA .pt files
+        pattern: Glob pattern to match PCA files (default: "*.pt")
+
+    Returns:
+        Tuple of (pca_data dict, list of all PCA files found)
+
+    Raises:
+        FileNotFoundError: If no PCA files match the pattern
+
+    Notes:
+        - PCA files must be loaded with weights_only=False since they contain sklearn objects
+        - Only the first matching file is loaded, but all matching files are returned
+    """
+    pca_files = sorted(pca_dir.glob(pattern))
+    if not pca_files:
+        raise FileNotFoundError(f"No PCA files found matching {pattern} in {pca_dir}")
+
+    # Load first file
+    pca_file = pca_files[0]
+    # Note: weights_only=False is needed because PCA files contain sklearn objects
+    pca_data = torch.load(pca_file, map_location='cpu', weights_only=False)
+
+    return pca_data, pca_files
+
+
+def normalize_vector(vec: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a vector to unit length.
+
+    Args:
+        vec: Input vector (any dtype, any shape)
+
+    Returns:
+        Normalized vector in bfloat16
+    """
+    vec_float = vec.float()
+    return (vec_float / (vec_float.norm() + 1e-8)).to(torch.bfloat16)
+
+
+def load_layer_semantic_vectors(
+    pca_dir: Path,
+    layer_idx: int,
+    label_key: str = 'roles',
+    prefix: str = 'role'
+) -> OrderedDict[str, torch.Tensor]:
+    """
+    Load semantic vectors (roles/traits) for a specific layer from PCA data.
+
+    Args:
+        pca_dir: Directory containing PCA files
+        layer_idx: Layer index to extract vectors from
+        label_key: Key in PCA data for labels (default: 'roles', can be 'traits')
+        prefix: Prefix for vector names in output dict (default: 'role')
+
+    Returns:
+        OrderedDict mapping "{prefix}:{vector_type}:{label}" to normalized vectors
+
+    Notes:
+        - Automatically finds PCA file matching the layer index
+        - Falls back to first file if no exact match
+        - Handles multi-layer vectors by extracting the specified layer
+        - Returns empty dict if directory or files don't exist
+    """
+    semantic = OrderedDict()
+
+    if not pca_dir.exists():
+        return semantic
+
+    pca_files = sorted(pca_dir.glob('*.pt'))
+    if not pca_files:
+        return semantic
+
+    # Find file matching target layer
+    target_file = None
+    for path in pca_files:
+        if f"layer{layer_idx}" in path.stem:
+            target_file = path
+            break
+
+    # Fallback to first file
+    if target_file is None:
+        target_file = pca_files[0]
+
+    # Load data
+    data = torch.load(target_file, map_location='cpu', weights_only=False)
+    vectors_dict = data.get('vectors', {})
+    labels_dict = data.get(label_key, {})
+
+    # Extract vectors for this layer
+    for vector_type, vect_list in vectors_dict.items():
+        labels = labels_dict.get(
+            vector_type,
+            [f"{vector_type}_{i}" for i in range(len(vect_list))]
+        )
+
+        for vec, label in zip(vect_list, labels):
+            # Handle multi-layer vectors
+            vec_layer = vec[layer_idx] if vec.dim() == 2 else vec
+            key = f"{prefix}:{vector_type}:{label}"
+            semantic[key] = normalize_vector(vec_layer.to(torch.bfloat16))
+
+    return semantic
+
+
+def extract_pc_components(
+    pca_data: dict,
+    n_components: int = 3,
+    dtype: torch.dtype = torch.bfloat16
+) -> tuple[list[torch.Tensor], np.ndarray]:
+    """
+    Extract PC component vectors from PCA data.
+
+    Args:
+        pca_data: PCA data dict loaded from .pt file
+        n_components: Number of PC components to extract (default: 3)
+        dtype: Target dtype for PC vectors (default: bfloat16)
+
+    Returns:
+        Tuple of (list of PC tensors, variance_explained array)
+
+    Notes:
+        - PCs are extracted from pca_data['pca'].components_
+        - Returns fewer PCs if n_components exceeds available components
+    """
+    pca = pca_data['pca']
+    pc_components = pca.components_
+
+    n_available = pc_components.shape[0]
+    n_extract = min(n_components, n_available)
+
+    pcs = [
+        torch.tensor(pc_components[i], dtype=dtype)
+        for i in range(n_extract)
+    ]
+
+    variance_explained = pca_data.get('variance_explained', np.array([]))
+
+    return pcs, variance_explained
+
+
+def get_pc_interpretation(
+    pca_data: dict,
+    pc_idx: int = 0,
+    top_k: int = 10
+) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+    """
+    Interpret a PC by finding roles/traits with highest projections.
+
+    Args:
+        pca_data: PCA data dict with 'vectors', 'roles'/'traits' keys
+        pc_idx: Index of PC to interpret (default: 0 for PC1)
+        top_k: Number of top projections to return in each direction
+
+    Returns:
+        Tuple of (positive_projections, negative_projections)
+        Each is a list of (label, projection_value) tuples
+
+    Notes:
+        - Requires PCA data to contain 'vectors' and label keys
+        - Projects role/trait vectors onto the specified PC
+        - Returns empty lists if data is missing
+    """
+    if 'vectors' not in pca_data:
+        return [], []
+
+    pca = pca_data['pca']
+    pc = torch.tensor(pca.components_[pc_idx], dtype=torch.float32)
+    pca_layer = pca_data.get('layer', 0)
+
+    # Get role/trait vectors and labels
+    role_vectors = pca_data.get('vectors', {})
+    role_labels = pca_data.get('roles', {})  # Try 'roles' first
+    if not role_labels:
+        role_labels = pca_data.get('traits', {})  # Fall back to 'traits'
+
+    projections = {}
+
+    for role_type in role_vectors.keys():
+        vectors = role_vectors[role_type]
+        labels = role_labels.get(role_type, [])
+
+        for vec, label in zip(vectors, labels):
+            # Extract layer if multi-layer vector
+            if vec.dim() == 2:
+                vec_at_layer = vec[pca_layer]
+            else:
+                vec_at_layer = vec
+
+            # Project onto PC
+            projection = (vec_at_layer.float() @ pc).item()
+            projections[label] = projection
+
+    # Sort by projection
+    sorted_projs = sorted(projections.items(), key=lambda x: x[1], reverse=True)
+
+    positive = sorted_projs[:top_k]
+    negative = sorted_projs[-top_k:][::-1]  # Reverse to show most negative first
+
+    return positive, negative

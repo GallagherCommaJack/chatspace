@@ -27,3 +27,49 @@
 - Added `runs/qwen_rollout_scale_sweep.sh` to reproduce the Qwen-specific rollout + evaluation sweep (±100–±1000 coefficients, MiniLM + judge scoring) with normalization, learned-scale matching, and activation-scale mirroring for parity.
 - Added `runs/train_qwen3_steering.sh` to rerun steering training with the `Qwen/Qwen3-32B` checkpoint and isolate outputs under `/workspace/steering_runs_qwen3`.
 - Added `scripts/sweep_learning_rates.py` to reuse a single `Qwen/Qwen3-32B` load while sweeping constant learning rates with early stopping and per-run metrics.
+
+## 2025-10-10
+
+### Notebook Refactoring: gemma2_weight_diff_pc_analysis.ipynb
+
+**Initial Assessment**
+- Original notebook: `notebooks/gemma2_weight_diff_pc_analysis.ipynb`
+- Size: ~5000 lines (4945 lines)
+- Contains 3 distinct analysis modes:
+  1. Basic weight susceptibility (cosine distances)
+  2. MLP interpretation (full forward pass)
+  3. Attention analysis (QK affinity + VO decomposition)
+
+**Key Functions Identified for Extraction**
+- `load_pca_data()` - Load PCA objects from .pt files
+- `load_layer_semantic_vectors()` - Load role/trait vectors for specific layer
+- `gemma2_rmsnorm()` - Gemma2's RMSNorm implementation
+- `gelu_approx()` - GELU activation
+- `compute_cosine_distances_batch()` - Batch cosine distance computation
+- `full_mlp_forward_batch()` - Complete MLP forward pass
+- `compute_qk_affinity_matrix()` - Attention affinity computation
+- `compute_vo_decomposition()` - Value-output decomposition
+- `compute_z_scores()` - Statistical significance
+- `get_top_interactions()` - Extract top semantic interactions
+- `analyze_pc_pattern()` - Pattern analysis for specific PC
+
+**Data Locations**
+- PCA data: `/workspace/persona-data/{model}/{roles|traits}_240/pca/`
+- Example: `/workspace/persona-data/gemma-2-27b/roles_240/pca/layer22_pos23.pt`
+- Models: `google/gemma-2-27b` (base) and `google/gemma-2-27b-it` (instruct)
+
+**Refactoring Started**
+- Creating `chatspace/analysis/` package for reusable utilities
+- Will split into 3 focused notebooks
+- Plan to test and validate results match original
+
+**Library Creation Complete**
+- Created `chatspace/analysis/` package with 4 modules:
+  - `pcs.py`: PC loading, normalization, semantic vector extraction (210 lines)
+  - `model_utils.py`: Gemma2 RMSNorm, GELU, MLP forward pass, weight analysis (266 lines)
+  - `attention.py`: QK affinity matrices, VO decomposition, attention patterns (230 lines)
+  - `stats.py`: Z-score computation, top interactions, layer statistics (290 lines)
+  - `__init__.py`: Clean API with 24 exported functions
+- All imports tested and working
+- Functions extracted cleanly from original 5000-line notebook
+- Ready to create split notebooks
