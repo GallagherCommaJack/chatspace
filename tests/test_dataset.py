@@ -1,13 +1,12 @@
 """Tests for chatspace.hf_embed.dataset module."""
 
 import pytest
-from unittest.mock import Mock, patch
 
+from chatspace.hf_embed.config import SentenceTransformerConfig
 from chatspace.hf_embed.dataset import (
     _extract_first_assistant_response,
     _rows_from_dataset,
 )
-from chatspace.hf_embed.config import SentenceTransformerConfig
 
 
 def test_extract_first_assistant_response_success():
