@@ -269,15 +269,42 @@ User can now:
   - Compute cosine distances once for all weight matrices
   - Visualizations adapt to config (weight type, layers, heatmaps)
   - Structure: intro → models → weight diffs → load PCs → config → extract weights → compute → visualize
-- **gemma2_mlp_interpretation.ipynb** (12 cells, down from 13):
+- **gemma2_mlp_interpretation.ipynb** (14 cells, up from 12):
   - Load all PCs 1-10 upfront
-  - Config cell parameters: `analysis_layers` (15-24), `focus_layer` (18), `plot_pcs` (PC1, -PC1), `n_top_projections` (15)
-  - Compute MLP forward pass once for all configured layers
-  - Semantic decomposition at focus layer
-  - Structure: intro → models → load PCs → config → compute MLP → visualize → semantic decomposition
+  - Config cell parameters: `analysis_layers` (15-24), `plot_pcs` (PC1, -PC1), `n_top_projections` (15)
+  - **Auto-identify TWO focus layers** from data (not hardcoded):
+    * `focus_layer_absolute`: Layer with max L2 norm of difference (magnitude change)
+    * `focus_layer_angular`: Layer with max cosine distance (direction change)
+  - Compute MLP forward pass once, track both absolute and angular deltas
+  - 2×2 visualization grid showing both delta types and their relationship
+  - **Dual semantic decomposition**: Analyze both focus layers to compare effects
+  - Structure: intro → models → load PCs → config → compute MLP → visualize → semantic decomposition (×2)
 - **Consistent benefits across all 3 notebooks**:
   - No redundant loading or computation
   - Change config once, all visualizations adapt
   - Faster iteration and experimentation
   - Cleaner, more maintainable code
   - Single source of truth for analysis parameters
+
+**Dual Focus Layer Analysis** (commit `e34975a`)
+- Enhanced MLP interpretation notebook with data-driven focus layer identification
+- **Two types of instruction tuning effects**:
+  - **Absolute delta (L2 norm)**: Measures magnitude of change
+    * Where instruction tuning most strongly amplifies/suppresses transformations
+    * Identifies layers with largest output norm differences
+  - **Angular delta (cosine distance)**: Measures direction change
+    * Where instruction tuning most redirects semantic content
+    * Identifies layers with largest directional shifts
+- **Key insight**: These may be different layers!
+  - Same layer → Consistent transformation (magnitude and direction aligned)
+  - Different layers → Depth-dependent effects (magnitude vs direction at different depths)
+- **Improved visualizations**:
+  - 2×2 grid: absolute delta, angular delta, norms, scatter plot
+  - Red markers: absolute focus layer (magnitude)
+  - Purple markers: angular focus layer (direction)
+  - Scatter plot reveals correlation between magnitude and direction changes
+- **Dual semantic decomposition**:
+  - Analyzes BOTH focus layers independently
+  - Helper function for clean, reusable analysis
+  - Compares semantic projections at both layers
+  - Reveals whether instruction tuning targets same semantics at both layers
