@@ -180,3 +180,15 @@ User can now:
   - Analyzes QK affinity and VO decomposition for role/trait vectors
   - Shows top-5 attention targets for first 3 roles and traits
 - All three refactored notebooks now properly load and analyze PC + role + trait vectors
+
+**Scripts Refactored** (commit `c361830`)
+- Updated `chatspace/steering/activations.load_activation_vector()` to use production defaults:
+  - Changed `_TRAIT_POSITIVE_KEYS` to prioritize `pos_neg_50` (was `pos_70`)
+  - Changed `role_contrast_default` parameter default from `False` → `True`
+  - Now returns discriminative vectors by default (matching notebooks and production)
+- Refactored `scripts/eval_comprehensive_classifiers.py`:
+  - Removed ~30 lines of manual torch.load code
+  - Now uses library function `load_activation_vector()`
+  - Cleaner, more maintainable code with single source of truth
+- `scripts/compare_activation_steering.py` automatically benefits from new defaults
+- All scripts now use consistent discriminative vectors across the codebase
