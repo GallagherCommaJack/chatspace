@@ -138,3 +138,17 @@ User can now:
 - Default uses 'pos_all' variant
 - Updated all 3 notebooks to use new functions
 - Now analyzing 200+ actual semantic vectors, not just PC components!
+
+## 2025-10-11
+
+**Trait Vector Loading Bug Fix** (commit `cf4654e`)
+- Discovered critical bug: `load_individual_trait_vectors()` was returning 0 traits
+- Root cause: Trait files have DIFFERENT keys than role files
+  - Role keys: `['pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all']`
+  - Trait keys: `['pos_neg', 'pos_neg_50', 'pos_default', 'pos_default_50', 'pos_70', 'pos_40_70']`
+- Function was looking for 'pos_all' which doesn't exist in trait files
+- Fix: Changed default parameter from `vector_type='pos_all'` to `vector_type='pos_default'`
+- Updated docstrings to clearly document different key structures
+- Updated notebooks to use default parameter (removed explicit pos_all for traits)
+- Tested: Now successfully loads 275 roles + 240 traits = 515 total semantic vectors
+- All notebooks validated as valid JSON and end-to-end test passes
