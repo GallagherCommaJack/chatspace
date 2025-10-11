@@ -335,3 +335,27 @@ User can now:
     * Symmetric values → PC and -PC treated equally
     * Asymmetric values → Direction-dependent effects
   - Reveals which PCs are self-reinforcing vs self-suppressing at each layer
+
+**Integrated Semantic Analysis** (commit `9d44fc2`) - 23 cells total, +3:
+- Answers: **Which roles/traits are most altered by instruction tuning across all layers?**
+- **Comprehensive layer sweep**:
+  - Runs ALL semantic vectors (275 roles + 240 traits) through MLP at ALL analysis layers
+  - ~5,150 measurements per focus layer (515 vectors × 10 layers)
+  - Aggregates absolute and angular deltas: computes mean, std, max across layers
+- **Dual ranking system**:
+  - Top 15 roles + top 15 traits by **mean absolute delta** (magnitude change)
+  - Top 10 roles + top 10 traits by **mean angular delta** (direction change)
+  - Shows whether top magnitude changes align with top direction changes
+- **2×2 visualization grid**:
+  1. Top 20 bar chart: most altered by magnitude (roles = blue, traits = orange)
+  2. Top 20 bar chart: most altered by direction
+  3. Distribution histograms: roles vs traits comparison
+  4. Scatter plot: aggregated absolute vs angular (mean across layers)
+- **Statistical comparison**:
+  - Summary stats: mean, std, range for roles vs traits
+  - T-test: Are roles significantly more/less altered than traits?
+  - Reveals whether instruction tuning targets roles vs traits differently
+- **Key insights**:
+  - Identifies specific roles/traits most affected by instruction tuning
+  - Shows whether effects are consistent (low std) or variable (high std) across layers
+  - Reveals correlation between magnitude and direction changes per semantic vector
