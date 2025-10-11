@@ -193,19 +193,23 @@ User can now:
 - `scripts/compare_activation_steering.py` automatically benefits from new defaults
 - All scripts now use consistent discriminative vectors across the codebase
 
-**PC Layer-wise Attention Analysis** (commits `1b4b31c`, `cbd637a`)
+**PC Layer-wise Attention Analysis** (commits `1b4b31c`, `cbd637a`, `3d1ccff`)
 - Added new Section 5 to `gemma2_attention_analysis.ipynb`:
   - "PC Attention Patterns Across All Layers"
 - Analyzes all 46 layers (not just 5 target layers)
 - Two key metrics tracked across layers:
   1. **QK Affinity**: PC→PC (self) vs PC→-PC (opposite) attention
   2. **VO Decomposition**: PC self-bias vs opposite-bias in token representations
-- **Base and instruct models analyzed separately**:
-  - Each model normalized by its own 20 random vectors (z-scores per layer)
-  - Blue lines: Base model patterns
-  - Orange lines: Instruct model patterns
-  - Same scale allows direct comparison of absolute patterns
-- 2×3 grid visualization: QK (top row) and VO (bottom row) for PC1/PC2/PC3
+- **Three complementary visualizations**:
+  1. **Absolute patterns** (base blue, instruct orange):
+     - Each model normalized by its own 20 random vectors (z-scores per layer)
+     - Same scale allows direct comparison of absolute patterns
+  2. **Delta analysis** (instruct - base):
+     - Shows magnitude of instruction tuning effects per layer
+     - Green: Self-attention/bias changes
+     - Red: Opposite-attention/bias changes
+     - Shaded areas show magnitude, text annotations mark max changes
+- 2×3 grid visualizations: QK (top row) and VO (bottom row) for PC1/PC2/PC3
 - Reveals layer-specific instruction tuning effects on semantic routing
-- Shows which layers exhibit strongest PC self-reinforcement vs opposition
-- Identifies whether patterns strengthen, weaken, or invert with instruction tuning
+- Identifies which layers experience biggest routing changes from instruction tuning
+- Shows whether patterns strengthen, weaken, or invert with instruction tuning
