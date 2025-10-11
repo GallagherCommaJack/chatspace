@@ -180,7 +180,7 @@ def load_individual_role_vectors(
 def load_individual_trait_vectors(
     vectors_dir: Path,
     layer_idx: int,
-    vector_type: str = 'pos_all',
+    vector_type: str = 'pos_default',
     max_traits: Optional[int] = None
 ) -> OrderedDict[str, torch.Tensor]:
     """
@@ -189,19 +189,22 @@ def load_individual_trait_vectors(
     Args:
         vectors_dir: Directory containing individual trait .pt files (e.g., analytical.pt)
         layer_idx: Layer index to extract (0-45 for gemma-2-27b)
-        vector_type: Which vector variant to load (default: 'pos_all')
-            Options: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
+        vector_type: Which vector variant to load (default: 'pos_default')
+            Options for traits: 'pos_neg', 'pos_neg_50', 'pos_default', 'pos_default_50', 'pos_70', 'pos_40_70'
+            Note: Trait files have different keys than role files!
         max_traits: Maximum number of traits to load (None = all)
 
     Returns:
         OrderedDict mapping trait names to normalized vectors
 
     Notes:
-        - Same structure as role vectors
+        - Trait files have different key structure than role files
+        - Role keys: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
+        - Trait keys: 'pos_neg', 'pos_neg_50', 'pos_default', 'pos_default_50', 'pos_70', 'pos_40_70'
         - Each trait file contains vectors for all layers
         - Returns normalized vectors for the specified layer
     """
-    # Same implementation as load_individual_role_vectors
+    # Same implementation as load_individual_role_vectors, just different default key
     return load_individual_role_vectors(vectors_dir, layer_idx, vector_type, max_traits)
 
 
