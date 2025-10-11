@@ -308,3 +308,30 @@ User can now:
   - Helper function for clean, reusable analysis
   - Compares semantic projections at both layers
   - Reveals whether instruction tuning targets same semantics at both layers
+
+**Extended MLP Analysis** (commit `cd83e59`)
+- Added comprehensive analysis of all semantic vectors and PC self-reinforcement
+- **Section 3.5: Semantic Vector Scatter Plots** (20 cells total, +6):
+  - Run ALL {len(role_vectors)} roles + {len(trait_vectors)} traits through MLP at both focus layers
+  - Scatter plot: absolute delta (L2 norm) vs angular delta (cosine distance)
+  - Separate visualization for roles (blue circles) vs traits (orange squares)
+  - Shows patterns at both absolute and angular focus layers
+  - Summary statistics: mean shifts, standard deviations, correlations
+  - **Key question**: Which semantic vectors get shifted most by instruction tuning?
+- **Section 3.6: PC Self-Reinforcement Analysis**:
+  - Tests whether PC vectors strengthen themselves through MLP transformation
+  - Analyzes PC1-5 and their negatives (-PC1, -PC2, etc.) across all analysis layers
+  - Decomposes output into two components:
+    * **Parallel (self-projection)**: How much output aligns with input direction
+    * **Orthogonal**: How much output adds perpendicular semantic content
+  - 2×2 visualization grid:
+    1. Self-projection delta by layer (PC vs -PC)
+    2. Orthogonal component delta by layer
+    3. Symmetry check: PC vs -PC at focus layers
+    4. Summary table with numerical values
+  - **Key insights**:
+    * Positive Δ → Instruction tuning amplifies this PC direction
+    * Negative Δ → Instruction tuning suppresses this PC direction
+    * Symmetric values → PC and -PC treated equally
+    * Asymmetric values → Direction-dependent effects
+  - Reveals which PCs are self-reinforcing vs self-suppressing at each layer
