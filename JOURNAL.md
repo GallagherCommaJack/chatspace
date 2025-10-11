@@ -193,23 +193,27 @@ User can now:
 - `scripts/compare_activation_steering.py` automatically benefits from new defaults
 - All scripts now use consistent discriminative vectors across the codebase
 
-**PC Layer-wise Attention Analysis** (commits `1b4b31c`, `cbd637a`, `3d1ccff`)
+**PC Layer-wise Attention Analysis** (commits `1b4b31c`, `cbd637a`, `3d1ccff`, `f9481a5`)
 - Added new Section 5 to `gemma2_attention_analysis.ipynb`:
   - "PC Attention Patterns Across All Layers"
 - Analyzes all 46 layers (not just 5 target layers)
 - Two key metrics tracked across layers:
   1. **QK Affinity**: PC→PC (self) vs PC→-PC (opposite) attention
   2. **VO Decomposition**: PC self-bias vs opposite-bias in token representations
-- **Three complementary visualizations**:
-  1. **Absolute patterns** (base blue, instruct orange):
-     - Each model normalized by its own 20 random vectors (z-scores per layer)
-     - Same scale allows direct comparison of absolute patterns
+- **Four complementary visualizations**:
+  1. **Positive PC patterns** (PC1/2/3):
+     - Base (blue) vs instruct (orange)
+     - Each model normalized by its own 20 random vectors
+     - Shows absolute attention patterns
   2. **Delta analysis** (instruct - base):
-     - Shows magnitude of instruction tuning effects per layer
-     - Green: Self-attention/bias changes
-     - Red: Opposite-attention/bias changes
-     - Shaded areas show magnitude, text annotations mark max changes
-- 2×3 grid visualizations: QK (top row) and VO (bottom row) for PC1/PC2/PC3
+     - Green: Self-attention changes
+     - Red: Opposite-attention changes
+     - Identifies layers with biggest instruction tuning effects
+  3. **Negative PC patterns** (-PC1/2/3):
+     - Same format as positive PCs
+     - Shows -PC1→-PC1 vs -PC1→PC1, etc.
+     - Reveals symmetry/asymmetry in attention routing
+- 2×3 grid visualizations: QK (top row) and VO (bottom row)
 - Reveals layer-specific instruction tuning effects on semantic routing
-- Identifies which layers experience biggest routing changes from instruction tuning
+- Identifies directional biases (do positive and negative PCs behave symmetrically?)
 - Shows whether patterns strengthen, weaken, or invert with instruction tuning
