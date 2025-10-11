@@ -260,3 +260,24 @@ User can now:
   6. Layer-wise visualizations (cells 9-12)
   7. PC number comparison (cell 13-14)
   8. Summary (cell 15)
+
+**All Notebooks Refactored** (commit `508ef7f`)
+- Applied same configuration pattern to remaining two notebooks
+- **gemma2_basic_weight_susceptibility.ipynb** (20 cells, down from 21):
+  - Load all PCs 1-10 upfront
+  - Config cell parameters: `plot_pcs`, `n_layers_context` (±5), `n_random_baseline` (20), `n_sample_roles/traits` (5 each)
+  - Compute cosine distances once for all weight matrices
+  - Visualizations adapt to config (weight type, layers, heatmaps)
+  - Structure: intro → models → weight diffs → load PCs → config → extract weights → compute → visualize
+- **gemma2_mlp_interpretation.ipynb** (12 cells, down from 13):
+  - Load all PCs 1-10 upfront
+  - Config cell parameters: `analysis_layers` (15-24), `focus_layer` (18), `plot_pcs` (PC1, -PC1), `n_top_projections` (15)
+  - Compute MLP forward pass once for all configured layers
+  - Semantic decomposition at focus layer
+  - Structure: intro → models → load PCs → config → compute MLP → visualize → semantic decomposition
+- **Consistent benefits across all 3 notebooks**:
+  - No redundant loading or computation
+  - Change config once, all visualizations adapt
+  - Faster iteration and experimentation
+  - Cleaner, more maintainable code
+  - Single source of truth for analysis parameters
