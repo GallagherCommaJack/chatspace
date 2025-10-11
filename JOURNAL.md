@@ -218,13 +218,16 @@ User can now:
 - Identifies directional biases (do positive and negative PCs behave symmetrically?)
 - Shows whether patterns strengthen, weaken, or invert with instruction tuning
 
-**Visualization Refactoring** (commit `4aade30`)
-- Refactored all three visualization cells to use consistent `plot_pcs` list
+**Visualization Refactoring** (commits `4aade30`, `de00a06`, `d6da413`)
+- Refactored visualization cells to use consistent `plot_pcs` list
 - Main visualization cell defines: `plot_pcs = ["PC1", "PC2", "PC3"]` (or `["PC1"]` for single PC)
-- Delta analysis cell now uses same `plot_pcs` list instead of hardcoded values
-- Negative PC visualization builds `plot_neg_pairs` dynamically from `plot_pcs`
-- All cells use proper subplot handling:
-  - Single PC: `ax = axes[0]` (1D indexing)
-  - Multiple PCs: `ax = axes[0, i]` (2D indexing)
-- User can now change PC selection once and all visualizations adapt automatically
-- Consistent pattern across positive PC, delta, and negative PC analyses
+- Delta analysis cell uses same `plot_pcs` list instead of hardcoded values
+- All cells use proper subplot handling for single vs multiple PC plots
+- **Bug fix**: Removed redundant negative PC visualization
+  - Attention mechanism is symmetric under vector negation: (-v1)·(-v2) = v1·v2
+  - -PC1→-PC1 is identical to PC1→PC1, so visualization was showing duplicate data
+- **New analysis**: Added PC comparison cell to answer "Is PC1 special?"
+  - Computes RMS of delta z-scores for each PC across all layers
+  - Bar charts comparing QK and VO instruction tuning effects for PC1 vs PC2 vs PC3
+  - Determines ranking: which PC shows strongest instruction tuning effects?
+  - Key question: Does PC1 (dominant variance component) also show strongest fine-tuning effects?
