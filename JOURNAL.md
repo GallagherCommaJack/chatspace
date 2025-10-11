@@ -192,3 +192,15 @@ User can now:
   - Cleaner, more maintainable code with single source of truth
 - `scripts/compare_activation_steering.py` automatically benefits from new defaults
 - All scripts now use consistent discriminative vectors across the codebase
+
+**PC Layer-wise Attention Analysis** (commit `1b4b31c`)
+- Added new Section 5 to `gemma2_attention_analysis.ipynb`:
+  - "PC Attention Patterns Across All Layers"
+- Analyzes all 46 layers (not just 5 target layers)
+- Two key metrics tracked across layers:
+  1. **QK Affinity**: PC→PC (self) vs PC→-PC (opposite) attention
+  2. **VO Decomposition**: PC self-bias vs opposite-bias in token representations
+- Normalized by 20 random vectors (z-scores per layer)
+- 2×3 grid visualization: QK (top row) and VO (bottom row) for PC1/PC2/PC3
+- Reveals layer-specific instruction tuning effects on semantic routing
+- Shows which layers exhibit strongest PC self-reinforcement vs opposition
