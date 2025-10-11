@@ -120,3 +120,10 @@ User can now:
 2. Run any of the 3 new notebooks
 3. Import from `chatspace.analysis` in new work
 4. Archive or keep original notebook as reference
+
+**Semantic Vector Loading Added** (commit `c9dae3e`)
+- Updated all 3 notebooks to properly load role/trait semantic vectors
+- `gemma2_basic_weight_susceptibility.ipynb`: Samples 5 roles + 5 traits for comparison
+- `gemma2_mlp_interpretation.ipynb`: Loads all semantic vectors for layer 18 decomposition (already had)
+- `gemma2_attention_analysis.ipynb`: Includes all semantic vectors in QK/VO analysis (already had)
+- All notebooks now analyze PCs, semantic vectors, AND random baseline
