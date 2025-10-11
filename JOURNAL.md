@@ -217,3 +217,14 @@ User can now:
 - Reveals layer-specific instruction tuning effects on semantic routing
 - Identifies directional biases (do positive and negative PCs behave symmetrically?)
 - Shows whether patterns strengthen, weaken, or invert with instruction tuning
+
+**Visualization Refactoring** (commit `4aade30`)
+- Refactored all three visualization cells to use consistent `plot_pcs` list
+- Main visualization cell defines: `plot_pcs = ["PC1", "PC2", "PC3"]` (or `["PC1"]` for single PC)
+- Delta analysis cell now uses same `plot_pcs` list instead of hardcoded values
+- Negative PC visualization builds `plot_neg_pairs` dynamically from `plot_pcs`
+- All cells use proper subplot handling:
+  - Single PC: `ax = axes[0]` (1D indexing)
+  - Multiple PCs: `ax = axes[0, i]` (2D indexing)
+- User can now change PC selection once and all visualizations adapt automatically
+- Consistent pattern across positive PC, delta, and negative PC analyses
