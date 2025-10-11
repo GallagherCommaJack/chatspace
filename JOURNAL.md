@@ -150,5 +150,20 @@ User can now:
 - Fix: Changed default parameter from `vector_type='pos_all'` to `vector_type='pos_default'`
 - Updated docstrings to clearly document different key structures
 - Updated notebooks to use default parameter (removed explicit pos_all for traits)
-- Tested: Now successfully loads 275 roles + 240 traits = 515 total semantic vectors
+- Tested: Now successfully loads 275 roles + 240 traits = 506 total semantic vectors
 - All notebooks validated as valid JSON and end-to-end test passes
+
+**Discriminative Vector Defaults** (commit `b7ab3cb`)
+- Updated vector loading to match production usage in `eval_comprehensive_classifiers.py`
+- **Role vectors now compute differences by default**: `pos_3 - default_1`
+  - Added `compute_difference=True` parameter to `load_individual_role_vectors()`
+  - Loads `default_vectors.pt` from parent directory (`roles_240/default_vectors.pt`)
+  - Changed default `vector_type` from `'pos_all'` to `'pos_3'` (strongest positive)
+  - Difference vectors provide discriminative power for classification and analysis
+- **Trait vectors now use contrast vectors**: `pos_neg_50` (default)
+  - Changed default from `'pos_default'` to `'pos_neg_50'`
+  - `pos_neg_50` is precomputed contrast vector (50% pos vs neg trait expression)
+  - Matches production usage for discriminative trait analysis
+- Updated notebooks to use new discriminative defaults
+- Backward compatible: can still load raw vectors with `compute_difference=False`
+- Production-ready: 275 role difference + 240 trait contrast = 506 discriminative vectors
