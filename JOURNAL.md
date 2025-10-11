@@ -234,3 +234,29 @@ User can now:
   - Shows if instruction tuning effects decay with PC number or if PC1 is uniquely affected
   - Includes table summary comparing variance explained vs effect magnitude
   - Key question: Does PC1 (dominant variance component) also show strongest fine-tuning effects?
+
+**Notebook Refactoring for Configurability** (commit `f095639`)
+- Restructured attention analysis notebook for clarity and maintainability
+- **Load once, compute once**:
+  - Load all PCs (1-10) upfront instead of reloading in different sections
+  - Compute QK/VO for all layers ONCE, reuse for all visualizations
+  - Eliminated redundant computation (~932 lines removed!)
+- **Centralized configuration cell**:
+  - `analysis_layers`: Which layers to compute (default: all 46)
+  - `comparison_layers`: Which layers to average for PC comparison (default: 17-27)
+  - `plot_pcs`: Which PCs to visualize in layer-wise plots (default: PC1-3)
+  - `n_pcs_compare`: How many PCs in PC number comparison (default: 10)
+- **Benefits**:
+  - Change config once, all visualizations adapt
+  - No redundant loading or computation
+  - Faster iteration: adjust parameters and re-run viz cells
+  - Cleaner structure: load → config → compute → visualize
+- **New structure** (16 cells, down from 24):
+  1. Intro, imports, models (cells 0-3)
+  2. Load all PCs 1-10 (cell 4)
+  3. **Config cell** (cell 5) ← SET PARAMETERS HERE
+  4. Compute QK/VO for all layers (cells 6-7)
+  5. Compute z-scores (cell 8)
+  6. Layer-wise visualizations (cells 9-12)
+  7. PC number comparison (cell 13-14)
+  8. Summary (cell 15)
