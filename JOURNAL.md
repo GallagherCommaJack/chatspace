@@ -227,7 +227,10 @@ User can now:
   - Attention mechanism is symmetric under vector negation: (-v1)·(-v2) = v1·v2
   - -PC1→-PC1 is identical to PC1→PC1, so visualization was showing duplicate data
 - **New analysis**: Added PC comparison cell to answer "Is PC1 special?"
-  - Computes RMS of delta z-scores for each PC across all layers
-  - Bar charts comparing QK and VO instruction tuning effects for PC1 vs PC2 vs PC3
-  - Determines ranking: which PC shows strongest instruction tuning effects?
+  - Analyzes PC1-PC10 to see how instruction tuning effects vary with PC number
+  - X-axis: PC number (1, 2, 3, ..., 10)
+  - Y-axis: Mean |Δ Z-score| averaged across layers 17-27
+  - Two line plots: QK affinity (self/opposite) and VO decomposition (self/opposite)
+  - Shows if instruction tuning effects decay with PC number or if PC1 is uniquely affected
+  - Includes table summary comparing variance explained vs effect magnitude
   - Key question: Does PC1 (dominant variance component) also show strongest fine-tuning effects?
