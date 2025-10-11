@@ -127,3 +127,14 @@ User can now:
 - `gemma2_mlp_interpretation.ipynb`: Loads all semantic vectors for layer 18 decomposition (already had)
 - `gemma2_attention_analysis.ipynb`: Includes all semantic vectors in QK/VO analysis (already had)
 - All notebooks now analyze PCs, semantic vectors, AND random baseline
+
+**Individual Role/Trait Vector Loading** (commit `688ccc4`)
+- Created new functions to load ACTUAL individual role/trait vectors:
+  - `load_individual_role_vectors()`: Loads specific roles (accountant, doctor, etc.)
+  - `load_individual_trait_vectors()`: Loads specific traits (analytical, creative, etc.)
+- These load from `/workspace/persona-data/{model}/{roles|traits}_240/vectors/`
+- Each role/trait file (e.g., accountant.pt) contains vectors for all 46 layers
+- Vector types: pos_0, pos_1, pos_2, pos_3, pos_all (different label strengths)
+- Default uses 'pos_all' variant
+- Updated all 3 notebooks to use new functions
+- Now analyzing 200+ actual semantic vectors, not just PC components!
