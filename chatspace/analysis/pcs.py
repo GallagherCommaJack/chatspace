@@ -63,6 +63,9 @@ def load_layer_semantic_vectors(
     """
     Load semantic vectors (roles/traits) for a specific layer from PCA data.
 
+    DEPRECATED: This loads from PCA files. Use load_individual_role_vectors() or
+    load_individual_trait_vectors() to load actual role/trait vectors.
+
     Args:
         pca_dir: Directory containing PCA files
         layer_idx: Layer index to extract vectors from
@@ -117,6 +120,89 @@ def load_layer_semantic_vectors(
             semantic[key] = normalize_vector(vec_layer.to(torch.bfloat16))
 
     return semantic
+
+
+def load_individual_role_vectors(
+    vectors_dir: Path,
+    layer_idx: int,
+    vector_type: str = 'pos_all',
+    max_roles: Optional[int] = None
+) -> OrderedDict[str, torch.Tensor]:
+    """
+    Load individual role vectors from the vectors directory.
+
+    Args:
+        vectors_dir: Directory containing individual role .pt files (e.g., accountant.pt)
+        layer_idx: Layer index to extract (0-45 for gemma-2-27b)
+        vector_type: Which vector variant to load (default: 'pos_all')
+            Options: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
+        max_roles: Maximum number of roles to load (None = all)
+
+    Returns:
+        OrderedDict mapping role names to normalized vectors
+
+    Notes:
+        - Each role file contains vectors for all layers (shape: [46, 4608])
+        - Vector types represent different label strengths (0=weak, 3=strong)
+        - Returns normalized vectors for the specified layer
+    """
+    role_vectors = OrderedDict()
+
+    if not vectors_dir.exists():
+        return role_vectors
+
+    # Get all .pt files
+    role_files = sorted(vectors_dir.glob('*.pt'))
+    if max_roles is not None:
+        role_files = role_files[:max_roles]
+
+    for role_file in role_files:
+        role_name = role_file.stem  # e.g., "accountant"
+        try:
+            data = torch.load(role_file, map_location='cpu', weights_only=False)
+
+            if vector_type not in data:
+                continue
+
+            # Extract vector for specified layer
+            vec = data[vector_type]  # Shape: [46, 4608]
+            vec_layer = vec[layer_idx]  # Shape: [4608]
+
+            # Normalize and store
+            role_vectors[role_name] = normalize_vector(vec_layer.to(torch.bfloat16))
+        except Exception as e:
+            print(f"Warning: Failed to load {role_file.name}: {e}")
+            continue
+
+    return role_vectors
+
+
+def load_individual_trait_vectors(
+    vectors_dir: Path,
+    layer_idx: int,
+    vector_type: str = 'pos_all',
+    max_traits: Optional[int] = None
+) -> OrderedDict[str, torch.Tensor]:
+    """
+    Load individual trait vectors from the vectors directory.
+
+    Args:
+        vectors_dir: Directory containing individual trait .pt files (e.g., analytical.pt)
+        layer_idx: Layer index to extract (0-45 for gemma-2-27b)
+        vector_type: Which vector variant to load (default: 'pos_all')
+            Options: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
+        max_traits: Maximum number of traits to load (None = all)
+
+    Returns:
+        OrderedDict mapping trait names to normalized vectors
+
+    Notes:
+        - Same structure as role vectors
+        - Each trait file contains vectors for all layers
+        - Returns normalized vectors for the specified layer
+    """
+    # Same implementation as load_individual_role_vectors
+    return load_individual_role_vectors(vectors_dir, layer_idx, vector_type, max_traits)
 
 
 def extract_pc_components(

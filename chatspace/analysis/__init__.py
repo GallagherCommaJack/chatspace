@@ -29,6 +29,8 @@ from .model_utils import (
 from .pcs import (
     extract_pc_components,
     get_pc_interpretation,
+    load_individual_role_vectors,
+    load_individual_trait_vectors,
     load_layer_semantic_vectors,
     load_pca_data,
     normalize_vector,
@@ -49,6 +51,8 @@ __all__ = [
     "load_pca_data",
     "normalize_vector",
     "load_layer_semantic_vectors",
+    "load_individual_role_vectors",
+    "load_individual_trait_vectors",
     "extract_pc_components",
     "get_pc_interpretation",
     # Model utilities
