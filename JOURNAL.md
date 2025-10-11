@@ -167,3 +167,16 @@ User can now:
 - Updated notebooks to use new discriminative defaults
 - Backward compatible: can still load raw vectors with `compute_difference=False`
 - Production-ready: 275 role difference + 240 trait contrast = 506 discriminative vectors
+
+**Attention Analysis Notebook Updated** (commit `4a110a8`)
+- Added role/trait vector analysis to `gemma2_attention_analysis.ipynb`
+- Now loads 10 sample role and 10 sample trait vectors at PCA layer
+- Test vectors increased from 9 → 19 total:
+  - 4 PC vectors (PC1, PC2, PC3, -PC1)
+  - 5 role difference vectors (pos_3 - default_1)
+  - 5 trait contrast vectors (pos_neg_50)
+  - 5 random baseline vectors
+- Added new Section 5: "Role and Trait Attention Patterns"
+  - Analyzes QK affinity and VO decomposition for role/trait vectors
+  - Shows top-5 attention targets for first 3 roles and traits
+- All three refactored notebooks now properly load and analyze PC + role + trait vectors
