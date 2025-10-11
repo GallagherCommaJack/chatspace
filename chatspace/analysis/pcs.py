@@ -125,8 +125,10 @@ def load_layer_semantic_vectors(
 def load_individual_role_vectors(
     vectors_dir: Path,
     layer_idx: int,
-    vector_type: str = 'pos_all',
-    max_roles: Optional[int] = None
+    vector_type: str = 'pos_3',
+    max_roles: Optional[int] = None,
+    compute_difference: bool = True,
+    default_type: str = 'default_1'
 ) -> OrderedDict[str, torch.Tensor]:
     """
     Load individual role vectors from the vectors directory.
@@ -134,9 +136,13 @@ def load_individual_role_vectors(
     Args:
         vectors_dir: Directory containing individual role .pt files (e.g., accountant.pt)
         layer_idx: Layer index to extract (0-45 for gemma-2-27b)
-        vector_type: Which vector variant to load (default: 'pos_all')
+        vector_type: Which vector variant to load (default: 'pos_3')
             Options: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
         max_roles: Maximum number of roles to load (None = all)
+        compute_difference: If True, compute role - default difference vectors (default: True)
+            This matches production usage: pos_3 - default_1 for discriminative vectors
+        default_type: Which default vector to subtract (default: 'default_1')
+            Only used if compute_difference=True
 
     Returns:
         OrderedDict mapping role names to normalized vectors
@@ -144,12 +150,29 @@ def load_individual_role_vectors(
     Notes:
         - Each role file contains vectors for all layers (shape: [46, 4608])
         - Vector types represent different label strengths (0=weak, 3=strong)
+        - By default, computes difference vectors (pos_3 - default_1) for discriminative power
+        - Default vectors are loaded from parent_dir/default_vectors.pt
         - Returns normalized vectors for the specified layer
     """
     role_vectors = OrderedDict()
 
     if not vectors_dir.exists():
         return role_vectors
+
+    # Load default vectors if computing differences
+    default_vec = None
+    if compute_difference:
+        default_path = vectors_dir.parent / 'default_vectors.pt'
+        if default_path.exists():
+            try:
+                default_data = torch.load(default_path, map_location='cpu', weights_only=False)
+                default_vec = default_data['activations'][default_type][layer_idx].float()
+            except Exception as e:
+                print(f"Warning: Failed to load default vectors: {e}")
+                print(f"  Will return raw vectors without subtraction")
+        else:
+            print(f"Warning: default_vectors.pt not found at {default_path}")
+            print(f"  Will return raw vectors without subtraction")
 
     # Get all .pt files
     role_files = sorted(vectors_dir.glob('*.pt'))
@@ -166,7 +189,11 @@ def load_individual_role_vectors(
 
             # Extract vector for specified layer
             vec = data[vector_type]  # Shape: [46, 4608]
-            vec_layer = vec[layer_idx]  # Shape: [4608]
+            vec_layer = vec[layer_idx].float()  # Shape: [4608]
+
+            # Compute difference if requested
+            if compute_difference and default_vec is not None:
+                vec_layer = vec_layer - default_vec
 
             # Normalize and store
             role_vectors[role_name] = normalize_vector(vec_layer.to(torch.bfloat16))
@@ -180,7 +207,7 @@ def load_individual_role_vectors(
 def load_individual_trait_vectors(
     vectors_dir: Path,
     layer_idx: int,
-    vector_type: str = 'pos_default',
+    vector_type: str = 'pos_neg_50',
     max_traits: Optional[int] = None
 ) -> OrderedDict[str, torch.Tensor]:
     """
@@ -189,9 +216,10 @@ def load_individual_trait_vectors(
     Args:
         vectors_dir: Directory containing individual trait .pt files (e.g., analytical.pt)
         layer_idx: Layer index to extract (0-45 for gemma-2-27b)
-        vector_type: Which vector variant to load (default: 'pos_default')
+        vector_type: Which vector variant to load (default: 'pos_neg_50')
             Options for traits: 'pos_neg', 'pos_neg_50', 'pos_default', 'pos_default_50', 'pos_70', 'pos_40_70'
             Note: Trait files have different keys than role files!
+            Production default: 'pos_neg_50' (precomputed contrast vector: 50% pos vs neg)
         max_traits: Maximum number of traits to load (None = all)
 
     Returns:
@@ -201,11 +229,20 @@ def load_individual_trait_vectors(
         - Trait files have different key structure than role files
         - Role keys: 'pos_0', 'pos_1', 'pos_2', 'pos_3', 'pos_all'
         - Trait keys: 'pos_neg', 'pos_neg_50', 'pos_default', 'pos_default_50', 'pos_70', 'pos_40_70'
+        - Default 'pos_neg_50' is a precomputed contrast vector (pos vs neg)
+        - This matches production usage for discriminative trait vectors
         - Each trait file contains vectors for all layers
         - Returns normalized vectors for the specified layer
     """
-    # Same implementation as load_individual_role_vectors, just different default key
-    return load_individual_role_vectors(vectors_dir, layer_idx, vector_type, max_traits)
+    # Load trait vectors using same logic as roles, but without difference computation
+    # (trait contrast vectors are precomputed)
+    return load_individual_role_vectors(
+        vectors_dir,
+        layer_idx,
+        vector_type,
+        max_traits,
+        compute_difference=False  # Traits use precomputed contrast vectors
+    )
 
 
 def extract_pc_components(
