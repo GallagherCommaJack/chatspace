@@ -10,7 +10,8 @@ import torch
 DEFAULT_PERSONA_ROOT = Path("/workspace/persona-data")
 DEFAULT_TARGET_LAYER = 22
 _ROLE_POSITIVE_KEYS: Sequence[str] = ("pos_3", "pos", "positive")
-_TRAIT_POSITIVE_KEYS: Sequence[str] = ("pos_70", "pos", "positive")
+# Production default: pos_neg_50 (precomputed contrast vector for 50% pos vs neg)
+_TRAIT_POSITIVE_KEYS: Sequence[str] = ("pos_neg_50", "pos_70", "pos", "positive")
 _ROLE_DEFAULT_KEY = "default_1"
 _ROLE_DEFAULT_CACHE: dict[str, torch.Tensor] | None = None
 
@@ -44,7 +45,7 @@ def load_activation_vector(
     persona_root: Path = DEFAULT_PERSONA_ROOT,
     target_layer: int = DEFAULT_TARGET_LAYER,
     role_model_prefix: str = "qwen-3-32b",
-    role_contrast_default: bool = False,
+    role_contrast_default: bool = True,
 ) -> torch.Tensor | None:
     """Load a persona activation vector for a trait or role dataset if available.
 
@@ -60,7 +61,8 @@ def load_activation_vector(
         Model name used for role activation vectors; defaults to Qwen-3-32b.
     role_contrast_default:
         When True, subtract the default activation vector for roles to obtain a
-        contrastive steering direction (pos - default).
+        contrastive steering direction (pos_3 - default_1). Default is True to
+        match production usage in eval_comprehensive_classifiers.py.
     """
 
     if "__trait__" in dataset:

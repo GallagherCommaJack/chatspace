@@ -20,7 +20,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from chatspace.steering import extract_layer_hidden_states, runs as run_utils
+from chatspace.steering import extract_layer_hidden_states, load_activation_vector, runs as run_utils
 
 
 def load_dataset_with_all_scores(
@@ -366,38 +366,31 @@ def main(argv: list[str] | None = None) -> None:
             # Optionally evaluate activation vector
             if args.eval_activation_vectors:
                 activation_vec = None
+                activation_vec_path = None
 
-                if dataset_type == "trait":
-                    model_prefix, trait_name = dataset_name.split("__trait__", 1)
-                    activation_vec_path = args.activation_root / f"{trait_name}.pt"
+                try:
+                    print(f"  Loading activation vector via library...")
+                    # Use library function with production defaults:
+                    # - Traits: pos_neg_50 (contrast vector)
+                    # - Roles: pos_3 - default_1 (difference vector)
+                    activation_vec_tensor = load_activation_vector(
+                        dataset_name,
+                        persona_root=args.activation_root.parent.parent,  # Go up from vectors/ to persona-data/
+                        target_layer=args.target_layer,
+                        role_contrast_default=True,  # Always compute role differences
+                    )
 
-                    if activation_vec_path.exists():
-                        print(f"  Loading activation vector: {activation_vec_path}")
-                        try:
-                            act_data = torch.load(activation_vec_path, map_location="cpu", weights_only=False)
-                            # For traits: use pos_neg_50 at target layer
-                            activation_vec = act_data["pos_neg_50"][args.target_layer].float().numpy()
-                        except Exception as exc:
-                            print(f"  Warning: Failed to load trait activation vector: {exc}")
-
-                elif dataset_type == "role":
-                    role_name = dataset_name.split("__role__")[1]
-                    activation_vec_path = args.activation_root / f"{role_name}.pt"
-                    default_vec_path = args.activation_root.parent / "default_vectors.pt"
-
-                    if activation_vec_path.exists() and default_vec_path.exists():
-                        print(f"  Loading activation vector: {activation_vec_path}")
-                        try:
-                            # Load role activation and default vectors
-                            act_data = torch.load(activation_vec_path, map_location="cpu", weights_only=False)
-                            default_data = torch.load(default_vec_path, map_location="cpu", weights_only=False)
-
-                            # For roles: pos_3 - default_1 at target layer
-                            vec_pos = act_data["pos_3"][args.target_layer].float().numpy()
-                            vec_default = default_data["activations"]["default_1"][args.target_layer].float().numpy()
-                            activation_vec = vec_pos - vec_default
-                        except Exception as exc:
-                            print(f"  Warning: Failed to load role activation vector: {exc}")
+                    if activation_vec_tensor is not None:
+                        activation_vec = activation_vec_tensor.numpy()
+                        # Determine path for logging
+                        if dataset_type == "trait":
+                            _, trait_name = dataset_name.split("__trait__", 1)
+                            activation_vec_path = args.activation_root / f"{trait_name}.pt"
+                        elif dataset_type == "role":
+                            _, role_name = dataset_name.split("__role__", 1)
+                            activation_vec_path = args.activation_root / f"{role_name}.pt"
+                except Exception as exc:
+                    print(f"  Warning: Failed to load activation vector: {exc}")
 
                 # Evaluate activation vector if loaded successfully
                 if activation_vec is not None:
