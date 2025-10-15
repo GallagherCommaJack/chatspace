@@ -21,7 +21,7 @@ def test_vllm_steering_vector_round_trip():
         target_layer=2,
         init_scale=0.0,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.2,
+        gpu_memory_utilization=0.05,
         max_model_len=128,
     )
 

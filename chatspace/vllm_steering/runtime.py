@@ -11,9 +11,41 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import torch
+from torch import nn
 from torch.utils.hooks import RemovableHandle
 
 LayerLike = Any
+
+
+class _SteeringModule(nn.Module):
+    """Small module that adds the steering vector inside the CUDA graph."""
+
+    def __init__(self, hidden_size: int, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.register_buffer(
+            "steering_vector",
+            torch.zeros(hidden_size, dtype=dtype, device=device),
+            persistent=False,
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden + self.steering_vector
+
+    def set_vector(self, vector: torch.Tensor) -> None:
+        if vector.ndim != 1:
+            raise ValueError("Steering vector must be 1D.")
+        if vector.shape != self.steering_vector.shape:
+            raise ValueError(
+                f"Steering vector shape mismatch: expected {tuple(self.steering_vector.shape)}, "
+                f"got {tuple(vector.shape)}"
+            )
+        self.steering_vector.copy_(vector.to(device=self.steering_vector.device, dtype=self.steering_vector.dtype))
+
+    def clear(self) -> None:
+        self.steering_vector.zero_()
+
+    def clone_cpu(self) -> torch.Tensor:
+        return self.steering_vector.detach().cpu()
 
 
 @dataclass
@@ -21,7 +53,7 @@ class _SteeringState:
     """Track steering metadata for a worker."""
 
     layer_idx: int
-    vector: torch.Tensor
+    module: _SteeringModule
     hook_handle: RemovableHandle | None = None
 
 
@@ -44,18 +76,12 @@ def _ensure_state(worker: Any) -> _SteeringState:
 def _register_hook(layer: LayerLike, state: _SteeringState) -> RemovableHandle:
     """Attach forward hook that adds the steering vector to residual stream."""
 
+    steering_module = state.module
+
     def _hook(module, args, output):
         del module, args  # Unused.
         hidden = output[0] if isinstance(output, tuple) else output
-        vector = state.vector
-        if vector.device != hidden.device or vector.dtype != hidden.dtype:
-            state.vector = vector = vector.to(device=hidden.device, dtype=hidden.dtype)
-        if vector.shape[-1] != hidden.shape[-1]:
-            raise ValueError(
-                f"Steering vector hidden size mismatch: expected {hidden.shape[-1]}, "
-                f"got {vector.shape[-1]}"
-            )
-        steered = hidden + vector
+        steered = steering_module(hidden)
         if isinstance(output, tuple):
             return (steered,) + output[1:]
         return steered
@@ -137,11 +163,12 @@ def initialize_worker_state(worker: Any, layer_idx: int, init_scale: float) -> d
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    vector = torch.zeros(hidden_size, device=device, dtype=dtype)
+    steering_module = _SteeringModule(hidden_size, dtype=dtype, device=device)
+    layers[layer_idx].add_module("_chatspace_steering", steering_module)
     if init_scale > 0:
-        torch.nn.init.normal_(vector, mean=0.0, std=init_scale)
+        torch.nn.init.normal_(steering_module.steering_vector, mean=0.0, std=init_scale)
 
-    state = _SteeringState(layer_idx=layer_idx, vector=vector)
+    state = _SteeringState(layer_idx=layer_idx, module=steering_module)
     state.hook_handle = _register_hook(layers[layer_idx], state)
     worker._chatspace_steering = state
 
@@ -157,25 +184,22 @@ def set_worker_vector(worker: Any, vector: torch.Tensor) -> None:
     """Replace the steering vector with the provided tensor."""
     state = _ensure_state(worker)
     try:
-        vector = deserialize_tensor(vector, device=state.vector.device, dtype=state.vector.dtype)
+        vector = deserialize_tensor(
+            vector,
+            device=state.module.steering_vector.device,
+            dtype=state.module.steering_vector.dtype,
+        )
     except TypeError:
         # Fall back for already-deserialized tensors.
         if not isinstance(vector, torch.Tensor):
             raise
-    if vector.ndim != 1:
-        raise ValueError("Steering vector must be 1D.")
-    if vector.shape != state.vector.shape:
-        raise ValueError(
-            f"Steering vector shape mismatch: expected {tuple(state.vector.shape)}, "
-            f"got {tuple(vector.shape)}"
-        )
-    state.vector.copy_(vector.to(device=state.vector.device, dtype=state.vector.dtype))
+    state.module.set_vector(vector)
 
 
 def clear_worker_vector(worker: Any) -> None:
     """Zero out the steering vector."""
     state = _ensure_state(worker)
-    state.vector.zero_()
+    state.module.clear()
 
 
 def set_worker_layer(worker: Any, layer_idx: int) -> None:
@@ -189,22 +213,29 @@ def set_worker_layer(worker: Any, layer_idx: int) -> None:
         )
     if state.hook_handle is not None:
         state.hook_handle.remove()
+    old_layer = layers[state.layer_idx]
+    new_layer = layers[layer_idx]
+    # Remove module from old layer if present, then attach to new layer.
+    if "_chatspace_steering" in old_layer._modules:
+        old_layer._modules.pop("_chatspace_steering")
+    new_layer.add_module("_chatspace_steering", state.module)
     state.layer_idx = int(layer_idx)
-    state.hook_handle = _register_hook(layers[layer_idx], state)
+    state.hook_handle = _register_hook(new_layer, state)
 
 
 def fetch_worker_vector(worker: Any) -> torch.Tensor:
     """Return a CPU copy of the current steering vector (for debugging/tests)."""
     state = _ensure_state(worker)
-    return state.vector.detach().cpu()
+    return state.module.clone_cpu()
 
 
 def fetch_worker_state(worker: Any) -> dict[str, Any]:
     """Inspect the worker steering state."""
     state = _ensure_state(worker)
+    vector = state.module.steering_vector
     return {
         "layer_idx": state.layer_idx,
-        "shape": tuple(state.vector.shape),
-        "dtype": str(state.vector.dtype),
-        "device": str(state.vector.device),
+        "shape": tuple(vector.shape),
+        "dtype": str(vector.dtype),
+        "device": str(vector.device),
     }
