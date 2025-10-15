@@ -21,6 +21,7 @@ dependencies = [
     "transformers>=4.56.2",
     "trl>=0.23.1",
     "umap-learn>=0.5.7",
+    "vllm>=0.11.0",
 ]
 description = "Add your description here"
 name = "chatspace"

@@ -18,6 +18,7 @@ from tqdm import tqdm, trange
 from chatspace.constants import PERSONA_ROOT as DEFAULT_PERSONA_ROOT
 from chatspace.steering import load_activation_vector, runs as run_utils
 from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
+from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 from chatspace.utils import sanitize_component
 
 
@@ -645,7 +646,7 @@ def generate_variants(
     instructions: InstructionData,
     args,
     tokenizer,
-    steering_model: QwenSteerModel,
+    steering_model,  # QwenSteerModel or VLLMSteerModel (both implement SteerableModel)
     device: torch.device,
 ) -> Iterable[dict[str, object]]:
     def run_batch(
@@ -657,6 +658,7 @@ def generate_variants(
         steering_model.set_target_layer(target_layer)
         steering_model.set_vector(vector)
 
+        # Convert messages to chat-formatted text
         chat_texts = [
             tokenizer.apply_chat_template(
                 msgs,
@@ -666,28 +668,47 @@ def generate_variants(
             )
             for msgs in message_batches
         ]
-        encoded = tokenizer(chat_texts, return_tensors="pt", padding=True).to(device)
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is None:
-            input_lens = torch.tensor([enc.size(0) for enc in encoded["input_ids"]], device=device)
+
+        if args.use_vllm:
+            # vLLM backend: pass text prompts directly
+            from vllm import SamplingParams
+
+            sampling_params = SamplingParams(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_new_tokens,
+            )
+            # VLLMSteerModel.generate returns list of completion texts
+            texts = steering_model.generate(chat_texts, sampling_params)
+            # Strip thinking tags if present
+            texts = [_strip_thinking_tags(text) for text in texts]
         else:
-            input_lens = attention_mask.sum(dim=1)
-        outputs = steering_model.generate(
-            **encoded,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=True,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-        texts: list[str] = []
-        for idx in range(outputs.size(0)):
-            seq = outputs[idx]
-            offset = int(input_lens[idx])
-            decoded = tokenizer.decode(seq[offset:], skip_special_tokens=True)
-            decoded = _strip_thinking_tags(decoded)
-            texts.append(decoded)
+            # HuggingFace backend: tokenize and decode
+            encoded = tokenizer(chat_texts, return_tensors="pt", padding=True).to(device)
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                input_lens = torch.tensor([enc.size(0) for enc in encoded["input_ids"]], device=device)
+            else:
+                input_lens = attention_mask.sum(dim=1)
+
+            outputs = steering_model.generate(
+                **encoded,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+            texts: list[str] = []
+            for idx in range(outputs.size(0)):
+                seq = outputs[idx]
+                offset = int(input_lens[idx])
+                decoded = tokenizer.decode(seq[offset:], skip_special_tokens=True)
+                decoded = _strip_thinking_tags(decoded)
+                texts.append(decoded)
+
         return texts
 
     trained_vector: torch.Tensor | None = None
@@ -847,6 +868,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--include-prefix", nargs="*", default=["qwen-3-32b__trait__", "gemma-2-27b__role__"])
+    parser.add_argument("--use-vllm", action="store_true", help="Use vLLM for high-throughput inference instead of HF transformers")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallelism size (number of GPUs)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="vLLM GPU memory utilization fraction")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
         "--steering-no-system",
@@ -889,29 +913,46 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.activation_scales = [float(s) for s in (args.activation_scales if args.activation_scales else args.steering_scales)]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+
+    # Initialize model based on backend choice
+    if args.use_vllm:
+        # vLLM backend
+        vllm_cfg = VLLMSteeringConfig(
+            model_name=args.model,
+            target_layer=args.target_layer,
+            init_scale=0.0,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            dtype="bfloat16" if torch.cuda.is_available() else "float32",
+        )
+        steering_model = VLLMSteerModel(vllm_cfg)
+        # vLLM has its own tokenizer internally, but we need one for chat templates
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+    else:
+        # HuggingFace transformers backend
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        base_kwargs = dict(
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            low_cpu_mem_usage=False,
+        )
+        model_cfg = SteeringVectorConfig(
+            model_name=args.model,
+            target_layer=args.target_layer,
+            init_scale=0.0,
+        )
+        steering_model = QwenSteerModel(model_cfg, **base_kwargs).eval()
+        if torch.cuda.is_available():
+            steering_model.to(device)
 
     chat_template_kwargs: dict[str, object] = {}
     if "qwen" in args.model.lower():
         chat_template_kwargs["enable_thinking"] = False
     args.chat_template_kwargs = chat_template_kwargs
-
-    base_kwargs = dict(
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-        low_cpu_mem_usage=False,
-    )
-    model_cfg = SteeringVectorConfig(
-        model_name=args.model,
-        target_layer=args.target_layer,
-        init_scale=0.0,
-    )
-    steering_model = QwenSteerModel(model_cfg, **base_kwargs).eval()
-    if torch.cuda.is_available():
-        steering_model.to(device)
 
     if args.datasets:
         datasets = args.datasets
