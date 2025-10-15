@@ -359,3 +359,6 @@ User can now:
   - Identifies specific roles/traits most affected by instruction tuning
   - Shows whether effects are consistent (low std) or variable (high std) across layers
   - Reveals correlation between magnitude and direction changes per semantic vector
+
+## 2025-10-15
+- 2025-10-15T22:11:51Z — Moved the steering hook into a `_SteeringModule` so vLLM CUDA graphs see live vector updates; smoke test now targets `Qwen/Qwen3-0.6B` with constrained GPU utilization. Verified in `notebooks/vllm_rollout_test.ipynb` that deterministic decoding (temp 0) diverges once `VLLMSteerModel(..., enforce_eager=True)` is used, and documented that extreme scales still crash captured graphs—clear the vector after probes.
