@@ -41,3 +41,4 @@
 - `chatspace/vllm_steering/runtime.py` now installs a `_SteeredModelWrapper` around the vLLM model; steering vectors live as per-layer `nn.Parameter`s so CUDA graphs can read updated values without disabling compile.
 - Running via `uv run …` keeps the repo root on `sys.path`, so the worker-side `sitecustomize.py` patch installer triggers automatically before model load.
 - Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) to sanity-check that steered vs. unsteered outputs diverge without relying on `enforce_eager`.
+- Scratch notes belong in `TEMP_JOURNAL.md`; the file is gitignored, so keep the canonical log in `JOURNAL.md` once work stabilizes.
