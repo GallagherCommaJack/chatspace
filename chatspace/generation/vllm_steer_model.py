@@ -53,6 +53,7 @@ class VLLMSteerModel(SteerableModel):
             llm_kwargs["max_model_len"] = cfg.max_model_len
         llm_kwargs.update(vllm_kwargs)
 
+        steering_runtime.ensure_layer_patch_installed()
         self.llm = LLM(model=cfg.model_name, **llm_kwargs)
         self._engine_client = self.llm.llm_engine.engine_core
 

@@ -36,3 +36,8 @@
 - Before editing the engineering log, capture the current UTC timestamp with `date -u` so new entries use an accurate datestamp.
 - Record material debugging and training updates in `JOURNAL.md`, summarizing the change, duration, and key outputs or checkpoints.
 - Note any tmux sessions, long-running jobs, or `/workspace` artifact paths so the next agent can resume without guesswork.
+
+## Steering Runtime Notes
+- `chatspace/vllm_steering/runtime.py` now installs a `_SteeredModelWrapper` around the vLLM model; steering vectors live as per-layer `nn.Parameter`s so CUDA graphs can read updated values without disabling compile.
+- Running via `uv run …` keeps the repo root on `sys.path`, so the worker-side `sitecustomize.py` patch installer triggers automatically before model load.
+- Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) to sanity-check that steered vs. unsteered outputs diverge without relying on `enforce_eager`.

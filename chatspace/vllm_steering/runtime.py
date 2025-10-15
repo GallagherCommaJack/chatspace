@@ -1,51 +1,22 @@
 """Worker-side utilities for steering vector control inside vLLM workers.
 
 These helpers are executed inside vLLM worker processes via collective RPCs.
-They install forward hooks on the target Qwen3 transformer layer and provide
-APIs to update steering vectors and retarget layers at runtime.
+They patch the target Qwen3 transformer layer so steering vectors participate
+in CUDA-graph captures, and provide APIs to update vectors or retarget layers
+at runtime.
 """
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Sequence
 
 import torch
 from torch import nn
-from torch.utils.hooks import RemovableHandle
 
 LayerLike = Any
-
-
-class _SteeringModule(nn.Module):
-    """Small module that adds the steering vector inside the CUDA graph."""
-
-    def __init__(self, hidden_size: int, dtype: torch.dtype, device: torch.device) -> None:
-        super().__init__()
-        self.register_buffer(
-            "steering_vector",
-            torch.zeros(hidden_size, dtype=dtype, device=device),
-            persistent=False,
-        )
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return hidden + self.steering_vector
-
-    def set_vector(self, vector: torch.Tensor) -> None:
-        if vector.ndim != 1:
-            raise ValueError("Steering vector must be 1D.")
-        if vector.shape != self.steering_vector.shape:
-            raise ValueError(
-                f"Steering vector shape mismatch: expected {tuple(self.steering_vector.shape)}, "
-                f"got {tuple(vector.shape)}"
-            )
-        self.steering_vector.copy_(vector.to(device=self.steering_vector.device, dtype=self.steering_vector.dtype))
-
-    def clear(self) -> None:
-        self.steering_vector.zero_()
-
-    def clone_cpu(self) -> torch.Tensor:
-        return self.steering_vector.detach().cpu()
 
 
 @dataclass
@@ -53,8 +24,134 @@ class _SteeringState:
     """Track steering metadata for a worker."""
 
     layer_idx: int
-    module: _SteeringModule
-    hook_handle: RemovableHandle | None = None
+    steering_vector: torch.Tensor
+    has_vector: bool = False
+
+
+class _SteeredModelWrapper(nn.Module):
+    """Wrap vLLM model to apply steering after forward execution."""
+
+    def __init__(self, model: nn.Module, state: _SteeringState) -> None:
+        super().__init__()
+        self._wrapped_model = model
+        self._steering_state = state
+
+    def __getattr__(self, name: str) -> Any:  # pragma: no cover - passthrough
+        if name in {"_wrapped_model", "_steering_state"}:
+            return object.__getattribute__(self, name)
+        return getattr(self._wrapped_model, name)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        output = self._wrapped_model(*args, **kwargs)
+        if not self._steering_state.has_vector:
+            return output
+        vector = self._steering_state.steering_vector
+        return _apply_vector_to_output(output, vector)
+
+    def unwrap(self) -> nn.Module:
+        return self._wrapped_model
+
+
+_PATCH_TARGETS: Sequence[tuple[str, str]] = (
+    ("vllm.model_executor.models.qwen2", "Qwen2DecoderLayer"),
+    ("vllm.model_executor.models.qwen2_moe", "Qwen2MoeDecoderLayer"),
+    ("vllm.model_executor.models.qwen2_vl", "Qwen2VLDecoderLayer"),
+    ("vllm.model_executor.models.qwen3", "Qwen3DecoderLayer"),
+    ("vllm.model_executor.models.qwen3_moe", "Qwen3MoeDecoderLayer"),
+    ("vllm.model_executor.models.qwen3_next", "Qwen3NextDecoderLayer"),
+    ("vllm.model_executor.models.qwen3_vl", "Qwen3DecoderLayer"),
+)
+
+_PATCHED_CLASSES: set[type] = set()
+_PATCH_INSTALLED = False
+
+
+def _apply_vector_to_output(output: Any, vector: torch.Tensor) -> Any:
+    if isinstance(output, torch.Tensor):
+        return output + vector
+    if isinstance(output, tuple):
+        if not output:
+            return output
+        steered = output[0] + vector
+        return (steered,) + output[1:]
+    if isinstance(output, list):
+        if not output:
+            return output
+        patched = list(output)
+        patched[0] = patched[0] + vector
+        return patched
+    if isinstance(output, dict) and "last_hidden_state" in output:
+        patched = dict(output)
+        patched["last_hidden_state"] = patched["last_hidden_state"] + vector
+        return patched
+    if hasattr(output, "last_hidden_state"):
+        output.last_hidden_state = output.last_hidden_state + vector  # type: ignore[assignment]
+        return output
+    return output + vector
+
+
+def _patch_decoder_layer_class(layer_cls: type) -> None:
+    if layer_cls in _PATCHED_CLASSES:
+        return
+    original_init = layer_cls.__init__
+    original_forward = layer_cls.forward
+
+    @wraps(original_init)
+    def _patched_init(self, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        if hasattr(self, "_chatspace_steering_vector"):
+            with torch.no_grad():
+                self._chatspace_steering_vector.zero_()  # type: ignore[attr-defined]
+            return
+        hidden_size = getattr(self, "hidden_size", None)
+        if hidden_size is None:
+            # Fallback: infer hidden size from first parameter.
+            param = next(self.parameters(), None)
+            if param is None:
+                raise RuntimeError(
+                    f"Cannot infer hidden size for steering patch on {layer_cls!r}"
+                )
+            hidden_size = param.shape[-1]
+        ref_param = next(self.parameters(), None)
+        dtype = ref_param.dtype if ref_param is not None else torch.float32
+        device = ref_param.device if ref_param is not None else torch.device("cpu")
+        parameter = nn.Parameter(
+            torch.zeros(hidden_size, dtype=dtype, device=device),
+            requires_grad=True,
+        )
+        self.register_parameter("_chatspace_steering_vector", parameter)
+
+    @wraps(original_forward)
+    def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
+        output = original_forward(self, *args, **kwargs)
+        vector = getattr(self, "_chatspace_steering_vector", None)
+        if vector is None:
+            return output
+        return _apply_vector_to_output(output, vector)
+
+    layer_cls.__init__ = _patched_init  # type: ignore[assignment]
+    layer_cls.forward = _patched_forward  # type: ignore[assignment]
+    _PATCHED_CLASSES.add(layer_cls)
+
+
+def ensure_layer_patch_installed() -> None:
+    """Patch known Qwen decoder layers so CUDA graphs include steering."""
+    global _PATCH_INSTALLED
+    if _PATCH_INSTALLED:
+        return
+    for module_name, class_name in _PATCH_TARGETS:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        layer_cls = getattr(module, class_name, None)
+        if layer_cls is None:
+            continue
+        try:
+            _patch_decoder_layer_class(layer_cls)
+        except Exception:
+            continue
+    _PATCH_INSTALLED = True
 
 
 def _resolve_layers(model: Any) -> list[LayerLike]:
@@ -71,22 +168,6 @@ def _ensure_state(worker: Any) -> _SteeringState:
     if state is None:
         raise RuntimeError("Steering state not initialized on worker.")
     return state
-
-
-def _register_hook(layer: LayerLike, state: _SteeringState) -> RemovableHandle:
-    """Attach forward hook that adds the steering vector to residual stream."""
-
-    steering_module = state.module
-
-    def _hook(module, args, output):
-        del module, args  # Unused.
-        hidden = output[0] if isinstance(output, tuple) else output
-        steered = steering_module(hidden)
-        if isinstance(output, tuple):
-            return (steered,) + output[1:]
-        return steered
-
-    return layer.register_forward_hook(_hook)
 
 
 def deserialize_tensor(
@@ -151,7 +232,8 @@ def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
 
 
 def initialize_worker_state(worker: Any, layer_idx: int, init_scale: float) -> dict[str, Any]:
-    """Install steering hook on worker after model load."""
+    """Install steering patch on worker after model load."""
+    ensure_layer_patch_installed()
     model = worker.model_runner.model
     layers = _resolve_layers(model)
     if layer_idx >= len(layers):
@@ -160,17 +242,41 @@ def initialize_worker_state(worker: Any, layer_idx: int, init_scale: float) -> d
         )
 
     hidden_size = model.config.hidden_size
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
+    first_param = next(model.parameters(), None)
+    if first_param is None:
+        raise RuntimeError("Model has no parameters to infer device/dtype.")
+    device = first_param.device
+    dtype = first_param.dtype
 
-    steering_module = _SteeringModule(hidden_size, dtype=dtype, device=device)
-    layers[layer_idx].add_module("_chatspace_steering", steering_module)
-    if init_scale > 0:
-        torch.nn.init.normal_(steering_module.steering_vector, mean=0.0, std=init_scale)
+    layer = layers[layer_idx]
+    if not hasattr(layer, "_chatspace_steering_vector"):
+        parameter = nn.Parameter(
+            torch.zeros(hidden_size, dtype=dtype, device=device),
+            requires_grad=True,
+        )
+        layer.register_parameter("_chatspace_steering_vector", parameter)
+    vector = layer._chatspace_steering_vector  # type: ignore[attr-defined]
+    if not isinstance(vector, torch.Tensor):
+        raise RuntimeError("Failed to attach steering parameter to target layer.")
+    if vector.numel() != hidden_size:
+        raise ValueError(
+            f"Steering buffer size mismatch: expected {hidden_size}, got {vector.numel()}"
+        )
+    with torch.no_grad():
+        if init_scale > 0:
+            torch.nn.init.normal_(vector, mean=0.0, std=init_scale)
+        else:
+            vector.zero_()
 
-    state = _SteeringState(layer_idx=layer_idx, module=steering_module)
-    state.hook_handle = _register_hook(layers[layer_idx], state)
+    state = _SteeringState(
+        layer_idx=layer_idx,
+        steering_vector=vector,
+        has_vector=bool(init_scale > 0),
+    )
     worker._chatspace_steering = state
+
+    if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
+        worker.model_runner.model = _SteeredModelWrapper(model, state)
 
     return {
         "hidden_size": hidden_size,
@@ -186,24 +292,37 @@ def set_worker_vector(worker: Any, vector: torch.Tensor) -> None:
     try:
         vector = deserialize_tensor(
             vector,
-            device=state.module.steering_vector.device,
-            dtype=state.module.steering_vector.dtype,
+            device=state.steering_vector.device,
+            dtype=state.steering_vector.dtype,
         )
     except TypeError:
         # Fall back for already-deserialized tensors.
         if not isinstance(vector, torch.Tensor):
             raise
-    state.module.set_vector(vector)
+    if vector.ndim != 1:
+        raise ValueError("Steering vector must be 1D.")
+    if vector.shape != state.steering_vector.shape:
+        raise ValueError(
+            f"Steering vector shape mismatch: expected {tuple(state.steering_vector.shape)}, "
+            f"got {tuple(vector.shape)}"
+        )
+    with torch.no_grad():
+        state.steering_vector.copy_(
+            vector.to(device=state.steering_vector.device, dtype=state.steering_vector.dtype)
+        )
+    state.has_vector = bool(torch.count_nonzero(vector).item() > 0)
 
 
 def clear_worker_vector(worker: Any) -> None:
     """Zero out the steering vector."""
     state = _ensure_state(worker)
-    state.module.clear()
+    with torch.no_grad():
+        state.steering_vector.zero_()
+    state.has_vector = False
 
 
 def set_worker_layer(worker: Any, layer_idx: int) -> None:
-    """Move steering hook to a different transformer layer."""
+    """Move steering patch to a different transformer layer."""
     state = _ensure_state(worker)
     model = worker.model_runner.model
     layers = _resolve_layers(model)
@@ -211,28 +330,44 @@ def set_worker_layer(worker: Any, layer_idx: int) -> None:
         raise ValueError(
             f"Target layer {layer_idx} out of range for model with {len(layers)} layers"
         )
-    if state.hook_handle is not None:
-        state.hook_handle.remove()
+    if layer_idx == state.layer_idx:
+        return
     old_layer = layers[state.layer_idx]
     new_layer = layers[layer_idx]
-    # Remove module from old layer if present, then attach to new layer.
-    if "_chatspace_steering" in old_layer._modules:
-        old_layer._modules.pop("_chatspace_steering")
-    new_layer.add_module("_chatspace_steering", state.module)
+    old_vector = getattr(old_layer, "_chatspace_steering_vector", None)
+    if isinstance(old_vector, torch.Tensor):
+        with torch.no_grad():
+            old_vector.zero_()
+    if not hasattr(new_layer, "_chatspace_steering_vector"):
+        template = state.steering_vector
+        parameter = nn.Parameter(
+            torch.zeros_like(template, device=template.device, dtype=template.dtype),
+            requires_grad=True,
+        )
+        new_layer.register_parameter("_chatspace_steering_vector", parameter)
+    vector = new_layer._chatspace_steering_vector  # type: ignore[attr-defined]
+    if vector.shape != state.steering_vector.shape:
+        raise ValueError(
+            f"Steering buffer shape mismatch on new layer: expected {tuple(state.steering_vector.shape)}, "
+            f"got {tuple(vector.shape)}"
+        )
+    with torch.no_grad():
+        vector.zero_()
     state.layer_idx = int(layer_idx)
-    state.hook_handle = _register_hook(new_layer, state)
+    state.steering_vector = vector
+    state.has_vector = False
 
 
 def fetch_worker_vector(worker: Any) -> torch.Tensor:
     """Return a CPU copy of the current steering vector (for debugging/tests)."""
     state = _ensure_state(worker)
-    return state.module.clone_cpu()
+    return state.steering_vector.detach().cpu().clone()
 
 
 def fetch_worker_state(worker: Any) -> dict[str, Any]:
     """Inspect the worker steering state."""
     state = _ensure_state(worker)
-    vector = state.module.steering_vector
+    vector = state.steering_vector
     return {
         "layer_idx": state.layer_idx,
         "shape": tuple(vector.shape),
