@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 import logging
 
 import torch
 from vllm import LLM, SamplingParams
 
 from chatspace.vllm_steering import runtime as steering_runtime
-
-from .base import SteerableModel
 
 
 logger = logging.getLogger(__name__)
@@ -23,12 +21,11 @@ class VLLMSteeringConfig:
     """Configuration for vLLM-based steerable model."""
 
     model_name: str = "Qwen/Qwen3-32B"
-    target_layer: int = 22
-    init_scale: float = 0.0
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
     dtype: str = "auto"
+    bootstrap_layers: tuple[int, ...] = ()
 
 
 def _parse_dtype(dtype_str: str) -> torch.dtype:
@@ -41,10 +38,16 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
-class VLLMSteerModel(SteerableModel):
+class VLLMSteerModel:
     """Wrap a vLLM LLM with steering vector control via worker RPCs."""
 
-    def __init__(self, cfg: VLLMSteeringConfig, **vllm_kwargs) -> None:
+    def __init__(
+        self,
+        cfg: VLLMSteeringConfig,
+        *,
+        bootstrap_layers: Sequence[int] | None = None,
+        **vllm_kwargs,
+    ) -> None:
         self.cfg = cfg
 
         enforce_eager = bool(vllm_kwargs.get("enforce_eager", True))
@@ -67,9 +70,15 @@ class VLLMSteerModel(SteerableModel):
             )
         self._engine_client = self.llm.llm_engine.engine_core
 
+        init_layers: tuple[int, ...]
+        if bootstrap_layers is not None:
+            init_layers = tuple(int(idx) for idx in bootstrap_layers)
+        else:
+            init_layers = tuple(int(idx) for idx in cfg.bootstrap_layers)
+
         setup_info = self._engine_client.collective_rpc(
             steering_runtime.initialize_worker_state,
-            args=(int(cfg.target_layer), float(cfg.init_scale)),
+            args=(init_layers,),
         )
         if not setup_info:
             raise RuntimeError("Failed to initialize steering state on workers.")
@@ -77,32 +86,55 @@ class VLLMSteerModel(SteerableModel):
         first = setup_info[0]
         self.hidden_size = int(first["hidden_size"])
         self._vector_dtype = _parse_dtype(first["dtype"])
-        self._cached_vector = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
+        layer_count = int(first["layer_count"])
+        self.layer_count = layer_count
+        self._cached_vectors: dict[int, torch.Tensor] = {}
+        for idx in init_layers:
+            if idx < 0 or idx >= layer_count:
+                raise ValueError(
+                    f"bootstrap layer {idx} is out of range for model with {layer_count} layers"
+                )
+            self._ensure_cached_layer(idx)
 
-    def _broadcast_vector(self, vector: torch.Tensor) -> None:
+    def _ensure_cached_layer(self, layer_idx: int) -> torch.Tensor:
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= self.layer_count:
+            raise ValueError(
+                f"Layer index {layer_idx} out of range for model with {self.layer_count} layers"
+            )
+        cached = self._cached_vectors.get(layer_idx)
+        if cached is None:
+            cached = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
+            self._cached_vectors[layer_idx] = cached
+        return cached
+
+    def _broadcast_vector(self, layer_idx: int, vector: torch.Tensor) -> None:
         vec = vector.to(dtype=self._vector_dtype, device="cpu").contiguous()
         payload = steering_runtime.serialize_tensor(vec)
         self._engine_client.collective_rpc(
-            steering_runtime.set_worker_vector, args=(payload,)
+            steering_runtime.set_worker_vector,
+            args=(int(layer_idx), payload),
         )
-        self._cached_vector = vec.clone()
+        self._cached_vectors[int(layer_idx)] = vec.clone()
 
-    def _broadcast_clear(self) -> None:
-        self._engine_client.collective_rpc(steering_runtime.clear_worker_vector)
-        self._cached_vector.zero_()
+    def _broadcast_clear(self, layer_idx: int | None = None) -> None:
+        if layer_idx is None:
+            self._engine_client.collective_rpc(steering_runtime.clear_worker_vector)
+            for idx, cached in self._cached_vectors.items():
+                cached.zero_()
+        else:
+            target = int(layer_idx)
+            self._engine_client.collective_rpc(
+                steering_runtime.clear_worker_vector, args=(target,)
+            )
+            self._ensure_cached_layer(target).zero_()
 
-    def set_target_layer(self, layer_idx: int) -> None:
+    def set_layer_vector(
+        self, layer_idx: int, vector: torch.Tensor | None
+    ) -> None:
         layer_idx = int(layer_idx)
-        if layer_idx == self.cfg.target_layer:
-            return
-        self._engine_client.collective_rpc(
-            steering_runtime.set_worker_layer, args=(layer_idx,)
-        )
-        self.cfg.target_layer = layer_idx
-
-    def set_vector(self, vector: torch.Tensor | None) -> None:
         if vector is None:
-            self._broadcast_clear()
+            self._broadcast_clear(layer_idx)
             return
 
         vec = vector.detach().view(-1)
@@ -110,11 +142,25 @@ class VLLMSteerModel(SteerableModel):
             raise ValueError(
                 f"Steering vector shape mismatch: expected {(self.hidden_size,)}, got {tuple(vec.shape)}"
             )
-        self._broadcast_vector(vec)
+        self._broadcast_vector(layer_idx, vec)
 
-    def current_vector(self) -> torch.Tensor:
+    def current_vector(self, layer_idx: int | None = None) -> torch.Tensor:
         """Return a CPU copy of the last vector broadcast to workers."""
-        return self._cached_vector.clone()
+        if layer_idx is None:
+            if not self._cached_vectors:
+                raise ValueError("No steering vectors have been cached yet.")
+            if len(self._cached_vectors) != 1:
+                raise ValueError(
+                    "Multiple layer vectors cached. Provide layer_idx explicitly."
+                )
+            layer_idx = next(iter(self._cached_vectors.keys()))
+        return self._ensure_cached_layer(int(layer_idx)).clone()
+
+    def clear_layer_vector(self, layer_idx: int) -> None:
+        self.set_layer_vector(layer_idx, None)
+
+    def clear_all_vectors(self) -> None:
+        self._broadcast_clear()
 
     def generate(
         self,
@@ -253,7 +299,21 @@ class VLLMSteerModel(SteerableModel):
         path.mkdir(parents=True, exist_ok=True)
 
         vector_path = path / "steering_vector.pt"
-        torch.save({"steering_vector": self._cached_vector.clone()}, vector_path)
+        serialized_vectors = {
+            int(layer_idx): tensor.detach().cpu().clone()
+            for layer_idx, tensor in self._cached_vectors.items()
+        }
+        torch.save(
+            {
+                "layer_vectors": serialized_vectors,
+                "steering_vector": (
+                    next(iter(serialized_vectors.values())).clone()
+                    if serialized_vectors
+                    else None
+                ),
+            },
+            vector_path,
+        )
 
         config_path = path / "steering_config.json"
         with config_path.open("w", encoding="utf-8") as fh:
@@ -270,32 +330,43 @@ class VLLMSteerModel(SteerableModel):
         with config_path.open("r", encoding="utf-8") as fh:
             cfg_dict = json.load(fh)
 
-        cfg = VLLMSteeringConfig(**cfg_dict)
+        allowed_keys = {f.name for f in fields(VLLMSteeringConfig)}
+        filtered_cfg = {key: value for key, value in cfg_dict.items() if key in allowed_keys}
+        cfg = VLLMSteeringConfig(**filtered_cfg)
+
         model = cls(cfg, **vllm_kwargs)
 
         vector_path = path / "steering_vector.pt"
         if vector_path.exists():
             state = torch.load(vector_path, map_location="cpu")
-            tensor = state.get("steering_vector")
-            if tensor is None:
-                raise ValueError(
-                    f"steering_vector.pt missing 'steering_vector' key at {vector_path}"
-                )
-            model.set_vector(tensor)
+            layer_vectors = state.get("layer_vectors")
+            if isinstance(layer_vectors, dict) and layer_vectors:
+                for layer_idx, tensor in layer_vectors.items():
+                    model.set_layer_vector(int(layer_idx), tensor)
+            else:
+                tensor = state.get("steering_vector")
+                if tensor is None:
+                    raise ValueError(
+                        f"steering_vector.pt missing steering data at {vector_path}"
+                    )
+                model.set_layer_vector(0, tensor)
         return model
 
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)
     # ------------------------------------------------------------------
 
-    def _fetch_worker_vectors(self) -> list[torch.Tensor]:
+    def _fetch_worker_vectors(self) -> list[dict[int, torch.Tensor]]:
         """Retrieve current worker vectors for validation."""
         payloads = self._engine_client.collective_rpc(
-            steering_runtime.fetch_worker_vector
+            steering_runtime.fetch_worker_vectors
         )
-        return [
-            steering_runtime.deserialize_tensor(
-                payload, device=torch.device("cpu"), dtype=self._vector_dtype
-            )
-            for payload in payloads
-        ]
+        worker_vectors: list[dict[int, torch.Tensor]] = []
+        for payload in payloads:
+            worker_map: dict[int, torch.Tensor] = {}
+            for layer_idx, tensor in payload.items():
+                worker_map[int(layer_idx)] = (
+                    tensor.detach().to(dtype=self._vector_dtype).cpu().clone()
+                )
+            worker_vectors.append(worker_map)
+        return worker_vectors

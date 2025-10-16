@@ -76,7 +76,9 @@ class SteerableModel(ABC):
 - Wraps `vllm.LLM` with steering capabilities
 - Accesses underlying model layers via `llm.llm_engine.model_executor...`
 - Installs forward hooks at specified layer
+- Supports multi-layer steering through `set_layer_vector`
 - Supports Qwen, Gemma, and other vLLM-compatible models
+- Optional `bootstrap_layers` pre-allocates worker buffers for known layer IDs
 
 **`QwenSteerModel` (Updated)**
 - Now inherits from `SteerableModel` base class
@@ -225,11 +227,25 @@ The vLLM backend now mirrors that behaviour from inside the worker processes:
 from chatspace.vllm_steering import runtime
 
 # Executed via EngineCore.collective_rpc on every worker
-runtime.initialize_worker_state(worker, layer_idx=target, init_scale=0.0)
-runtime.set_worker_vector(worker, steering_vector)
+runtime.initialize_worker_state(worker, (target,))
+runtime.set_worker_vector(worker, target, steering_vector)
+runtime.set_worker_vector(worker, other_layer, other_vector)  # Optional extra layers
+# Clear a specific layer when done
+runtime.clear_worker_vector(worker, target)
 ```
 
-Each worker keeps a 1D tensor in device memory and a forward hook that adds it to the residual stream before logits are computed. Updating the steering vector or retargeting the layer is done through additional `collective_rpc` calls so tensor-parallel shards stay in sync.
+Each worker keeps 1D tensors in device memory keyed by layer index and a forward hook that adds the active vectors to the residual stream before logits are computed. Drivers must explicitly manage layer indices—there is no implicit "default"—so `set_layer_vector`/`clear_all_vectors` on `VLLMSteerModel` simply broadcast the desired tensors (or zeros) to the matching layer buffers.
+
+```python
+from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+
+cfg = VLLMSteeringConfig(model_name="Qwen/Qwen3-0.6B")
+model = VLLMSteerModel(cfg, bootstrap_layers=(22,))
+model.set_layer_vector(22, steering_tensor)
+model.set_layer_vector(30, other_tensor)   # Optional extra layer
+model.clear_layer_vector(22)
+model.clear_all_vectors()
+```
 
 ### Generation API Differences
 

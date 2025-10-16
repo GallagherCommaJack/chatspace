@@ -655,8 +655,13 @@ def generate_variants(
         layer_idx: int | None = None,
     ) -> list[str]:
         target_layer = layer_idx if layer_idx is not None else args.target_layer
-        steering_model.set_target_layer(target_layer)
-        steering_model.set_vector(vector)
+        if args.use_vllm:
+            steering_model.clear_all_vectors()
+            if vector is not None:
+                steering_model.set_layer_vector(target_layer, vector)
+        else:
+            steering_model.set_target_layer(target_layer)
+            steering_model.set_vector(vector)
 
         # Convert messages to chat-formatted text
         chat_texts = [
@@ -919,13 +924,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         # vLLM backend
         vllm_cfg = VLLMSteeringConfig(
             model_name=args.model,
-            target_layer=args.target_layer,
-            init_scale=0.0,
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             dtype="bfloat16" if torch.cuda.is_available() else "float32",
         )
-        steering_model = VLLMSteerModel(vllm_cfg)
+        steering_model = VLLMSteerModel(
+            vllm_cfg,
+            bootstrap_layers=(args.target_layer,),
+        )
         # vLLM has its own tokenizer internally, but we need one for chat templates
         tokenizer = AutoTokenizer.from_pretrained(args.model)
     else:
