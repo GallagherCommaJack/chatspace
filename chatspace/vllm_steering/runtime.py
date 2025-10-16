@@ -15,6 +15,10 @@ from typing import Any, Sequence
 
 import torch
 from torch import nn
+try:  # pragma: no cover - torch._dynamo optional at runtime
+    import torch._dynamo as _dynamo
+except Exception:  # pragma: no cover - fallback when unavailable
+    _dynamo = None
 
 LayerLike = Any
 
@@ -25,7 +29,7 @@ class _SteeringState:
 
     layer_idx: int
     steering_vector: torch.Tensor
-    has_vector: bool = False
+    hook_handle: Any | None = None
 
 
 class _SteeredModelWrapper(nn.Module):
@@ -45,11 +49,7 @@ class _SteeredModelWrapper(nn.Module):
             return getattr(self._wrapped_model, name)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
-        output = self._wrapped_model(*args, **kwargs)
-        if not self._steering_state.has_vector:
-            return output
-        vector = self._steering_state.steering_vector
-        return _apply_vector_to_output(output, vector)
+        return self._wrapped_model(*args, **kwargs)
 
     def unwrap(self) -> nn.Module:
         return self._wrapped_model
@@ -67,16 +67,18 @@ _PATCH_TARGETS: Sequence[tuple[str, str]] = (
 
 _PATCHED_CLASSES: set[type] = set()
 _PATCH_INSTALLED = False
+_SEEN_OUTPUT_TYPES: set[str] = set()
 
 
 def _apply_vector_to_output(output: Any, vector: torch.Tensor) -> Any:
+    _SEEN_OUTPUT_TYPES.add(type(output).__name__)
     if isinstance(output, torch.Tensor):
         return output + vector
     if isinstance(output, tuple):
         if not output:
             return output
-        steered = output[0] + vector
-        return (steered,) + output[1:]
+        steered_hidden = output[0] + vector
+        return (steered_hidden,) + output[1:]
     if isinstance(output, list):
         if not output:
             return output
@@ -92,12 +94,14 @@ def _apply_vector_to_output(output: Any, vector: torch.Tensor) -> Any:
         return output
     return output + vector
 
+if _dynamo is not None:
+    _apply_vector_to_output = _dynamo.disable(_apply_vector_to_output)  # type: ignore[assignment]
+
 
 def _patch_decoder_layer_class(layer_cls: type) -> None:
     if layer_cls in _PATCHED_CLASSES:
         return
     original_init = layer_cls.__init__
-    original_forward = layer_cls.forward
 
     @wraps(original_init)
     def _patched_init(self, *args: Any, **kwargs: Any) -> None:
@@ -124,16 +128,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         )
         self.register_parameter("_chatspace_steering_vector", parameter)
 
-    @wraps(original_forward)
-    def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
-        output = original_forward(self, *args, **kwargs)
-        vector = getattr(self, "_chatspace_steering_vector", None)
-        if vector is None:
-            return output
-        return _apply_vector_to_output(output, vector)
-
     layer_cls.__init__ = _patched_init  # type: ignore[assignment]
-    layer_cls.forward = _patched_forward  # type: ignore[assignment]
     _PATCHED_CLASSES.add(layer_cls)
 
 
@@ -164,6 +159,18 @@ def _resolve_layers(model: Any) -> list[LayerLike]:
     if hasattr(model, "layers"):
         return list(model.layers)
     raise RuntimeError(f"Could not resolve layers for model of type {type(model)}")
+
+
+def _install_forward_hook(layer: LayerLike, state: _SteeringState) -> None:
+    """Attach (or replace) the steering hook on the provided layer."""
+    if state.hook_handle is not None:
+        state.hook_handle.remove()
+        state.hook_handle = None
+
+    def _hook(module: nn.Module, args: Any, output: Any) -> Any:
+        return _apply_vector_to_output(output, state.steering_vector)
+
+    state.hook_handle = layer.register_forward_hook(_hook)
 
 
 def _ensure_state(worker: Any) -> _SteeringState:
@@ -274,12 +281,13 @@ def initialize_worker_state(worker: Any, layer_idx: int, init_scale: float) -> d
     state = _SteeringState(
         layer_idx=layer_idx,
         steering_vector=vector,
-        has_vector=bool(init_scale > 0),
     )
     worker._chatspace_steering = state
 
     if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
         worker.model_runner.model = _SteeredModelWrapper(model, state)
+
+    _install_forward_hook(layer, state)
 
     return {
         "hidden_size": hidden_size,
@@ -313,7 +321,6 @@ def set_worker_vector(worker: Any, vector: torch.Tensor) -> None:
         state.steering_vector.copy_(
             vector.to(device=state.steering_vector.device, dtype=state.steering_vector.dtype)
         )
-    state.has_vector = bool(torch.count_nonzero(vector).item() > 0)
 
 
 def clear_worker_vector(worker: Any) -> None:
@@ -321,7 +328,6 @@ def clear_worker_vector(worker: Any) -> None:
     state = _ensure_state(worker)
     with torch.no_grad():
         state.steering_vector.zero_()
-    state.has_vector = False
 
 
 def set_worker_layer(worker: Any, layer_idx: int) -> None:
@@ -358,7 +364,7 @@ def set_worker_layer(worker: Any, layer_idx: int) -> None:
         vector.zero_()
     state.layer_idx = int(layer_idx)
     state.steering_vector = vector
-    state.has_vector = False
+    _install_forward_hook(new_layer, state)
 
 
 def fetch_worker_vector(worker: Any) -> torch.Tensor:
@@ -376,4 +382,35 @@ def fetch_worker_state(worker: Any) -> dict[str, Any]:
         "shape": tuple(vector.shape),
         "dtype": str(vector.dtype),
         "device": str(vector.device),
+    }
+
+
+def inspect_layer_vector(worker: Any) -> dict[str, Any]:
+    """Return diagnostics for the patched layer (for debugging)."""
+    state = _ensure_state(worker)
+    layers = _resolve_layers(worker.model_runner.model)
+    layer = layers[state.layer_idx]
+    vector = getattr(layer, "_chatspace_steering_vector", None)
+    layer_type = type(layer).__name__
+    if vector is None:
+        return {"has_vector": False}
+    with torch.no_grad():
+        norm = float(vector.norm().item())
+        sum_val = float(vector.sum().item())
+    try:
+        forward_name = type(layer.forward).__name__
+    except AttributeError:  # pragma: no cover - callable without __name__
+        forward_name = layer.forward.__class__.__name__
+    has_instance_forward = "forward" in layer.__dict__
+    return {
+        "has_vector": True,
+        "norm": norm,
+        "sum": sum_val,
+        "dtype": str(vector.dtype),
+        "device": str(vector.device),
+        "output_types": list(_SEEN_OUTPUT_TYPES),
+        "layer_type": layer_type,
+        "forward_type": forward_name,
+        "instance_forward": has_instance_forward,
+        "layer_module": layer.__class__.__module__,
     }

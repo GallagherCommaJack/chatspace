@@ -10,7 +10,8 @@
 - `uv sync` — install and lock project dependencies (Python 3.11 required).
 - `uv run chatspace embed-hf --dataset <org/name> --model <model> --max-rows 1000` — run the embedding pipeline end-to-end with deterministic row limits.
 - `uv run pytest` — execute the unit test suite in `tests/` with isolated virtualenv support.
-- `python test_multiprocessing.py` — quick regression for the multiprocessing controller without downloading datasets.
+- `uv run python test_multiprocessing.py` — quick regression for the multiprocessing controller without downloading datasets.
+- ALWAYS run python via `uv run python`, DO NOT run plain `python`, system python will not have requisite deps installed
 
 ## Coding Style & Naming Conventions
 - Follow PEP 8 with 4-space indentation, descriptive snake_case for functions, and UpperCamelCase for classes.
@@ -38,7 +39,8 @@
 - Note any tmux sessions, long-running jobs, or `/workspace` artifact paths so the next agent can resume without guesswork.
 
 ## Steering Runtime Notes
-- `chatspace/vllm_steering/runtime.py` now installs a `_SteeredModelWrapper` around the vLLM model; steering vectors live as per-layer `nn.Parameter`s so CUDA graphs can read updated values without disabling compile.
+- `chatspace/vllm_steering/runtime.py` injects steering vectors via per-layer forward hooks; this only runs in eager mode. Always launch `VLLMSteerModel` with `enforce_eager=True` (default) or the hook will be compiled away and no steering occurs.
+- CUDA-graph capture presently breaks steering: the compiled forward bypasses the hook. Leave graphs disabled until we add a fused kernel / runtime patch that is graph-safe.
 - Running via `uv run …` keeps the repo root on `sys.path`, so the worker-side `sitecustomize.py` patch installer triggers automatically before model load.
-- Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) to sanity-check that steered vs. unsteered outputs diverge without relying on `enforce_eager`.
+- Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) for quick verification; expect steered logprobs to diverge under eager execution only.
 - Scratch notes belong in `TEMP_JOURNAL.md`; the file is gitignored, so keep the canonical log in `JOURNAL.md` once work stabilizes.

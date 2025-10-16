@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
+import logging
 
 import torch
 from vllm import LLM, SamplingParams
@@ -14,6 +15,8 @@ from chatspace.vllm_steering import runtime as steering_runtime
 
 from .base import SteerableModel
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class VLLMSteeringConfig:
@@ -44,10 +47,13 @@ class VLLMSteerModel(SteerableModel):
     def __init__(self, cfg: VLLMSteeringConfig, **vllm_kwargs) -> None:
         self.cfg = cfg
 
+        enforce_eager = bool(vllm_kwargs.get("enforce_eager", True))
+
         llm_kwargs = {
             "tensor_parallel_size": cfg.tensor_parallel_size,
             "gpu_memory_utilization": cfg.gpu_memory_utilization,
             "dtype": cfg.dtype,
+            "enforce_eager": enforce_eager,
         }
         if cfg.max_model_len is not None:
             llm_kwargs["max_model_len"] = cfg.max_model_len
@@ -55,6 +61,10 @@ class VLLMSteerModel(SteerableModel):
 
         steering_runtime.ensure_layer_patch_installed()
         self.llm = LLM(model=cfg.model_name, **llm_kwargs)
+        if not enforce_eager:
+            logger.warning(
+                "vLLM steering currently requires enforce_eager=True to apply layer hooks."
+            )
         self._engine_client = self.llm.llm_engine.engine_core
 
         setup_info = self._engine_client.collective_rpc(
