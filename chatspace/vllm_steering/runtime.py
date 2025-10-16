@@ -29,7 +29,6 @@ class _SteeringState:
 
     layer_idx: int
     steering_vector: torch.Tensor
-    hook_handle: Any | None = None
 
 
 class _SteeredModelWrapper(nn.Module):
@@ -102,6 +101,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
     if layer_cls in _PATCHED_CLASSES:
         return
     original_init = layer_cls.__init__
+    original_forward = layer_cls.forward
 
     @wraps(original_init)
     def _patched_init(self, *args: Any, **kwargs: Any) -> None:
@@ -128,7 +128,16 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         )
         self.register_parameter("_chatspace_steering_vector", parameter)
 
+    @wraps(original_forward)
+    def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
+        output = original_forward(self, *args, **kwargs)
+        vector = getattr(self, "_chatspace_steering_vector", None)
+        if vector is None:
+            return output
+        return _apply_vector_to_output(output, vector)
+
     layer_cls.__init__ = _patched_init  # type: ignore[assignment]
+    layer_cls.forward = _patched_forward  # type: ignore[assignment]
     _PATCHED_CLASSES.add(layer_cls)
 
 
@@ -159,18 +168,6 @@ def _resolve_layers(model: Any) -> list[LayerLike]:
     if hasattr(model, "layers"):
         return list(model.layers)
     raise RuntimeError(f"Could not resolve layers for model of type {type(model)}")
-
-
-def _install_forward_hook(layer: LayerLike, state: _SteeringState) -> None:
-    """Attach (or replace) the steering hook on the provided layer."""
-    if state.hook_handle is not None:
-        state.hook_handle.remove()
-        state.hook_handle = None
-
-    def _hook(module: nn.Module, args: Any, output: Any) -> Any:
-        return _apply_vector_to_output(output, state.steering_vector)
-
-    state.hook_handle = layer.register_forward_hook(_hook)
 
 
 def _ensure_state(worker: Any) -> _SteeringState:
@@ -287,8 +284,6 @@ def initialize_worker_state(worker: Any, layer_idx: int, init_scale: float) -> d
     if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
         worker.model_runner.model = _SteeredModelWrapper(model, state)
 
-    _install_forward_hook(layer, state)
-
     return {
         "hidden_size": hidden_size,
         "layer_count": len(layers),
@@ -364,7 +359,6 @@ def set_worker_layer(worker: Any, layer_idx: int) -> None:
         vector.zero_()
     state.layer_idx = int(layer_idx)
     state.steering_vector = vector
-    _install_forward_hook(new_layer, state)
 
 
 def fetch_worker_vector(worker: Any) -> torch.Tensor:
