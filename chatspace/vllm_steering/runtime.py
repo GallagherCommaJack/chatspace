@@ -33,13 +33,16 @@ class _SteeredModelWrapper(nn.Module):
 
     def __init__(self, model: nn.Module, state: _SteeringState) -> None:
         super().__init__()
-        self._wrapped_model = model
+        object.__setattr__(self, "_wrapped_model", model)
         self._steering_state = state
 
     def __getattr__(self, name: str) -> Any:  # pragma: no cover - passthrough
         if name in {"_wrapped_model", "_steering_state"}:
             return object.__getattribute__(self, name)
-        return getattr(self._wrapped_model, name)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._wrapped_model, name)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         output = self._wrapped_model(*args, **kwargs)

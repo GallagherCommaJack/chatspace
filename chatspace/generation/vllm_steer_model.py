@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm import LLM, SamplingParams
@@ -118,6 +118,125 @@ class VLLMSteerModel(SteerableModel):
             sampling_params = SamplingParams(**kwargs)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
         return [output.outputs[0].text for output in outputs]
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        use_tqdm: bool = False,
+        chat_options: dict[str, Any] | None = None,
+        prefill_assistant: str | bool | None = None,
+        **sampling_kwargs: Any,
+    ) -> list[str]:
+        """Execute chat-style generation with optional sampling overrides.
+
+        Parameters
+        ----------
+        messages : list[dict[str, Any]] | list[list[dict[str, Any]]]
+            Conversation messages using the OpenAI-style schema. A single
+            conversation may be provided (list of messages) or a batch of
+            conversations (list of conversation lists).
+        sampling_params : SamplingParams | None
+            Optional sampling configuration. If omitted, ``sampling_kwargs``
+            are used to instantiate a ``SamplingParams`` object.
+        use_tqdm : bool, default False
+            Whether to display the progress bar during generation.
+        chat_options : dict[str, Any] | None
+            Additional keyword arguments forwarded to ``LLM.chat`` (for
+            example ``chat_template`` or ``add_generation_prompt``).
+        prefill_assistant : str | bool | None, default None
+            Optional prefix inserted as the final assistant message before
+            generation. When set to ``True`` the helper injects an empty
+            ``<think></think>`` block compatible with the hybrid chat template.
+            String inputs allow custom prefixes; any whitespace-only think blocks
+            are normalized to match template formatting. The helper automatically
+            strips the prefix (including the sentinel) from returned outputs. Set
+            to ``None`` or ``False`` to disable prefilling.
+        **sampling_kwargs : Any
+            Keyword arguments used to build a ``SamplingParams`` instance when
+            ``sampling_params`` is not supplied.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams(**sampling_kwargs)
+        elif sampling_kwargs:
+            raise ValueError(
+                "Provide either sampling_params or sampling keyword overrides, not both."
+            )
+
+        single_conversation = (
+            isinstance(messages, list)
+            and (len(messages) == 0 or isinstance(messages[0], dict))
+        )
+        if single_conversation:
+            batched_messages = [cast(list[dict[str, Any]], messages)]
+        else:
+            batched_messages = cast(list[list[dict[str, Any]]], messages)
+
+        prepared_messages: list[list[dict[str, Any]]]
+        chat_kwargs = dict(chat_options or {})
+        chat_kwargs.setdefault("chat_template_content_format", "string")
+
+        sentinel = "ASSISTANT_PREFILL:"
+        trim_prefix: str | None = None
+
+        def _normalize_prefill(raw: str) -> str:
+            stripped = raw.strip()
+            if stripped.startswith("<think>") and "</think>" in stripped:
+                head, tail = stripped.split("</think>", 1)
+                inside = head[len("<think>") :].strip()
+                if not inside:
+                    tail = tail.lstrip("\n")
+                    return "<think>\n\n</think>\n\n" + tail
+            return raw
+
+        prefill_base: str | None
+        if isinstance(prefill_assistant, bool):
+            prefill_base = "<think>\n\n</think>\n\n" if prefill_assistant else None
+        elif isinstance(prefill_assistant, str):
+            prefill_base = _normalize_prefill(prefill_assistant)
+        else:
+            prefill_base = None
+
+        if prefill_base is not None:
+            prefill_payload = f"{prefill_base}{sentinel}"
+            trim_prefix = prefill_payload
+            if chat_kwargs.get("add_generation_prompt", False):
+                raise ValueError(
+                    "Cannot prefill assistant when add_generation_prompt=True. "
+                    "Disable prefilling or override chat_options."
+                )
+            if chat_kwargs.get("continue_final_message") is False:
+                raise ValueError(
+                    "Cannot prefill assistant when continue_final_message=False. "
+                    "Disable prefilling or override chat_options."
+                )
+            chat_kwargs.setdefault("add_generation_prompt", False)
+            chat_kwargs.setdefault("continue_final_message", True)
+
+            prepared_messages = []
+            for conv in batched_messages:
+                conv_copy = [dict(msg) for msg in conv]
+                conv_copy.append({"role": "assistant", "content": prefill_payload})
+                prepared_messages.append(conv_copy)
+        elif prefill_assistant not in (None, False):
+            raise TypeError("prefill_assistant must be a string, boolean, or None.")
+        else:
+            prepared_messages = batched_messages
+
+        outputs = self.llm.chat(
+            prepared_messages,
+            sampling_params=sampling_params,
+            use_tqdm=use_tqdm,
+            **chat_kwargs,
+        )
+        texts: list[str] = []
+        for output in outputs:
+            text = output.outputs[0].text
+            if trim_prefix and text.startswith(trim_prefix):
+                text = text[len(trim_prefix) :].lstrip()
+            texts.append(text)
+        return texts
 
     def save_pretrained(self, save_directory: str | Path, **_) -> None:
         path = Path(save_directory)

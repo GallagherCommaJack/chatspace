@@ -6,6 +6,7 @@ import os
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
@@ -47,4 +48,53 @@ def test_vllm_steering_vector_round_trip():
         assert torch.allclose(worker_vec, torch.zeros_like(worker_vec))
 
     # Clean up to avoid leaving GPU memory allocated between tests.
+    del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_chat_respects_steering():
+    torch.manual_seed(0)
+
+    cfg = VLLMSteeringConfig(
+        model_name="Qwen/Qwen3-0.6B",
+        target_layer=2,
+        init_scale=0.0,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=128,
+    )
+
+    try:
+        model = VLLMSteerModel(cfg)
+    except OSError as exc:  # pragma: no cover - allows offline environments
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    request = [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "State the color of a clear daytime sky."},
+    ]
+    sampling = SamplingParams(temperature=0.0, max_tokens=16)
+
+    baseline = model.chat(request, sampling_params=sampling)[0]
+
+    scale = 5_000.0
+    random_vector = torch.randn(model.hidden_size, dtype=torch.float32) * scale
+    model.set_vector(random_vector)
+    steered = model.chat(request, sampling_params=sampling)[0]
+
+    model.set_vector(None)
+    reset = model.chat(request, sampling_params=sampling)[0]
+
+    prefilled = model.chat(
+        request,
+        sampling_params=sampling,
+        prefill_assistant="<think>\n</think>\n",
+    )[0]
+
+    assert steered != baseline, "Steered response unexpectedly matches baseline output."
+    assert (
+        reset == baseline
+    ), "Clearing the steering vector should restore baseline behaviour."
+    assert "ASSISTANT_PREFILL:" not in prefilled
+
     del model
