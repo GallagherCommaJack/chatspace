@@ -3,6 +3,7 @@
 from .base import SteerableModel
 from .config import GenerationConfig
 from .vllm_steer_model import (
+    AddSpec,
     AblationSpec,
     LayerSteeringSpec,
     ProjectionCapSpec,
@@ -16,6 +17,7 @@ __all__ = [
     "GenerationConfig",
     "VLLMSteerModel",
     "VLLMSteeringConfig",
+    "AddSpec",
     "LayerSteeringSpec",
     "ProjectionCapSpec",
     "AblationSpec",

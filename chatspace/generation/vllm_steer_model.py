@@ -51,14 +51,43 @@ class VLLMSteeringConfig:
 
 
 @dataclass
+class AddSpec:
+    """Describe an additive steering vector with its magnitude.
+
+    Parameters
+    ----------
+    vector :
+        L2-normalised direction stored on CPU in ``float32`` for numerical
+        stability.  The norm is maintained separately via ``scale`` so the
+        direction can be reused.
+    scale :
+        Magnitude applied to the direction when broadcasting to workers.
+    The helper L2-normalises ``vector`` when constructing the spec; ``scale``
+    therefore captures the original norm.  Supplying ``scale=0`` represents a
+    cleared steering vector.
+    """
+
+    vector: torch.Tensor
+    scale: float = 1.0
+
+    def clone(self) -> "AddSpec":
+        return AddSpec(vector=self.vector.detach().clone(), scale=self.scale)
+
+    def materialize(self) -> torch.Tensor:
+        """Return the scaled steering vector."""
+        return (self.vector * self.scale).contiguous()
+
+
+@dataclass
 class ProjectionCapSpec:
     """Describe projection capping applied after steering is injected.
 
     Parameters
     ----------
     vector :
-        Direction (unit-ish) used to measure the hidden-state component that
-        should be clamped.  The worker will normalise this before use.
+        Direction (unit vector) used to measure the hidden-state component that
+        should be clamped.  The helper L2-normalises the provided tensor and
+        stores it in ``float32`` when constructing the spec.
     cap_below :
         Optional lower bound for that component.  ``None`` leaves the lower
         side unconstrained.
@@ -86,8 +115,8 @@ class AblationSpec:
     Parameters
     ----------
     vector :
-        Direction to project onto before rescaling.  The worker normalises this
-        to maintain numerical stability.
+        Direction to project onto before rescaling.  The helper L2-normalises
+        this tensor and stores it in ``float32`` when constructing the spec.
     scale :
         Multiplicative factor applied to the projected component.  Values under
         ``1.0`` diminish the component; values over ``1.0`` amplify it.
@@ -106,36 +135,31 @@ class LayerSteeringSpec:
 
     Parameters
     ----------
-    vector :
-        Raw steering vector to add to the hidden state.  ``None`` leaves the
-        hidden state unmodified.
+    add :
+        Optional :class:`AddSpec` describing the additive steering vector.
     projection_cap :
         Optional :class:`ProjectionCapSpec` applied after the steering addition.
     ablation :
         Optional :class:`AblationSpec` applied after the steering addition.
     """
 
-    vector: torch.Tensor | None = None
+    add: AddSpec | None = None
     projection_cap: ProjectionCapSpec | None = None
     ablation: AblationSpec | None = None
 
     def clone(self) -> "LayerSteeringSpec":
         return LayerSteeringSpec(
-            vector=self.vector.detach().clone()
-            if isinstance(self.vector, torch.Tensor)
-            else None,
+            add=self.add.clone() if self.add else None,
             projection_cap=self.projection_cap.clone() if self.projection_cap else None,
             ablation=self.ablation.clone() if self.ablation else None,
         )
 
     def is_empty(self) -> bool:
-        vector_empty = True
-        if isinstance(self.vector, torch.Tensor):
-            if self.vector.numel() == 0:
-                vector_empty = True
-            else:
-                vector_empty = bool(torch.count_nonzero(self.vector).item() == 0)
-        return vector_empty and self.projection_cap is None and self.ablation is None
+        add_active = False
+        if self.add is not None:
+            scale = float(self.add.scale)
+            add_active = math.isfinite(scale) and not math.isclose(scale, 0.0, rel_tol=0.0, abs_tol=1e-12)
+        return (not add_active) and self.projection_cap is None and self.ablation is None
 
 
 @dataclass
@@ -254,32 +278,19 @@ class VLLMSteerModel(SteerableModel):
                 raise ValueError(
                     f"bootstrap layer {idx} is out of range for model with {layer_count} layers"
                 )
-            self._ensure_cached_layer(idx)
+            self._ensure_layer_spec(idx)
         self._active_layer: int | None = None
         if init_layers:
             self.set_target_layer(init_layers[0])
         elif layer_count > 0:
             self.set_target_layer(0)
 
-    def _ensure_cached_layer(self, layer_idx: int) -> torch.Tensor:
-        layer_idx = int(layer_idx)
-        if layer_idx < 0 or layer_idx >= self.layer_count:
-            raise ValueError(
-                f"Layer index {layer_idx} out of range for model with {self.layer_count} layers"
-            )
-        spec = self._layer_specs.get(layer_idx)
-        if spec is None:
-            spec = LayerSteeringSpec()
-            self._layer_specs[layer_idx] = spec
-        if (
-            not isinstance(spec.vector, torch.Tensor)
-            or spec.vector.shape[0] != self.hidden_size
-        ):
-            spec.vector = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
-        return spec.vector
-
-    def _get_layer_spec(self, layer_idx: int) -> LayerSteeringSpec:
+    def _ensure_layer_spec(self, layer_idx: int) -> LayerSteeringSpec:
         idx = int(layer_idx)
+        if idx < 0 or idx >= self.layer_count:
+            raise ValueError(
+                f"Layer index {idx} out of range for model with {self.layer_count} layers"
+            )
         spec = self._layer_specs.get(idx)
         if spec is None:
             spec = LayerSteeringSpec()
@@ -291,12 +302,6 @@ class VLLMSteerModel(SteerableModel):
         spec = self._layer_specs.get(idx)
         if spec is None:
             return
-        # Ensure vector reference exists for emptiness check.
-        if (
-            isinstance(spec.vector, torch.Tensor)
-            and spec.vector.shape[0] != self.hidden_size
-        ):
-            spec.vector = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
         if spec.is_empty():
             self._layer_specs.pop(idx, None)
 
@@ -310,31 +315,42 @@ class VLLMSteerModel(SteerableModel):
             raise ValueError(
                 f"{context} shape mismatch: expected {(self.hidden_size,)}, got {tuple(vec.shape)}"
             )
-        return vec.to(dtype=self._vector_dtype, device="cpu").contiguous()
+        return vec.to(dtype=torch.float32, device="cpu").contiguous()
+
+    def _normalize_vector(
+        self, vector: torch.Tensor, *, context: str
+    ) -> tuple[torch.Tensor, float]:
+        prepared = self._prepare_layer_vector(vector, context=context)
+        norm = float(prepared.norm().item())
+        if not math.isfinite(norm) or norm <= 0.0:
+            raise ValueError(f"{context} vector must have positive finite norm.")
+        unit = (prepared / norm).to(dtype=torch.float32).contiguous()
+        return unit, norm
 
     def _prepare_direction_vector(
         self, vector: torch.Tensor, *, context: str
     ) -> torch.Tensor:
-        prepared = self._prepare_layer_vector(vector, context=context)
-        norm = float(prepared.norm().item())
-        if norm <= 0:
-            raise ValueError(f"{context} vector must have non-zero norm.")
-        return prepared
+        unit, _ = self._normalize_vector(vector, context=context)
+        return unit
 
-    def _broadcast_vector(self, layer_idx: int, vector: torch.Tensor) -> None:
-        payload = steering_runtime.serialize_tensor(vector)
+    def _broadcast_add(self, layer_idx: int, add_spec: AddSpec) -> None:
+        payload = steering_runtime.serialize_tensor(
+            add_spec.materialize().to(dtype=self._vector_dtype)
+        )
         self._engine_client.collective_rpc(
             steering_runtime.set_worker_vector,
             args=(int(layer_idx), payload),
         )
-        spec = self._get_layer_spec(int(layer_idx))
-        spec.vector = vector.clone()
+        layer_spec = self._ensure_layer_spec(int(layer_idx))
+        layer_spec.add = add_spec.clone()
 
     def _broadcast_projection_cap(
         self, layer_idx: int, spec: ProjectionCapSpec
     ) -> None:
         payload = {
-            "vector": steering_runtime.serialize_tensor(spec.vector),
+            "vector": steering_runtime.serialize_tensor(
+                spec.vector.to(dtype=self._vector_dtype)
+            ),
             "cap_below": spec.cap_below,
             "cap_above": spec.cap_above,
         }
@@ -342,19 +358,21 @@ class VLLMSteerModel(SteerableModel):
             steering_runtime.set_worker_projection_cap,
             args=(int(layer_idx), payload),
         )
-        layer_spec = self._get_layer_spec(int(layer_idx))
+        layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.projection_cap = spec.clone()
 
     def _broadcast_ablation(self, layer_idx: int, spec: AblationSpec) -> None:
         payload = {
-            "vector": steering_runtime.serialize_tensor(spec.vector),
+            "vector": steering_runtime.serialize_tensor(
+                spec.vector.to(dtype=self._vector_dtype)
+            ),
             "scale": float(spec.scale),
         }
         self._engine_client.collective_rpc(
             steering_runtime.set_worker_ablation,
             args=(int(layer_idx), payload),
         )
-        layer_spec = self._get_layer_spec(int(layer_idx))
+        layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.ablation = spec.clone()
 
     def _broadcast_clear(self, layer_idx: int | None = None) -> None:
@@ -377,21 +395,28 @@ class VLLMSteerModel(SteerableModel):
                 steering_runtime.clear_worker_ablation, args=(target,)
             )
             layer_spec = self._layer_specs.get(target)
-            if layer_spec is not None and isinstance(layer_spec.vector, torch.Tensor):
-                layer_spec.vector.zero_()
             if layer_spec is not None:
+                layer_spec.add = None
                 layer_spec.projection_cap = None
                 layer_spec.ablation = None
             self._prune_layer_entry(target)
 
     def set_layer_vector(self, layer_idx: int, vector: torch.Tensor | None) -> None:
-        layer_idx = int(layer_idx)
+        target = int(layer_idx)
         if vector is None:
-            self._broadcast_clear(layer_idx)
+            self._broadcast_clear(target)
             return
 
-        prepared = self._prepare_layer_vector(vector, context="Steering vector update")
-        self._broadcast_vector(layer_idx, prepared)
+        prepared = self._prepare_layer_vector(
+            vector, context="Steering vector update"
+        )
+        magnitude = float(prepared.norm().item())
+        if not math.isfinite(magnitude) or magnitude <= 0.0:
+            self._broadcast_clear(target)
+            return
+        unit = (prepared / magnitude).contiguous()
+        add_spec = AddSpec(vector=unit, scale=magnitude)
+        self._broadcast_add(target, add_spec)
 
     def set_vector(self, vector: torch.Tensor | None) -> None:
         """Set the steering vector for the active layer."""
@@ -402,7 +427,7 @@ class VLLMSteerModel(SteerableModel):
     def set_target_layer(self, layer_idx: int) -> None:
         """Select which layer receives ``set_vector`` updates."""
         idx = int(layer_idx)
-        self._ensure_cached_layer(idx)
+        self._ensure_layer_spec(idx)
         self._active_layer = idx
 
     def set_layer_projection_cap(
@@ -414,7 +439,7 @@ class VLLMSteerModel(SteerableModel):
         cap_above: float | None = None,
     ) -> None:
         target = int(layer_idx)
-        self._ensure_cached_layer(target)
+        self._ensure_layer_spec(target)
         if cap_below is None and cap_above is None:
             raise ValueError("Projection cap requires at least one bound.")
         lower = float(cap_below) if cap_below is not None else None
@@ -422,7 +447,7 @@ class VLLMSteerModel(SteerableModel):
         if lower is not None and upper is not None and lower > upper:
             raise ValueError("cap_below cannot exceed cap_above.")
         prepared = self._prepare_direction_vector(
-            vector, context="Projection cap vector"
+        vector, context="Projection cap vector"
         )
         spec = ProjectionCapSpec(vector=prepared, cap_below=lower, cap_above=upper)
         self._broadcast_projection_cap(target, spec)
@@ -450,7 +475,7 @@ class VLLMSteerModel(SteerableModel):
         scale: float,
     ) -> None:
         target = int(layer_idx)
-        self._ensure_cached_layer(target)
+        self._ensure_layer_spec(target)
         if not isinstance(scale, (int, float)):
             raise TypeError("Ablation scale must be a numeric value.")
         scale_value = float(scale)
@@ -498,8 +523,8 @@ class VLLMSteerModel(SteerableModel):
 
         for layer_idx_raw, layer_spec in spec.layers.items():
             layer_idx = int(layer_idx_raw)
-            if isinstance(layer_spec.vector, torch.Tensor):
-                self.set_layer_vector(layer_idx, layer_spec.vector)
+            if layer_spec.add is not None:
+                self._broadcast_add(layer_idx, layer_spec.add)
             else:
                 self.clear_layer_vector(layer_idx)
 
@@ -557,7 +582,10 @@ class VLLMSteerModel(SteerableModel):
                     "Multiple layer vectors cached. Provide layer_idx explicitly."
                 )
             layer_idx = next(iter(self._layer_specs.keys()))
-        vector = self._ensure_cached_layer(int(layer_idx))
+        spec = self._ensure_layer_spec(int(layer_idx))
+        if spec.add is None:
+            return torch.zeros(self.hidden_size, dtype=self._vector_dtype)
+        vector = spec.add.materialize().to(dtype=self._vector_dtype)
         return vector.clone()
 
     def clear_layer_vector(self, layer_idx: int) -> None:
@@ -703,9 +731,9 @@ class VLLMSteerModel(SteerableModel):
 
         vector_path = path / "steering_vector.pt"
         serialized_vectors = {
-            int(layer_idx): spec.vector.detach().cpu().clone()
+            int(layer_idx): spec.add.materialize().detach().cpu().clone()
             for layer_idx, spec in self._layer_specs.items()
-            if isinstance(spec.vector, torch.Tensor)
+            if spec.add is not None
         }
         serialized_caps = {
             int(layer_idx): {
