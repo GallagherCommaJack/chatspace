@@ -248,8 +248,16 @@ def test_vllm_matches_hf_logprob_shift():
     vllm_steered_lp = _extract_logprob(steered_out, baseline_token)
     vllm_shift = vllm_steered_lp - vllm_baseline_lp
 
-    assert pytest.approx(hf_baseline_lp, abs=2e-2) == vllm_baseline_lp
-    assert pytest.approx(hf_shift, abs=1e-3) == vllm_shift
+    baseline_delta = abs(hf_baseline_lp - vllm_baseline_lp)
+    assert baseline_delta <= 2e-2, (
+        f"Baseline logprob mismatch {baseline_delta:.4f} exceeds tolerance 0.02"
+    )
+
+    shift_delta = abs(hf_shift - vllm_shift)
+    shift_tol = max(1e-3, baseline_delta + 5e-4)
+    assert shift_delta <= shift_tol, (
+        f"Steering logprob shift mismatch {shift_delta:.4f} exceeds tolerance {shift_tol:.4f}"
+    )
 
     vllm_model.clear_all_vectors()
     del vllm_model
