@@ -81,8 +81,9 @@ class SteerableModel(ABC):
 - Supports Qwen, Gemma, and other vLLM-compatible models
 - Optional `bootstrap_layers` pre-allocates worker buffers for known layer IDs
 
-**`SteeringSpec` / `ProjectionCapSpec` / `AblationSpec`**
-- Lightweight dataclasses that track the driver-side state mirrored across workers
+**`LayerSteeringSpec` / `SteeringSpec` / `ProjectionCapSpec` / `AblationSpec`**
+- Lightweight dataclasses that capture per-layer and full-model steering state
+- Support cloning + serialization via `export_steering_spec` / `apply_steering_spec`
 - Persisted alongside vectors when calling `save_pretrained`
 
 **`QwenSteerModel` (Updated)**
@@ -254,6 +255,30 @@ model.clear_layer_vector(22)
 model.clear_layer_projection_cap(22)
 model.clear_layer_ablation(22)
 model.clear_all_vectors()
+```
+
+### Snapshot & Restore Steering
+
+```python
+from chatspace.generation import LayerSteeringSpec, SteeringSpec
+
+# Capture the baseline configuration for later reuse.
+baseline = model.export_steering_spec()
+
+# Build an override that tweaks multiple layers.
+override = SteeringSpec(
+    layers={
+        10: LayerSteeringSpec(vector=steering_a),
+        18: LayerSteeringSpec(vector=steering_b, ablation=ablation_spec),
+    }
+)
+
+# Apply temporarily; previous steering is automatically restored on exit.
+with model.steering(override):
+    run_eval(model)
+
+# Or reapply manually at any time.
+model.apply_steering_spec(baseline)
 ```
 
 ### Generation API Differences
