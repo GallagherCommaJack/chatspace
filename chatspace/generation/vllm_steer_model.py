@@ -1,4 +1,22 @@
-"""vLLM-based steerable language model that manages steering inside workers."""
+"""Steering helpers for coordinating vLLM worker state with chatspace.
+
+The helpers in this module wrap ``vllm.LLM`` so steering vectors can be injected
+into Qwen-style decoder layers without breaking CUDA graph capture.  The primary
+entry point is :class:`VLLMSteerModel`, which mirrors the
+``SteerableModel`` interface used by the HuggingFace implementation:
+
+Typical usage::
+
+    cfg = VLLMSteeringConfig(model_name="Qwen/Qwen3-0.6B")
+    model = VLLMSteerModel(cfg, bootstrap_layers=(target_layer,))
+    model.set_target_layer(target_layer)
+    model.set_vector(torch.zeros(model.hidden_size))
+    outputs = model.generate(["...prompt..."], sampling_params)
+
+``VLLMSteerModel`` internally broadcasts steering updates to every worker via
+collective RPCs.  ``enforce_eager=True`` should remain enabled unless you have
+verified the steering patch still executes inside compiled graphs.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +32,11 @@ import torch
 from vllm import LLM, SamplingParams
 
 from chatspace.vllm_steering import runtime as steering_runtime
+from .base import SteerableModel
 
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class VLLMSteeringConfig:
@@ -32,7 +52,20 @@ class VLLMSteeringConfig:
 
 @dataclass
 class ProjectionCapSpec:
-    """Layer projection capping parameters."""
+    """Describe projection capping applied after steering is injected.
+
+    Parameters
+    ----------
+    vector :
+        Direction (unit-ish) used to measure the hidden-state component that
+        should be clamped.  The worker will normalise this before use.
+    cap_below :
+        Optional lower bound for that component.  ``None`` leaves the lower
+        side unconstrained.
+    cap_above :
+        Optional upper bound for that component.  ``None`` leaves the upper
+        side unconstrained.
+    """
 
     vector: torch.Tensor
     cap_below: float | None = None
@@ -48,7 +81,17 @@ class ProjectionCapSpec:
 
 @dataclass
 class AblationSpec:
-    """Layer ablation parameters."""
+    """Describe multiplicative ablation along a residual direction.
+
+    Parameters
+    ----------
+    vector :
+        Direction to project onto before rescaling.  The worker normalises this
+        to maintain numerical stability.
+    scale :
+        Multiplicative factor applied to the projected component.  Values under
+        ``1.0`` diminish the component; values over ``1.0`` amplify it.
+    """
 
     vector: torch.Tensor
     scale: float = 1.0
@@ -59,7 +102,18 @@ class AblationSpec:
 
 @dataclass
 class LayerSteeringSpec:
-    """Full steering configuration for a single layer."""
+    """All steering controls for a single transformer layer.
+
+    Parameters
+    ----------
+    vector :
+        Raw steering vector to add to the hidden state.  ``None`` leaves the
+        hidden state unmodified.
+    projection_cap :
+        Optional :class:`ProjectionCapSpec` applied after the steering addition.
+    ablation :
+        Optional :class:`AblationSpec` applied after the steering addition.
+    """
 
     vector: torch.Tensor | None = None
     projection_cap: ProjectionCapSpec | None = None
@@ -67,7 +121,9 @@ class LayerSteeringSpec:
 
     def clone(self) -> "LayerSteeringSpec":
         return LayerSteeringSpec(
-            vector=self.vector.detach().clone() if isinstance(self.vector, torch.Tensor) else None,
+            vector=self.vector.detach().clone()
+            if isinstance(self.vector, torch.Tensor)
+            else None,
             projection_cap=self.projection_cap.clone() if self.projection_cap else None,
             ablation=self.ablation.clone() if self.ablation else None,
         )
@@ -84,7 +140,13 @@ class LayerSteeringSpec:
 
 @dataclass
 class SteeringSpec:
-    """Aggregate steering configuration across layers."""
+    """Bundle steering metadata for multiple layers.
+
+    Parameters
+    ----------
+    layers :
+        Mapping of layer indices to :class:`LayerSteeringSpec` instances.
+    """
 
     layers: dict[int, LayerSteeringSpec] = field(default_factory=dict)
 
@@ -107,8 +169,30 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
-class VLLMSteerModel:
-    """Wrap a vLLM LLM with steering vector control via worker RPCs."""
+class VLLMSteerModel(SteerableModel):
+    """Steerable wrapper around ``vllm.LLM`` for Qwen-family models.
+
+    The wrapper keeps a small cache of per-layer steering metadata and mirrors
+    the :class:`chatspace.generation.base.SteerableModel` contract so higher
+    level pipeline code can swap between HuggingFace and vLLM backends.  When a
+    steering vector is updated we serialize the payload, broadcast it to all
+    worker processes with ``collective_rpc`` and leave a CPU copy in
+    ``_layer_specs`` for quick inspection.
+
+    Parameters
+    ----------
+    cfg :
+        High-level configuration for vLLM (model name, tensor parallel size,
+        bootstrap layers, etc).
+    bootstrap_layers :
+        Optional explicit list of layer indices that should be pre-initialised.
+        Supplying a layer ensures the worker patches allocate buffers before
+        the first call to :meth:`set_vector`.
+    **vllm_kwargs :
+        Extra keyword arguments forwarded to ``vllm.LLM``.  ``enforce_eager``
+        defaults to ``True`` and attempts to disable it are overridden because
+        compiled graphs would otherwise skip the Python-side steering hook.
+    """
 
     def __init__(
         self,
@@ -119,7 +203,13 @@ class VLLMSteerModel:
     ) -> None:
         self.cfg = cfg
 
-        enforce_eager = bool(vllm_kwargs.get("enforce_eager", True))
+        enforce_eager_raw = vllm_kwargs.get("enforce_eager", True)
+        enforce_eager = bool(enforce_eager_raw)
+        if not enforce_eager:
+            logger.warning(
+                "vLLM steering requires enforce_eager=True; overriding user-supplied value."
+            )
+            enforce_eager = True
 
         llm_kwargs = {
             "tensor_parallel_size": cfg.tensor_parallel_size,
@@ -165,6 +255,11 @@ class VLLMSteerModel:
                     f"bootstrap layer {idx} is out of range for model with {layer_count} layers"
                 )
             self._ensure_cached_layer(idx)
+        self._active_layer: int | None = None
+        if init_layers:
+            self.set_target_layer(init_layers[0])
+        elif layer_count > 0:
+            self.set_target_layer(0)
 
     def _ensure_cached_layer(self, layer_idx: int) -> torch.Tensor:
         layer_idx = int(layer_idx)
@@ -176,7 +271,10 @@ class VLLMSteerModel:
         if spec is None:
             spec = LayerSteeringSpec()
             self._layer_specs[layer_idx] = spec
-        if not isinstance(spec.vector, torch.Tensor) or spec.vector.shape[0] != self.hidden_size:
+        if (
+            not isinstance(spec.vector, torch.Tensor)
+            or spec.vector.shape[0] != self.hidden_size
+        ):
             spec.vector = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
         return spec.vector
 
@@ -194,12 +292,17 @@ class VLLMSteerModel:
         if spec is None:
             return
         # Ensure vector reference exists for emptiness check.
-        if isinstance(spec.vector, torch.Tensor) and spec.vector.shape[0] != self.hidden_size:
+        if (
+            isinstance(spec.vector, torch.Tensor)
+            and spec.vector.shape[0] != self.hidden_size
+        ):
             spec.vector = torch.zeros(self.hidden_size, dtype=self._vector_dtype)
         if spec.is_empty():
             self._layer_specs.pop(idx, None)
 
-    def _prepare_layer_vector(self, vector: torch.Tensor, *, context: str) -> torch.Tensor:
+    def _prepare_layer_vector(
+        self, vector: torch.Tensor, *, context: str
+    ) -> torch.Tensor:
         if not isinstance(vector, torch.Tensor):
             raise TypeError(f"{context} requires a torch.Tensor input.")
         vec = vector.detach().view(-1)
@@ -209,7 +312,9 @@ class VLLMSteerModel:
             )
         return vec.to(dtype=self._vector_dtype, device="cpu").contiguous()
 
-    def _prepare_direction_vector(self, vector: torch.Tensor, *, context: str) -> torch.Tensor:
+    def _prepare_direction_vector(
+        self, vector: torch.Tensor, *, context: str
+    ) -> torch.Tensor:
         prepared = self._prepare_layer_vector(vector, context=context)
         norm = float(prepared.norm().item())
         if norm <= 0:
@@ -225,7 +330,9 @@ class VLLMSteerModel:
         spec = self._get_layer_spec(int(layer_idx))
         spec.vector = vector.clone()
 
-    def _broadcast_projection_cap(self, layer_idx: int, spec: ProjectionCapSpec) -> None:
+    def _broadcast_projection_cap(
+        self, layer_idx: int, spec: ProjectionCapSpec
+    ) -> None:
         payload = {
             "vector": steering_runtime.serialize_tensor(spec.vector),
             "cap_below": spec.cap_below,
@@ -253,7 +360,9 @@ class VLLMSteerModel:
     def _broadcast_clear(self, layer_idx: int | None = None) -> None:
         if layer_idx is None:
             self._engine_client.collective_rpc(steering_runtime.clear_worker_vector)
-            self._engine_client.collective_rpc(steering_runtime.clear_worker_projection_cap)
+            self._engine_client.collective_rpc(
+                steering_runtime.clear_worker_projection_cap
+            )
             self._engine_client.collective_rpc(steering_runtime.clear_worker_ablation)
             self._layer_specs.clear()
         else:
@@ -275,9 +384,7 @@ class VLLMSteerModel:
                 layer_spec.ablation = None
             self._prune_layer_entry(target)
 
-    def set_layer_vector(
-        self, layer_idx: int, vector: torch.Tensor | None
-    ) -> None:
+    def set_layer_vector(self, layer_idx: int, vector: torch.Tensor | None) -> None:
         layer_idx = int(layer_idx)
         if vector is None:
             self._broadcast_clear(layer_idx)
@@ -285,6 +392,18 @@ class VLLMSteerModel:
 
         prepared = self._prepare_layer_vector(vector, context="Steering vector update")
         self._broadcast_vector(layer_idx, prepared)
+
+    def set_vector(self, vector: torch.Tensor | None) -> None:
+        """Set the steering vector for the active layer."""
+        if self._active_layer is None:
+            raise ValueError("Target layer not set. Call set_target_layer first.")
+        self.set_layer_vector(self._active_layer, vector)
+
+    def set_target_layer(self, layer_idx: int) -> None:
+        """Select which layer receives ``set_vector`` updates."""
+        idx = int(layer_idx)
+        self._ensure_cached_layer(idx)
+        self._active_layer = idx
 
     def set_layer_projection_cap(
         self,
@@ -337,9 +456,7 @@ class VLLMSteerModel:
         scale_value = float(scale)
         if not math.isfinite(scale_value):
             raise ValueError("Ablation scale must be finite.")
-        prepared = self._prepare_direction_vector(
-            vector, context="Ablation vector"
-        )
+        prepared = self._prepare_direction_vector(vector, context="Ablation vector")
         spec = AblationSpec(vector=prepared, scale=scale_value)
         self._broadcast_ablation(target, spec)
 
@@ -369,7 +486,9 @@ class VLLMSteerModel:
             layers[int(layer_idx)] = cloned
         return SteeringSpec(layers=layers)
 
-    def apply_steering_spec(self, spec: SteeringSpec, *, clear_missing: bool = True) -> None:
+    def apply_steering_spec(
+        self, spec: SteeringSpec, *, clear_missing: bool = True
+    ) -> None:
         """Apply a previously captured steering specification."""
         target_layers = {int(idx) for idx in spec.layers.keys()}
         if clear_missing:
@@ -401,7 +520,9 @@ class VLLMSteerModel:
             else:
                 self.clear_layer_ablation(layer_idx)
 
-    def push_steering_spec(self, spec: SteeringSpec, *, clear_missing: bool = True) -> None:
+    def push_steering_spec(
+        self, spec: SteeringSpec, *, clear_missing: bool = True
+    ) -> None:
         """Push current steering onto a stack and apply ``spec``."""
         baseline = self.export_steering_spec().clone()
         self._steering_stack.append(baseline)
@@ -416,7 +537,9 @@ class VLLMSteerModel:
         return baseline
 
     @contextmanager
-    def steering(self, spec: SteeringSpec, *, clear_missing: bool = True) -> Iterator[None]:
+    def steering(
+        self, spec: SteeringSpec, *, clear_missing: bool = True
+    ) -> Iterator[None]:
         """Context manager that reapplies previous steering on exit."""
         self.push_steering_spec(spec, clear_missing=clear_missing)
         try:
@@ -501,9 +624,8 @@ class VLLMSteerModel:
                 "Provide either sampling_params or sampling keyword overrides, not both."
             )
 
-        single_conversation = (
-            isinstance(messages, list)
-            and (len(messages) == 0 or isinstance(messages[0], dict))
+        single_conversation = isinstance(messages, list) and (
+            len(messages) == 0 or isinstance(messages[0], dict)
         )
         if single_conversation:
             batched_messages = [cast(list[dict[str, Any]], messages)]
@@ -632,7 +754,9 @@ class VLLMSteerModel:
             cfg_dict = json.load(fh)
 
         allowed_keys = {f.name for f in fields(VLLMSteeringConfig)}
-        filtered_cfg = {key: value for key, value in cfg_dict.items() if key in allowed_keys}
+        filtered_cfg = {
+            key: value for key, value in cfg_dict.items() if key in allowed_keys
+        }
         cfg = VLLMSteeringConfig(**filtered_cfg)
 
         model = cls(cfg, **vllm_kwargs)
