@@ -11,6 +11,8 @@ import torch
 from torch import nn
 from transformers import AutoModelForCausalLM
 
+from chatspace.generation.base import SteerableModel
+
 
 class ResidualHook(nn.Module):
     """A module that injects a trainable vector into the residual stream."""
@@ -34,8 +36,12 @@ class SteeringVectorConfig:
     init_scale: float = 0.0
 
 
-class QwenSteerModel(nn.Module):
-    """Wrap a Qwen causal LM with an additive steering vector at a residual layer."""
+class QwenSteerModel(nn.Module, SteerableModel):
+    """Wrap a Qwen causal LM with an additive steering vector at a residual layer.
+
+    This class implements the SteerableModel interface for HuggingFace transformers
+    models, providing steering vector injection via PyTorch forward hooks.
+    """
 
     def __init__(self, cfg: SteeringVectorConfig, **model_kwargs) -> None:
         super().__init__()

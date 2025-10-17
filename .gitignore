@@ -17,3 +17,4 @@ wheels/
 # network drive mount symlink
 workspace
 persona-subspace
+TEMP_JOURNAL.md
