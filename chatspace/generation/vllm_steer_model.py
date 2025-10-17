@@ -447,7 +447,7 @@ class VLLMSteerModel(SteerableModel):
         if lower is not None and upper is not None and lower > upper:
             raise ValueError("cap_below cannot exceed cap_above.")
         prepared = self._prepare_direction_vector(
-        vector, context="Projection cap vector"
+            vector, context="Projection cap vector"
         )
         spec = ProjectionCapSpec(vector=prepared, cap_below=lower, cap_above=upper)
         self._broadcast_projection_cap(target, spec)
@@ -514,7 +514,14 @@ class VLLMSteerModel(SteerableModel):
     def apply_steering_spec(
         self, spec: SteeringSpec, *, clear_missing: bool = True
     ) -> None:
-        """Apply a previously captured steering specification."""
+        """Apply a previously captured steering specification.
+
+        Each layer entry replaces the additive vector, projection cap, and
+        ablation settings. Layers omitted from the spec are cleared when
+        ``clear_missing`` is ``True``. When a layer entry omits the additive
+        vector the helper clears any existing steering state before applying
+        projection caps or ablations present in the spec.
+        """
         target_layers = {int(idx) for idx in spec.layers.keys()}
         if clear_missing:
             existing_layers = set(self._layer_specs.keys())
@@ -523,26 +530,30 @@ class VLLMSteerModel(SteerableModel):
 
         for layer_idx_raw, layer_spec in spec.layers.items():
             layer_idx = int(layer_idx_raw)
-            if layer_spec.add is not None:
-                self._broadcast_add(layer_idx, layer_spec.add)
-            else:
+            add_spec = layer_spec.add
+            cleared = add_spec is None
+            if cleared:
                 self.clear_layer_vector(layer_idx)
+            else:
+                self._broadcast_add(layer_idx, add_spec)
 
-            if layer_spec.projection_cap is not None:
-                cap = layer_spec.projection_cap
+            projection_spec = layer_spec.projection_cap
+            if projection_spec is not None:
                 self.set_layer_projection_cap(
                     layer_idx,
-                    cap.vector,
-                    cap_below=cap.cap_below,
-                    cap_above=cap.cap_above,
+                    projection_spec.vector,
+                    cap_below=projection_spec.cap_below,
+                    cap_above=projection_spec.cap_above,
                 )
-            else:
+            elif not cleared:
                 self.clear_layer_projection_cap(layer_idx)
 
-            if layer_spec.ablation is not None:
-                ablation = layer_spec.ablation
-                self.set_layer_ablation(layer_idx, ablation.vector, ablation.scale)
-            else:
+            ablation_spec = layer_spec.ablation
+            if ablation_spec is not None:
+                self.set_layer_ablation(
+                    layer_idx, ablation_spec.vector, ablation_spec.scale
+                )
+            elif not cleared:
                 self.clear_layer_ablation(layer_idx)
 
     def push_steering_spec(

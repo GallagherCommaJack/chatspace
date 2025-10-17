@@ -615,15 +615,6 @@ def fetch_worker_vectors(worker: Any) -> dict[int, torch.Tensor]:
     }
 
 
-def fetch_worker_vector(worker: Any, layer_idx: int) -> torch.Tensor:
-    """Return a CPU copy of a steering vector for the requested layer."""
-    state = _ensure_state(worker)
-    vector = state.layer_vectors.get(int(layer_idx))
-    if vector is None:
-        vector = _ensure_layer_entry(worker, state, int(layer_idx))
-    return vector.detach().cpu().clone()
-
-
 def fetch_worker_state(worker: Any) -> dict[str, Any]:
     """Inspect the worker steering state."""
     state = _ensure_state(worker)
