@@ -28,6 +28,7 @@
 - Use concise, imperative commit subjects similar to `Fix steering vector training pipeline and data loader`; squash noisy intermediate commits before review.
 - PRs should describe motivation, summarize functional changes, list validation commands (e.g., `uv run pytest`), and link issues or run IDs.
 - Include screenshots or log excerpts when modifying visualization notebooks or CLI surfaces; note any `/workspace` artifacts that reviewers can reproduce.
+- DO NOT commit with --amend unless explicitly asked to
 
 ## Data & Storage Practices
 - Respect the storage policy: stream downloads into `/workspace/datasets/raw/...` and write processed shards to `/workspace/embeddings/{model}/{dataset}`.
