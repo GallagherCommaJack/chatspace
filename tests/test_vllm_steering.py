@@ -44,6 +44,34 @@ def test_vllm_steering_vector_round_trip():
             worker_vec, vector.to(dtype=worker_vec.dtype), atol=1e-5
         ), "Broadcast steering vector does not match worker copy."
 
+    cap_vector = torch.randn(hidden_size, dtype=torch.float32)
+    model.set_layer_projection_cap(target_layer, cap_vector, cap_below=-0.5, cap_above=0.75)
+    ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
+    model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
+
+    inspection = model._engine_client.collective_rpc(
+        steering_runtime.inspect_layer_vector, args=(target_layer,)
+    )
+    assert inspection, "Expected inspection data for target layer."
+    layer_info = inspection[0]
+    projection_cap = layer_info.get("projection_cap")
+    assert projection_cap is not None
+    assert projection_cap["cap_below"] == pytest.approx(-0.5)
+    assert projection_cap["cap_above"] == pytest.approx(0.75)
+    ablation_info = layer_info.get("ablation")
+    assert ablation_info is not None
+    assert ablation_info["scale"] == pytest.approx(0.4)
+
+    model.clear_layer_projection_cap(target_layer)
+    model.clear_layer_ablation(target_layer)
+    inspection_after_clear = model._engine_client.collective_rpc(
+        steering_runtime.inspect_layer_vector, args=(target_layer,)
+    )
+    assert inspection_after_clear, "Expected inspection after clearing."
+    layer_info_after_clear = inspection_after_clear[0]
+    assert layer_info_after_clear.get("projection_cap") is None
+    assert layer_info_after_clear.get("ablation") is None
+
     worker_state = model._engine_client.collective_rpc(steering_runtime.fetch_worker_state)
     assert worker_state, "Expected worker state info."
     layer_count = int(worker_state[0].get("layer_count", 0) or 0)

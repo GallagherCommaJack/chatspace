@@ -77,8 +77,13 @@ class SteerableModel(ABC):
 - Accesses underlying model layers via `llm.llm_engine.model_executor...`
 - Installs forward hooks at specified layer
 - Supports multi-layer steering through `set_layer_vector`
+- Adds advanced controls via `set_layer_projection_cap` and `set_layer_ablation`
 - Supports Qwen, Gemma, and other vLLM-compatible models
 - Optional `bootstrap_layers` pre-allocates worker buffers for known layer IDs
+
+**`SteeringSpec` / `ProjectionCapSpec` / `AblationSpec`**
+- Lightweight dataclasses that track the driver-side state mirrored across workers
+- Persisted alongside vectors when calling `save_pretrained`
 
 **`QwenSteerModel` (Updated)**
 - Now inherits from `SteerableModel` base class
@@ -234,7 +239,7 @@ runtime.set_worker_vector(worker, other_layer, other_vector)  # Optional extra l
 runtime.clear_worker_vector(worker, target)
 ```
 
-Each worker keeps 1D tensors in device memory keyed by layer index and a forward hook that adds the active vectors to the residual stream before logits are computed. Drivers must explicitly manage layer indices—there is no implicit "default"—so `set_layer_vector`/`clear_all_vectors` on `VLLMSteerModel` simply broadcast the desired tensors (or zeros) to the matching layer buffers.
+Each worker keeps 1D tensors in device memory keyed by layer index and a forward hook that adds the active vectors to the residual stream before logits are computed. Drivers must explicitly manage layer indices—there is no implicit "default"—so `VLLMSteerModel` exposes explicit mutators: `set_layer_vector` for additive steering, `set_layer_projection_cap` for clamping the residual projection, and `set_layer_ablation` for scaling the projection component.
 
 ```python
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
@@ -243,7 +248,11 @@ cfg = VLLMSteeringConfig(model_name="Qwen/Qwen3-0.6B")
 model = VLLMSteerModel(cfg, bootstrap_layers=(22,))
 model.set_layer_vector(22, steering_tensor)
 model.set_layer_vector(30, other_tensor)   # Optional extra layer
+model.set_layer_projection_cap(22, cap_tensor, cap_below=-1.0, cap_above=1.5)
+model.set_layer_ablation(22, ablation_tensor, scale=0.25)
 model.clear_layer_vector(22)
+model.clear_layer_projection_cap(22)
+model.clear_layer_ablation(22)
 model.clear_all_vectors()
 ```
 
