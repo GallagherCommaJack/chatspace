@@ -6,9 +6,14 @@ import os
 
 import pytest
 import torch
+from transformers import AutoConfig, AutoTokenizer
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+)
+from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
 
 # vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
@@ -172,3 +177,81 @@ def test_vllm_chat_respects_steering():
     assert "ASSISTANT_PREFILL:" not in prefilled
 
     del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_matches_hf_logprob_shift():
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 2
+    prompt = "In a quiet village, the baker"
+
+    config = AutoConfig.from_pretrained(model_name)
+    hidden_size = int(config.hidden_size)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hf_cfg = SteeringVectorConfig(model_name=model_name, target_layer=target_layer, init_scale=0.0)
+    hf_model = QwenSteerModel(
+        hf_cfg,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    with torch.no_grad():
+        hf_outputs_base = hf_model(**inputs)
+    base_logits = hf_outputs_base.logits[:, -1, :].float()
+    base_logprobs = torch.log_softmax(base_logits, dim=-1)
+    baseline_token = int(torch.argmax(base_logprobs, dim=-1).item())
+    hf_baseline_lp = float(base_logprobs[0, baseline_token])
+
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 0.01
+    hf_model.set_vector(steering_vector)
+    with torch.no_grad():
+        hf_outputs_steered = hf_model(**inputs)
+    steered_logits = hf_outputs_steered.logits[:, -1, :].float()
+    steered_logprobs = torch.log_softmax(steered_logits, dim=-1)
+    hf_steered_lp = float(steered_logprobs[0, baseline_token])
+    hf_shift = hf_steered_lp - hf_baseline_lp
+
+    hf_model.set_vector(None)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float16",
+    )
+
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
+
+    def _extract_logprob(output, token_id):
+        entry = output.logprobs[0].get(int(token_id))
+        if entry is None:
+            raise AssertionError(f"Token id {token_id} not present in returned logprobs")
+        return float(entry.logprob)
+
+    baseline_out = vllm_model.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0].outputs[0]
+    vllm_baseline_lp = _extract_logprob(baseline_out, baseline_token)
+
+    vllm_model.set_layer_vector(target_layer, steering_vector)
+    steered_out = vllm_model.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0].outputs[0]
+    vllm_steered_lp = _extract_logprob(steered_out, baseline_token)
+    vllm_shift = vllm_steered_lp - vllm_baseline_lp
+
+    assert pytest.approx(hf_baseline_lp, abs=2e-2) == vllm_baseline_lp
+    assert pytest.approx(hf_shift, abs=1e-3) == vllm_shift
+
+    vllm_model.clear_all_vectors()
+    del vllm_model
+    del hf_model
+    torch.cuda.empty_cache()
