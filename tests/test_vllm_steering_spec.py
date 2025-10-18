@@ -72,11 +72,11 @@ def _assert_spec_eq(left: SteeringSpec, right: SteeringSpec) -> None:
                 _unit(left_layer.projection_cap.vector),
                 _unit(right_layer.projection_cap.vector),
             )
-            assert left_layer.projection_cap.cap_below == pytest.approx(
-                right_layer.projection_cap.cap_below
+            assert left_layer.projection_cap.min == pytest.approx(
+                right_layer.projection_cap.min
             )
-            assert left_layer.projection_cap.cap_above == pytest.approx(
-                right_layer.projection_cap.cap_above
+            assert left_layer.projection_cap.max == pytest.approx(
+                right_layer.projection_cap.max
             )
         if left_layer.ablation is None:
             assert right_layer.ablation is None
@@ -98,7 +98,7 @@ def test_export_and_apply_steering_spec_roundtrip():
     ablation_vector = torch.ones(model.hidden_size, dtype=torch.float32) * 2
 
     model.set_layer_vector(layer, vector)
-    model.set_layer_projection_cap(layer, cap_vector, cap_below=-0.5, cap_above=0.75)
+    model.set_layer_projection_cap(layer, cap_vector, min=-0.5, max=0.75)
     model.set_layer_ablation(layer, ablation_vector, scale=0.4)
 
     exported = model.export_steering_spec()
@@ -109,8 +109,8 @@ def test_export_and_apply_steering_spec_roundtrip():
     assert layer_spec.projection_cap is not None
     cap_unit = cap_vector / cap_vector.norm()
     assert torch.allclose(layer_spec.projection_cap.vector, cap_unit)
-    assert layer_spec.projection_cap.cap_below == pytest.approx(-0.5)
-    assert layer_spec.projection_cap.cap_above == pytest.approx(0.75)
+    assert layer_spec.projection_cap.min == pytest.approx(-0.5)
+    assert layer_spec.projection_cap.max == pytest.approx(0.75)
     assert layer_spec.ablation is not None
     ablation_unit = ablation_vector / ablation_vector.norm()
     assert torch.allclose(layer_spec.ablation.vector, ablation_unit)
@@ -126,8 +126,8 @@ def test_export_and_apply_steering_spec_roundtrip():
     restored_cap = model.current_projection_cap(layer)
     assert restored_cap is not None
     assert torch.allclose(restored_cap.vector, cap_unit)
-    assert restored_cap.cap_below == pytest.approx(-0.5)
-    assert restored_cap.cap_above == pytest.approx(0.75)
+    assert restored_cap.min == pytest.approx(-0.5)
+    assert restored_cap.max == pytest.approx(0.75)
     restored_ablation = model.current_ablation(layer)
     assert restored_ablation is not None
     assert torch.allclose(restored_ablation.vector, ablation_unit)
@@ -150,8 +150,8 @@ def test_steering_context_manager_restores_state():
                 ),
                 projection_cap=ProjectionCapSpec(
                     vector=torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32),
-                    cap_below=-1.0,
-                    cap_above=1.0,
+                    min=-1.0,
+                    max=1.0,
                 ),
             ),
             3: LayerSteeringSpec(

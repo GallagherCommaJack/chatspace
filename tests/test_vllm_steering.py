@@ -50,7 +50,7 @@ def test_vllm_steering_vector_round_trip():
         ), "Broadcast steering vector does not match worker copy."
 
     cap_vector = torch.randn(hidden_size, dtype=torch.float32)
-    model.set_layer_projection_cap(target_layer, cap_vector, cap_below=-0.5, cap_above=0.75)
+    model.set_layer_projection_cap(target_layer, cap_vector, min=-0.5, max=0.75)
     ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
     model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
 
@@ -61,8 +61,8 @@ def test_vllm_steering_vector_round_trip():
     layer_info = inspection[0]
     projection_cap = layer_info.get("projection_cap")
     assert projection_cap is not None
-    assert projection_cap["cap_below"] == pytest.approx(-0.5)
-    assert projection_cap["cap_above"] == pytest.approx(0.75)
+    assert projection_cap["min"] == pytest.approx(-0.5)
+    assert projection_cap["max"] == pytest.approx(0.75)
     ablation_info = layer_info.get("ablation")
     assert ablation_info is not None
     assert ablation_info["scale"] == pytest.approx(0.4)

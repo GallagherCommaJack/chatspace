@@ -11,8 +11,8 @@ def test_apply_projection_cap_enforces_bounds():
     unit = torch.tensor([1.0, 0.0], dtype=torch.float32)
     config = steering_runtime._ProjectionCapConfig(  # type: ignore[attr-defined]
         unit_vector=unit,
-        cap_below=-1.0,
-        cap_above=1.5,
+        min=-1.0,
+        max=1.5,
     )
     hidden = torch.tensor([[2.0, 3.0], [-5.0, 1.0]], dtype=torch.float32)
 
@@ -26,8 +26,8 @@ def test_apply_projection_cap_noop_when_within_bounds():
     unit = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)
     config = steering_runtime._ProjectionCapConfig(  # type: ignore[attr-defined]
         unit_vector=unit,
-        cap_below=-2.0,
-        cap_above=2.0,
+        min=-2.0,
+        max=2.0,
     )
     hidden = torch.tensor([[0.0, 1.0, -3.0]], dtype=torch.float32)
 

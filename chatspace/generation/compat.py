@@ -75,7 +75,7 @@ def load_legacy_role_trait_config(path: str | Path) -> list[LegacyExperiment]:
         Ordered collection preserving the experiment order encoded in the file.
         Each experiment is translated into a :class:`SteeringSpec` where the
         stored vector becomes an additive steering component and the legacy
-        ``cap`` value (when present) is mapped to ``cap_below`` on the
+        ``cap`` value (when present) is mapped to ``max`` on the
         associated :class:`ProjectionCapSpec`.
     """
 
@@ -136,8 +136,8 @@ def load_legacy_role_trait_config(path: str | Path) -> list[LegacyExperiment]:
                 cap_value = float(intervention["cap"])
                 projection_cap = ProjectionCapSpec(
                     vector=unit_vector.clone(),
-                    cap_below=None,
-                    cap_above=cap_value,
+                    min=None,
+                    max=cap_value,
                 )
             else:
                 raise ValueError(f"Legacy intervention in experiment '{experiment_id}' missing 'cap' field")

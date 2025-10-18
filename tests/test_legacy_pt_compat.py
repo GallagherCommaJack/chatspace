@@ -54,15 +54,15 @@ def test_load_legacy_role_trait_config(tmp_path: Path) -> None:
     layer0 = spec.layers[0]
     assert layer0.projection_cap is not None
     assert layer0.add is None
-    assert layer0.projection_cap.cap_below is None
-    assert layer0.projection_cap.cap_above == pytest.approx(-0.5)
+    assert layer0.projection_cap.min is None
+    assert layer0.projection_cap.max == pytest.approx(-0.5)
     assert torch.allclose(layer0.projection_cap.vector, torch.tensor([1.0, 0.0, 0.0]))
 
     layer1 = spec.layers[1]
     assert layer1.add is None
     assert layer1.projection_cap is not None
-    assert layer1.projection_cap.cap_below is None
-    assert layer1.projection_cap.cap_above == pytest.approx(0.75)
+    assert layer1.projection_cap.min is None
+    assert layer1.projection_cap.max == pytest.approx(0.75)
     assert torch.allclose(
         layer1.projection_cap.vector,
         torch.tensor([0.0, -0.6, 0.8]),
@@ -71,8 +71,8 @@ def test_load_legacy_role_trait_config(tmp_path: Path) -> None:
 
     second = experiments[1].spec
     assert second.layers[1].projection_cap is not None
-    assert second.layers[1].projection_cap.cap_below is None
-    assert second.layers[1].projection_cap.cap_above == pytest.approx(1.25)
+    assert second.layers[1].projection_cap.min is None
+    assert second.layers[1].projection_cap.max == pytest.approx(1.25)
     assert torch.allclose(
         second.layers[1].projection_cap.vector,
         torch.tensor([0.0, -0.6, 0.8]),

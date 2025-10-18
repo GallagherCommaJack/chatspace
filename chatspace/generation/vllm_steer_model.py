@@ -88,23 +88,23 @@ class ProjectionCapSpec:
         Direction (unit vector) used to measure the hidden-state component that
         should be clamped.  The helper L2-normalises the provided tensor and
         stores it in ``float32`` when constructing the spec.
-    cap_below :
-        Optional lower bound for that component.  ``None`` leaves the lower
+    min :
+        Optional minimum bound for that component.  ``None`` leaves the lower
         side unconstrained.
-    cap_above :
-        Optional upper bound for that component.  ``None`` leaves the upper
+    max :
+        Optional maximum bound for that component.  ``None`` leaves the upper
         side unconstrained.
     """
 
     vector: torch.Tensor
-    cap_below: float | None = None
-    cap_above: float | None = None
+    min: float | None = None
+    max: float | None = None
 
     def clone(self) -> "ProjectionCapSpec":
         return ProjectionCapSpec(
             vector=self.vector.detach().clone(),
-            cap_below=self.cap_below,
-            cap_above=self.cap_above,
+            min=self.min,
+            max=self.max,
         )
 
 
@@ -351,8 +351,8 @@ class VLLMSteerModel(SteerableModel):
             "vector": steering_runtime.serialize_tensor(
                 spec.vector.to(dtype=self._vector_dtype)
             ),
-            "cap_below": spec.cap_below,
-            "cap_above": spec.cap_above,
+            "min": spec.min,
+            "max": spec.max,
         }
         self._engine_client.collective_rpc(
             steering_runtime.set_worker_projection_cap,
@@ -435,21 +435,21 @@ class VLLMSteerModel(SteerableModel):
         layer_idx: int,
         vector: torch.Tensor,
         *,
-        cap_below: float | None = None,
-        cap_above: float | None = None,
+        min: float | None = None,
+        max: float | None = None,
     ) -> None:
         target = int(layer_idx)
         self._ensure_layer_spec(target)
-        if cap_below is None and cap_above is None:
+        if min is None and max is None:
             raise ValueError("Projection cap requires at least one bound.")
-        lower = float(cap_below) if cap_below is not None else None
-        upper = float(cap_above) if cap_above is not None else None
+        lower = float(min) if min is not None else None
+        upper = float(max) if max is not None else None
         if lower is not None and upper is not None and lower > upper:
-            raise ValueError("cap_below cannot exceed cap_above.")
+            raise ValueError("min cannot exceed max.")
         prepared = self._prepare_direction_vector(
             vector, context="Projection cap vector"
         )
-        spec = ProjectionCapSpec(vector=prepared, cap_below=lower, cap_above=upper)
+        spec = ProjectionCapSpec(vector=prepared, min=lower, max=upper)
         self._broadcast_projection_cap(target, spec)
 
     def clear_layer_projection_cap(self, layer_idx: int) -> None:
@@ -542,8 +542,8 @@ class VLLMSteerModel(SteerableModel):
                 self.set_layer_projection_cap(
                     layer_idx,
                     projection_spec.vector,
-                    cap_below=projection_spec.cap_below,
-                    cap_above=projection_spec.cap_above,
+                    min=projection_spec.min,
+                    max=projection_spec.max,
                 )
             elif not cleared:
                 self.clear_layer_projection_cap(layer_idx)
@@ -749,8 +749,8 @@ class VLLMSteerModel(SteerableModel):
         serialized_caps = {
             int(layer_idx): {
                 "vector": spec.projection_cap.vector.detach().cpu().clone(),
-                "cap_below": spec.projection_cap.cap_below,
-                "cap_above": spec.projection_cap.cap_above,
+                "min": spec.projection_cap.min,
+                "max": spec.projection_cap.max,
             }
             for layer_idx, spec in self._layer_specs.items()
             if spec.projection_cap is not None
@@ -823,8 +823,8 @@ class VLLMSteerModel(SteerableModel):
                     model.set_layer_projection_cap(
                         int(layer_idx),
                         vector,
-                        cap_below=payload.get("cap_below"),
-                        cap_above=payload.get("cap_above"),
+                        min=payload.get("min"),
+                        max=payload.get("max"),
                     )
             ablations = state.get("ablations") or {}
             if isinstance(ablations, dict):

@@ -41,8 +41,8 @@ class _ProjectionCapConfig:
     """Maintain projection capping parameters for a layer."""
 
     unit_vector: torch.Tensor
-    cap_below: float | None
-    cap_above: float | None
+    min: float | None
+    max: float | None
 
 
 @dataclass
@@ -191,16 +191,16 @@ def _deserialize_direction_payload(
 
 
 def _apply_projection_cap(hidden: torch.Tensor, config: _ProjectionCapConfig) -> torch.Tensor:
-    if config.cap_below is None and config.cap_above is None:
+    if config.min is None and config.max is None:
         return hidden
     flat = _reshape_for_component_ops(hidden, config.unit_vector.shape[0])
     unit = config.unit_vector
     projection = flat @ unit
     clamp_kwargs: dict[str, torch.Tensor] = {}
-    if config.cap_below is not None:
-        clamp_kwargs["min"] = projection.new_tensor(float(config.cap_below))
-    if config.cap_above is not None:
-        clamp_kwargs["max"] = projection.new_tensor(float(config.cap_above))
+    if config.min is not None:
+        clamp_kwargs["min"] = projection.new_tensor(float(config.min))
+    if config.max is not None:
+        clamp_kwargs["max"] = projection.new_tensor(float(config.max))
     clamped = torch.clamp(projection, **clamp_kwargs)  # type: ignore[arg-type]
     if clamped is not projection:
         delta = (clamped - projection).unsqueeze(-1) * unit
@@ -495,20 +495,20 @@ def set_worker_projection_cap(worker: Any, layer_idx: int, payload: dict[str, An
     if vector_payload is None:
         raise ValueError("Projection cap payload missing 'vector'.")
     unit = _deserialize_direction_payload(vector_payload, dest=dest, state=state)
-    cap_below = payload.get("cap_below")
-    cap_above = payload.get("cap_above")
-    cap_below_float = float(cap_below) if cap_below is not None else None
-    cap_above_float = float(cap_above) if cap_above is not None else None
+    min_val = payload.get("min")
+    max_val = payload.get("max")
+    min_float = float(min_val) if min_val is not None else None
+    max_float = float(max_val) if max_val is not None else None
     if (
-        cap_below_float is not None
-        and cap_above_float is not None
-        and cap_below_float > cap_above_float
+        min_float is not None
+        and max_float is not None
+        and min_float > max_float
     ):
-        raise ValueError("cap_below cannot exceed cap_above.")
+        raise ValueError("min cannot exceed max.")
     config = _ProjectionCapConfig(
         unit_vector=unit.detach().clone().contiguous(),
-        cap_below=cap_below_float,
-        cap_above=cap_above_float,
+        min=min_float,
+        max=max_float,
     )
     state.projection_caps[target_idx] = config
     layer = _resolve_layers(worker.model_runner.model)[target_idx]
@@ -652,8 +652,8 @@ def inspect_layer_vector(worker: Any, layer_idx: int | None = None) -> dict[str,
     projection_cap = getattr(layer, "_chatspace_projection_cap", None)
     if isinstance(projection_cap, _ProjectionCapConfig):
         proj_info = {
-            "cap_below": projection_cap.cap_below,
-            "cap_above": projection_cap.cap_above,
+            "min": projection_cap.min,
+            "max": projection_cap.max,
         }
     else:
         proj_info = None
