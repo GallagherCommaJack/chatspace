@@ -315,7 +315,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hf.add_argument("--output-root", default="/workspace", help="Base output directory")
     p_hf.add_argument("--dtype", default="bfloat16", help="Model dtype hint")
     p_hf.add_argument("--device", default=None, help="Device hint, e.g. 'cuda', 'auto'")
-    p_hf.add_argument("--attention", default="flash_attention_2", help="Attention implementation hint")
+    p_hf.add_argument(
+        "--attention",
+        default="flash_attention_2",
+        help="Attention implementation hint (install extra 'flash-attn' to enable flash_attention_2)",
+    )
     p_hf.add_argument("--prefetch-batches", type=int, default=4, help="Number of batches to prefetch from the loader")
     p_hf.add_argument("--bucket-min-tokens", type=int, default=128, help="Minimum token count for bucket sizing")
     p_hf.add_argument("--bucket-max-tokens", type=int, default=32768, help="Maximum token count for bucket sizing")

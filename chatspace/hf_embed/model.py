@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import time
 from typing import Any, Iterable, Optional
@@ -12,11 +13,22 @@ from sentence_transformers import SentenceTransformer
 from .config import SentenceTransformerConfig
 
 
+def _is_flash_attn_available() -> bool:
+    """Return True when the flash_attn module can be imported."""
+    return importlib.util.find_spec("flash_attn") is not None
+
+
 def _default_model_kwargs(cfg: SentenceTransformerConfig) -> dict[str, Any]:
     """Build model kwargs from config."""
     kwargs: dict[str, Any] = {}
     if cfg.attention_impl:
-        kwargs["attn_implementation"] = cfg.attention_impl
+        if cfg.attention_impl == "flash_attention_2" and not _is_flash_attn_available():
+            logging.warning(
+                "flash_attention_2 requested but flash-attn is not installed; "
+                "using the model default attention implementation instead."
+            )
+        else:
+            kwargs["attn_implementation"] = cfg.attention_impl
     if cfg.device:
         kwargs["device_map"] = cfg.device
     if cfg.dtype:

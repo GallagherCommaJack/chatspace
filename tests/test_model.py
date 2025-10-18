@@ -1,5 +1,6 @@
 """Tests for chatspace.hf_embed.model module."""
 
+import logging
 from unittest.mock import MagicMock
 
 import torch
@@ -12,11 +13,11 @@ from chatspace.hf_embed.model import (
 )
 
 
-def test_default_model_kwargs():
-    """Test model kwargs construction."""
+def test_default_model_kwargs(monkeypatch):
+    """Test model kwargs construction with flash attention available."""
+    monkeypatch.setattr("chatspace.hf_embed.model._is_flash_attn_available", lambda: True)
     cfg = SentenceTransformerConfig(
         dataset="test",
-        attention_impl="flash_attention_2",
         device="cuda",
         dtype="bfloat16",
     )
@@ -26,6 +27,20 @@ def test_default_model_kwargs():
     assert kwargs["attn_implementation"] == "flash_attention_2"
     assert kwargs["device_map"] == "cuda"
     assert kwargs["dtype"] == "bfloat16"
+
+
+def test_default_model_kwargs_flash_attention_missing(monkeypatch, caplog):
+    """Ensure flash attention requests are ignored when the package is absent."""
+    cfg = SentenceTransformerConfig(
+        dataset="test",
+    )
+    monkeypatch.setattr("chatspace.hf_embed.model._is_flash_attn_available", lambda: False)
+
+    with caplog.at_level(logging.WARNING):
+        kwargs = _default_model_kwargs(cfg)
+
+    assert "attn_implementation" not in kwargs
+    assert "flash_attention_2 requested" in caplog.text
 
 
 def test_default_model_kwargs_custom():

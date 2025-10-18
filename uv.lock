@@ -456,7 +456,6 @@ dependencies = [
     { name = "dash" },
     { name = "dash-bootstrap-components" },
     { name = "datasets" },
-    { name = "flash-attn" },
     { name = "huggingface-hub", extra = ["hf-transfer"] },
     { name = "openai" },
     { name = "peft" },
@@ -476,6 +475,11 @@ dependencies = [
     { name = "vllm" },
 ]
 
+[package.optional-dependencies]
+flash-attn = [
+    { name = "flash-attn" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "ipykernel" },
@@ -491,7 +495,7 @@ requires-dist = [
     { name = "dash", specifier = ">=2.18.0" },
     { name = "dash-bootstrap-components", specifier = ">=1.6.0" },
     { name = "datasets", specifier = ">=4.1.1" },
-    { name = "flash-attn", specifier = ">=2.5.1" },
+    { name = "flash-attn", marker = "extra == 'flash-attn'", specifier = ">=2.5.1" },
     { name = "huggingface-hub", extras = ["hf-transfer"], specifier = ">=0.35.1" },
     { name = "openai", specifier = ">=1.109.1" },
     { name = "peft", specifier = ">=0.17.1" },
@@ -510,6 +514,7 @@ requires-dist = [
     { name = "umap-learn", specifier = ">=0.5.7" },
     { name = "vllm", specifier = ">=0.11.0" },
 ]
+provides-extras = ["flash-attn"]
 
 [package.metadata.requires-dev]
 dev = [
