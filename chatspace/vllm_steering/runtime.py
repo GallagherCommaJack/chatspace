@@ -196,19 +196,15 @@ def _apply_projection_cap(hidden: torch.Tensor, config: _ProjectionCapConfig) ->
     flat = _reshape_for_component_ops(hidden, config.unit_vector.shape[0])
     unit = config.unit_vector
     projection = flat @ unit
+    clamp_kwargs: dict[str, torch.Tensor] = {}
     if config.cap_below is not None:
-        lower = projection.new_tensor(float(config.cap_below))
-        mask = projection < lower
-        if mask.any():
-            delta = (lower - projection[mask]).unsqueeze(-1) * unit
-            flat[mask] = flat[mask] + delta
-            projection = flat @ unit
+        clamp_kwargs["min"] = projection.new_tensor(float(config.cap_below))
     if config.cap_above is not None:
-        upper = projection.new_tensor(float(config.cap_above))
-        mask = projection > upper
-        if mask.any():
-            delta = (upper - projection[mask]).unsqueeze(-1) * unit
-            flat[mask] = flat[mask] + delta
+        clamp_kwargs["max"] = projection.new_tensor(float(config.cap_above))
+    clamped = torch.clamp(projection, **clamp_kwargs)  # type: ignore[arg-type]
+    if clamped is not projection:
+        delta = (clamped - projection).unsqueeze(-1) * unit
+        flat = flat + delta
     return flat.reshape_as(hidden)
 
 

@@ -34,7 +34,16 @@ package = true
 preview = true
 
 [tool.setuptools]
-packages = ["chatspace"]
+packages = [
+    "chatspace",
+    "chatspace.analysis",
+    "chatspace.generation",
+    "chatspace.hf_embed",
+    "chatspace.persona",
+    "chatspace.steering",
+    "chatspace.utils",
+    "chatspace.vllm_steering",
+]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [ { requirement = "torch", match-runtime = true } ]

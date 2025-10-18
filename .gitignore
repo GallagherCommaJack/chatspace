@@ -18,3 +18,8 @@ wheels/
 workspace
 persona-subspace
 TEMP_JOURNAL.md
+
+.uv_cache/
+.ruff_cache/
+.pytest_cache/
+.claude/

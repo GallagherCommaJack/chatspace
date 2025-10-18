@@ -131,21 +131,22 @@ def load_legacy_role_trait_config(path: str | Path) -> list[LegacyExperiment]:
                 raise KeyError(f"Legacy intervention references unknown vector '{vector_name}'")
             layer_idx, unit_vector, magnitude = prepared_vectors[vector_name]
 
-            add_spec = AddSpec(vector=unit_vector.clone(), scale=magnitude)
             projection_cap = None
             if "cap" in intervention and intervention["cap"] is not None:
                 cap_value = float(intervention["cap"])
                 projection_cap = ProjectionCapSpec(
                     vector=unit_vector.clone(),
-                    cap_below=cap_value,
-                    cap_above=None,
+                    cap_below=None,
+                    cap_above=cap_value,
                 )
+            else:
+                raise ValueError(f"Legacy intervention in experiment '{experiment_id}' missing 'cap' field")
 
             if layer_idx in layers:
                 raise ValueError(
                     f"Legacy experiment '{experiment_id}' defines multiple interventions for layer {layer_idx}"
                 )
-            layers[layer_idx] = LayerSteeringSpec(add=add_spec, projection_cap=projection_cap)
+            layers[layer_idx] = LayerSteeringSpec(add=None, projection_cap=projection_cap)
 
         experiments.append(LegacyExperiment(id=experiment_id, spec=SteeringSpec(layers=layers)))
 
