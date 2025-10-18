@@ -33,8 +33,16 @@ version = "0.1.0"
 package = true
 preview = true
 
-[tool.setuptools]
-packages = ["chatspace"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chatspace", "chatspace.*"]
+exclude = [
+    "tests",
+    "scripts",
+    "runs",
+    "notebooks",
+    "workspace",
+]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [ { requirement = "torch", match-runtime = true } ]
