@@ -485,3 +485,189 @@ def test_hidden_states_match_hf():
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_hidden_states_match_hf_decode_phase():
+    """Test that captured hidden states match between HuggingFace and vLLM during decode phase.
+
+    This test validates that the hidden state capture fix works correctly during
+    autoregressive generation (decode phase), not just prefill. It generates multiple
+    tokens and compares the hidden states at each decode step.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 2
+    prompt = "The quick brown fox"
+    num_decode_tokens = 5  # Generate 5 tokens during decode phase
+
+    # -------------------------------------------------------------------------
+    # HuggingFace path: Manual autoregressive generation with KV cache
+    # -------------------------------------------------------------------------
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Tokenize input
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    # Perform manual autoregressive generation to capture decode-phase hidden states
+    past_key_values = None
+    next_token_ids = inputs.input_ids
+    hf_decode_hiddens = []
+
+    for step in range(num_decode_tokens + 1):  # +1 to include prefill
+        captured_hidden = None
+
+        def capture_hook(module, args, output):
+            """Hook to capture hidden states from HF model."""
+            nonlocal captured_hidden
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            # Capture the last token's hidden state (the new token in decode phase)
+            captured_hidden = hidden_states[:, -1:, :].detach().cpu().clone()
+            return output
+
+        # Install hook on target layer
+        layer = hf_model.model.layers[target_layer]
+        hook_handle = layer.register_forward_hook(capture_hook)
+
+        # Forward pass with KV cache
+        with torch.no_grad():
+            outputs = hf_model(
+                next_token_ids,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )
+
+        # Remove hook
+        hook_handle.remove()
+
+        # Store hidden state (skip first iteration which is prefill)
+        if past_key_values is not None:
+            assert captured_hidden is not None, f"Should have captured hidden state at step {step}"
+            hf_decode_hiddens.append(captured_hidden.to(dtype=torch.float32))
+
+        # Get next token
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token_ids = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+        # Update KV cache for next iteration
+        past_key_values = outputs.past_key_values
+
+    assert len(hf_decode_hiddens) == num_decode_tokens, (
+        f"Should have {num_decode_tokens} decode hidden states, got {len(hf_decode_hiddens)}"
+    )
+
+    # -------------------------------------------------------------------------
+    # vLLM path: Generate all tokens at once
+    # -------------------------------------------------------------------------
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=len(tokenizer.encode(prompt)) + num_decode_tokens + 16,
+        dtype="float16",
+    )
+
+    try:
+        vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
+    except OSError as exc:  # pragma: no cover - allows offline environments
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    # Enable capture for vLLM (capture before steering)
+    vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
+
+    # Generate with vLLM using the same prompt (ignore EOS to ensure we generate the requested number)
+    sampling = SamplingParams(temperature=0.0, max_tokens=num_decode_tokens, logprobs=0, ignore_eos=True)
+    vllm_model.generate([prompt], sampling_params=sampling)
+
+    # Fetch captured states
+    vllm_states = vllm_model.fetch_hidden_states(layer_idx=target_layer)
+    vllm_captures = vllm_states[0][target_layer]
+
+    # vLLM captures: [0] = prefill, [1:] = decode steps
+    # Determine actual number of decode tokens generated
+    num_vllm_decode_tokens = len(vllm_captures) - 1  # Subtract prefill capture
+
+    print(f"\nvLLM generated {num_vllm_decode_tokens} decode tokens (captures: {len(vllm_captures)} total)")
+
+    # We need at least some decode tokens to validate
+    assert num_vllm_decode_tokens >= 3, (
+        f"Need at least 3 decode tokens for meaningful comparison, got {num_vllm_decode_tokens}"
+    )
+
+    # Use the minimum of what we generated
+    num_tokens_to_compare = min(num_decode_tokens, num_vllm_decode_tokens)
+
+    # -------------------------------------------------------------------------
+    # Compare decode-phase hidden states
+    # -------------------------------------------------------------------------
+    print(f"\nDecode phase hidden state comparison ({num_tokens_to_compare} tokens):")
+
+    for step_idx in range(num_tokens_to_compare):
+        # HF: hidden state from decode step
+        hf_hidden = hf_decode_hiddens[step_idx].squeeze(0).squeeze(0)  # Remove batch and seq dims
+
+        # vLLM: hidden state from decode step (+1 to skip prefill)
+        vllm_hidden = vllm_captures[step_idx + 1]["before"].to(dtype=torch.float32)
+
+        # vLLM decode states are typically (1, hidden_size), squeeze to (hidden_size,)
+        if vllm_hidden.dim() > 1:
+            vllm_hidden = vllm_hidden.squeeze(0)
+
+        # Ensure shapes match
+        assert hf_hidden.shape == vllm_hidden.shape, (
+            f"Step {step_idx}: Shape mismatch - HF {hf_hidden.shape} vs vLLM {vllm_hidden.shape}"
+        )
+
+        # Flatten for comparison
+        hf_flat = hf_hidden.reshape(-1)
+        vllm_flat = vllm_hidden.reshape(-1)
+
+        # Compute cosine similarity
+        cos_sim = torch.nn.functional.cosine_similarity(
+            hf_flat.unsqueeze(0), vllm_flat.unsqueeze(0)
+        ).item()
+
+        # Compute mean absolute error
+        mae = torch.mean(torch.abs(hf_flat - vllm_flat)).item()
+
+        # Statistics
+        hf_mean = hf_flat.mean().item()
+        vllm_mean = vllm_flat.mean().item()
+        hf_std = hf_flat.std().item()
+        vllm_std = vllm_flat.std().item()
+
+        print(f"  Step {step_idx}:")
+        print(f"    Cosine similarity: {cos_sim:.6f}")
+        print(f"    MAE: {mae:.6f}")
+        print(f"    HF mean: {hf_mean:.4f}, std: {hf_std:.4f}")
+        print(f"    vLLM mean: {vllm_mean:.4f}, std: {vllm_std:.4f}")
+
+        # Assert high cosine similarity (decode phase should also match)
+        assert cos_sim > 0.99, (
+            f"Decode step {step_idx}: Cosine similarity {cos_sim:.6f} should be >0.99. "
+            f"This indicates the fix may not work correctly during decode phase."
+        )
+
+        # Assert low mean absolute error
+        assert mae < 0.01, (
+            f"Decode step {step_idx}: MAE {mae:.6f} should be <0.01"
+        )
+
+    print(f"\n✓ All {num_tokens_to_compare} decode steps match between HF and vLLM")
+
+    # Clean up
+    vllm_model.clear_all_vectors()
+    del vllm_model
+    del hf_model
+    torch.cuda.empty_cache()

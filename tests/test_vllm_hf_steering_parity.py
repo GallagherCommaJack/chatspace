@@ -70,6 +70,7 @@ def test_vllm_hf_steering_combinations_match():
 
     model_name = "Qwen/Qwen3-0.6B"
     target_layer = 4
+    downstream_layer = 5  # Check that steering propagates to subsequent layers
     prompt = "A curious squirrel contemplates the mysteries of the forest."
 
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -108,8 +109,8 @@ def test_vllm_hf_steering_combinations_match():
         max_model_len=inputs.input_ids.shape[1] + 16,
         dtype="float16",
     )
-    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    vllm_model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
@@ -118,42 +119,51 @@ def test_vllm_hf_steering_combinations_match():
             # ------------------------------------------------------------------
             # HuggingFace path
             # ------------------------------------------------------------------
-            captured_hf_hidden: dict[str, torch.Tensor] = {}
+            captured_hf_hiddens: dict[int, torch.Tensor] = {}
 
-            def hook(module, _args, output):
-                hidden = output[0] if isinstance(output, tuple) else output
-                orig_dtype = hidden.dtype
-                hidden_fp32 = hidden.to(torch.float32)
+            def make_hook(layer_idx: int):
+                def hook(module, _args, output):
+                    hidden = output[0] if isinstance(output, tuple) else output
+                    orig_dtype = hidden.dtype
+                    hidden_fp32 = hidden.to(torch.float32)
 
-                if case["vector"] is not None:
-                    hidden_fp32 = hidden_fp32 + case["vector"].to(device=hidden_fp32.device)
+                    # Only apply steering at target layer
+                    if layer_idx == target_layer:
+                        if case["vector"] is not None:
+                            hidden_fp32 = hidden_fp32 + case["vector"].to(device=hidden_fp32.device)
 
-                if case["cap"] is not None:
-                    unit = _normalize(case["cap"].vector).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
-                    hidden_fp32 = _apply_projection_cap(
-                        hidden_fp32,
-                        unit,
-                        minimum=case["cap"].min,
-                        maximum=case["cap"].max,
-                    )
+                        if case["cap"] is not None:
+                            unit = _normalize(case["cap"].vector).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
+                            hidden_fp32 = _apply_projection_cap(
+                                hidden_fp32,
+                                unit,
+                                minimum=case["cap"].min,
+                                maximum=case["cap"].max,
+                            )
 
-                if case["ablation"] is not None:
-                    unit = _normalize(case["ablation"].vector).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
-                    hidden_fp32 = _apply_ablation(hidden_fp32, unit, scale=case["ablation"].scale)
+                        if case["ablation"] is not None:
+                            unit = _normalize(case["ablation"].vector).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
+                            hidden_fp32 = _apply_ablation(hidden_fp32, unit, scale=case["ablation"].scale)
 
-                captured_hf_hidden["tensor"] = hidden_fp32.detach().cpu().clone()
-                hidden_out = hidden_fp32.to(dtype=orig_dtype)
-                if isinstance(output, tuple):
-                    return (hidden_out,) + output[1:]
-                return hidden_out
+                    captured_hf_hiddens[layer_idx] = hidden_fp32.detach().cpu().clone()
+                    hidden_out = hidden_fp32.to(dtype=orig_dtype)
+                    if isinstance(output, tuple):
+                        return (hidden_out,) + output[1:]
+                    return hidden_out
+                return hook
 
-            layer = hf_model.model.layers[target_layer]
-            handle = layer.register_forward_hook(hook)
+            # Install hooks on both layers
+            target_handle = hf_model.model.layers[target_layer].register_forward_hook(make_hook(target_layer))
+            downstream_handle = hf_model.model.layers[downstream_layer].register_forward_hook(make_hook(downstream_layer))
+
             with torch.no_grad():
                 hf_model(**inputs)
-            handle.remove()
 
-            hf_hidden = captured_hf_hidden["tensor"]
+            target_handle.remove()
+            downstream_handle.remove()
+
+            hf_target_hidden = captured_hf_hiddens[target_layer]
+            hf_downstream_hidden = captured_hf_hiddens[downstream_layer]
 
             # ------------------------------------------------------------------
             # vLLM path
@@ -162,7 +172,9 @@ def test_vllm_hf_steering_combinations_match():
             vllm_model.clear_layer_projection_cap(target_layer)
             vllm_model.clear_layer_ablation(target_layer)
             vllm_model.clear_hidden_states(target_layer)
+            vllm_model.clear_hidden_states(downstream_layer)
 
+            # Only set steering at target layer
             if case["vector"] is not None:
                 vllm_model.set_layer_vector(target_layer, case["vector"])
             if case["cap"] is not None:
@@ -180,19 +192,238 @@ def test_vllm_hf_steering_combinations_match():
                 )
 
             vllm_model.generate([prompt], sampling_params=sampling)
-            states = vllm_model.fetch_hidden_states(layer_idx=target_layer)
-            vllm_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
+            states = vllm_model.fetch_hidden_states()
+            vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
+            vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
 
             # ------------------------------------------------------------------
             # Comparison
             # ------------------------------------------------------------------
-            hf_flat = hf_hidden.reshape(-1)
-            vllm_flat = vllm_hidden.reshape(-1)
-            mae = torch.mean(torch.abs(vllm_flat - hf_flat)).item()
-            cos = F.cosine_similarity(hf_flat.unsqueeze(0), vllm_flat.unsqueeze(0), dim=-1).item()
+            # Check target layer (where steering is applied)
+            hf_target_flat = hf_target_hidden.reshape(-1)
+            vllm_target_flat = vllm_target_hidden.reshape(-1)
+            target_mae = torch.mean(torch.abs(vllm_target_flat - hf_target_flat)).item()
+            target_cos = F.cosine_similarity(hf_target_flat.unsqueeze(0), vllm_target_flat.unsqueeze(0), dim=-1).item()
 
-            assert mae < 2e-3, f"{case['name']}: mean abs diff too large ({mae:.6f})"
-            assert cos > 0.9995, f"{case['name']}: cosine similarity degraded ({cos:.6f})"
+            assert target_mae < 2e-3, f"{case['name']} (target layer): mean abs diff too large ({target_mae:.6f})"
+            assert target_cos > 0.9995, f"{case['name']} (target layer): cosine similarity degraded ({target_cos:.6f})"
+
+            # Check downstream layer (verify steering propagates)
+            hf_downstream_flat = hf_downstream_hidden.reshape(-1)
+            vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
+            downstream_mae = torch.mean(torch.abs(vllm_downstream_flat - hf_downstream_flat)).item()
+            downstream_cos = F.cosine_similarity(hf_downstream_flat.unsqueeze(0), vllm_downstream_flat.unsqueeze(0), dim=-1).item()
+
+            assert downstream_mae < 2e-3, f"{case['name']} (downstream layer): mean abs diff too large ({downstream_mae:.6f})"
+            assert downstream_cos > 0.9995, f"{case['name']} (downstream layer): cosine similarity degraded ({downstream_cos:.6f})"
     finally:
         del vllm_model
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_decode_steering_matches_hf_prefill():
+    """Test that vLLM decode-time steering matches HF prefill-time steering.
+
+    This validates that steering applied during vLLM's autoregressive decode phase
+    produces the same hidden states as HF's prefill phase with the same tokens.
+
+    Strategy:
+    1. HF: Forward pass with [prompt + generated_tokens] in prefill mode (with steering)
+    2. vLLM: Generate tokens autoregressively starting from prompt (with steering)
+    3. Compare hidden states at each token position
+
+    If vLLM decode-time steering works correctly, the hidden states should match.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    downstream_layer = 5  # Check that steering propagates to subsequent layers
+    prompt = "The capital of France is"
+
+    # Load HF model
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Create steering vector
+    hidden_size = hf_model.config.hidden_size
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 0.1
+
+    # -------------------------------------------------------------------------
+    # Step 1: vLLM generate with steering (decode mode)
+    # -------------------------------------------------------------------------
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=64,
+        dtype="float16",
+    )
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+
+    # Set steering vector (only at target layer)
+    vllm_model.set_layer_vector(target_layer, steering_vector)
+
+    # Enable capture on both layers
+    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
+
+    # Generate tokens
+    sampling = SamplingParams(temperature=0.0, max_tokens=5, logprobs=0, ignore_eos=True)
+    outputs = vllm_model.generate([prompt], sampling_params=sampling)
+
+    # Get the generated text (outputs is list[str] of completion only)
+    generated_text = outputs[0]
+    full_text = prompt + generated_text
+
+    # Fetch vLLM hidden states (decode mode)
+    vllm_states = vllm_model.fetch_hidden_states()
+    vllm_target_captures = vllm_states[0][target_layer]
+    vllm_downstream_captures = vllm_states[0][downstream_layer]
+
+    # vLLM captures: [0] = prefill, [1:] = decode steps
+    num_decode_steps = len(vllm_target_captures) - 1
+    assert num_decode_steps >= 3, f"Need at least 3 decode steps, got {num_decode_steps}"
+
+    print(f"\nGenerated text: {repr(generated_text)}")
+    print(f"Full text: {repr(full_text)}")
+    print(f"vLLM captures: {len(vllm_target_captures)} (1 prefill + {num_decode_steps} decode)")
+
+    # -------------------------------------------------------------------------
+    # Step 2: HF forward pass with full text (prefill mode with steering)
+    # -------------------------------------------------------------------------
+    # Tokenize the full text (what vLLM generated)
+    full_inputs = tokenizer(full_text, return_tensors="pt").to("cuda")
+    prompt_inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    prompt_len = prompt_inputs.input_ids.shape[1]
+    full_len = full_inputs.input_ids.shape[1]
+
+    print(f"Prompt tokens: {prompt_len}, Full tokens: {full_len}")
+
+    # Capture hidden states from HF with steering
+    captured_hf_hiddens: dict[int, torch.Tensor] = {}
+
+    def make_hook(layer_idx: int):
+        def capture_hook(module, args, output):
+            """Hook to capture and steer hidden states from HF model."""
+            hidden = output[0] if isinstance(output, tuple) else output
+            orig_dtype = hidden.dtype
+            hidden_fp32 = hidden.to(torch.float32)
+
+            # Apply steering only at target layer (same vector vLLM used)
+            if layer_idx == target_layer:
+                hidden_fp32 = hidden_fp32 + steering_vector.to(device=hidden_fp32.device)
+
+            # Capture the steered hidden state
+            captured_hf_hiddens[layer_idx] = hidden_fp32.detach().cpu().clone()
+
+            # Return steered hidden state
+            hidden_out = hidden_fp32.to(dtype=orig_dtype)
+            if isinstance(output, tuple):
+                return (hidden_out,) + output[1:]
+            return hidden_out
+        return capture_hook
+
+    # Install hooks on both layers
+    target_handle = hf_model.model.layers[target_layer].register_forward_hook(make_hook(target_layer))
+    downstream_handle = hf_model.model.layers[downstream_layer].register_forward_hook(make_hook(downstream_layer))
+
+    with torch.no_grad():
+        hf_model(**full_inputs)
+
+    target_handle.remove()
+    downstream_handle.remove()
+
+    # HF captured the full sequence: [prompt_tokens + generated_tokens]
+    assert len(captured_hf_hiddens) == 2, "Should have captured both layers"
+    hf_target_hidden_full = captured_hf_hiddens[target_layer].to(dtype=torch.float32).squeeze(0)  # [seq_len, hidden_size]
+    hf_downstream_hidden_full = captured_hf_hiddens[downstream_layer].to(dtype=torch.float32).squeeze(0)  # [seq_len, hidden_size]
+
+    print(f"HF target hidden shape: {hf_target_hidden_full.shape}")
+    print(f"HF downstream hidden shape: {hf_downstream_hidden_full.shape}")
+
+    # -------------------------------------------------------------------------
+    # Step 3: Compare vLLM decode-time vs HF prefill-time hidden states
+    # -------------------------------------------------------------------------
+    print(f"\nComparing vLLM decode (steered) vs HF prefill (steered):")
+
+    for decode_idx in range(num_decode_steps):
+        # HF: token position in the full sequence
+        hf_token_idx = prompt_len + decode_idx
+
+        if hf_token_idx >= hf_target_hidden_full.shape[0]:
+            print(f"  Decode step {decode_idx}: Skipping (out of bounds)")
+            continue
+
+        # -------------------------------------------------------------------------
+        # Target layer comparison
+        # -------------------------------------------------------------------------
+        # vLLM: hidden state from decode step (after steering)
+        vllm_target_hidden = vllm_target_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
+        if vllm_target_hidden.dim() > 1:
+            vllm_target_hidden = vllm_target_hidden.squeeze(0)  # [hidden_size]
+
+        # HF: hidden state from prefill at the corresponding token position
+        hf_target_hidden = hf_target_hidden_full[hf_token_idx]  # [hidden_size]
+
+        # Compare
+        hf_target_flat = hf_target_hidden.reshape(-1)
+        vllm_target_flat = vllm_target_hidden.reshape(-1)
+
+        target_cos_sim = F.cosine_similarity(hf_target_flat.unsqueeze(0), vllm_target_flat.unsqueeze(0), dim=-1).item()
+        target_mae = torch.mean(torch.abs(hf_target_flat - vllm_target_flat)).item()
+
+        # -------------------------------------------------------------------------
+        # Downstream layer comparison (verify steering propagates)
+        # -------------------------------------------------------------------------
+        vllm_downstream_hidden = vllm_downstream_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
+        if vllm_downstream_hidden.dim() > 1:
+            vllm_downstream_hidden = vllm_downstream_hidden.squeeze(0)
+
+        hf_downstream_hidden = hf_downstream_hidden_full[hf_token_idx]
+
+        hf_downstream_flat = hf_downstream_hidden.reshape(-1)
+        vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
+
+        downstream_cos_sim = F.cosine_similarity(hf_downstream_flat.unsqueeze(0), vllm_downstream_flat.unsqueeze(0), dim=-1).item()
+        downstream_mae = torch.mean(torch.abs(hf_downstream_flat - vllm_downstream_flat)).item()
+
+        print(f"  Decode step {decode_idx} (token position {hf_token_idx}):")
+        print(f"    Target layer:     cos={target_cos_sim:.6f}, MAE={target_mae:.6f}")
+        print(f"    Downstream layer: cos={downstream_cos_sim:.6f}, MAE={downstream_mae:.6f}")
+
+        # Assert high similarity for target layer (steering is working during decode)
+        assert target_cos_sim > 0.999, (
+            f"Decode step {decode_idx} (target layer): Cosine similarity {target_cos_sim:.6f} should be >0.999. "
+            f"This indicates decode-time steering may not match prefill-time steering."
+        )
+        assert target_mae < 0.01, (
+            f"Decode step {decode_idx} (target layer): MAE {target_mae:.6f} should be <0.01"
+        )
+
+        # Assert high similarity for downstream layer (steering propagates)
+        assert downstream_cos_sim > 0.999, (
+            f"Decode step {decode_idx} (downstream layer): Cosine similarity {downstream_cos_sim:.6f} should be >0.999. "
+            f"This indicates steering may not propagate correctly through layers."
+        )
+        assert downstream_mae < 0.01, (
+            f"Decode step {decode_idx} (downstream layer): MAE {downstream_mae:.6f} should be <0.01"
+        )
+
+    print(f"\n✓ vLLM decode-time steering matches HF prefill-time steering (target + downstream layers)")
+
+    # Cleanup
+    vllm_model.clear_all_vectors()
+    del vllm_model
+    del hf_model
+    torch.cuda.empty_cache()
