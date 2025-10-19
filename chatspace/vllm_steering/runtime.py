@@ -25,6 +25,15 @@ LayerLike = Any
 
 
 @dataclass
+class _CaptureConfig:
+    """Configuration for capturing hidden states at a layer."""
+
+    capture_before: bool = True
+    capture_after: bool = True
+    max_captures: int | None = None
+
+
+@dataclass
 class _SteeringState:
     """Track steering metadata for a worker."""
 
@@ -34,6 +43,8 @@ class _SteeringState:
     layer_vectors: dict[int, torch.Tensor]
     projection_caps: dict[int, "_ProjectionCapConfig"]
     ablations: dict[int, "_AblationConfig"]
+    capture_configs: dict[int, _CaptureConfig]
+    captured_states: dict[int, list[dict[str, torch.Tensor]]]
 
 
 @dataclass
@@ -91,33 +102,96 @@ _PATCH_INSTALLED = False
 _SEEN_OUTPUT_TYPES: set[str] = set()
 
 
+def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
+    """Extract the primary hidden state tensor from layer output.
+
+    For vLLM Qwen layers, the forward returns (delta, residual) where:
+    - delta (output[0]): The per-layer update that will be added to the residual.
+    - residual (output[1]): The running residual stream before the delta is applied.
+
+    To mirror HuggingFace decoder outputs we need ``residual + delta`` which is the
+    hidden state propagated to the next layer. Fall back to the first tensor when the
+    structure does not match this tuple form.
+    """
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, (tuple, list)):
+        if len(output) >= 2:
+            # vLLM Qwen layers return (delta, residual)
+            first = output[0]
+            second = output[1]
+            if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+                # Combine residual stream with delta to match HF hidden state
+                return second + first
+        if len(output) > 0:
+            # Single element or fallback: return first element
+            hidden = output[0]
+            if isinstance(hidden, torch.Tensor):
+                return hidden
+    if isinstance(output, dict) and "last_hidden_state" in output:
+        return output["last_hidden_state"]
+    if hasattr(output, "last_hidden_state"):
+        hidden = output.last_hidden_state  # type: ignore[assignment]
+        if isinstance(hidden, torch.Tensor):
+            return hidden
+    return None
+
+
+def _is_qwen_layer_output(output: Any) -> bool:
+    return (
+        isinstance(output, tuple)
+        and len(output) >= 2
+        and isinstance(output[0], torch.Tensor)
+        and isinstance(output[1], torch.Tensor)
+    )
+
+
 def _transform_output(
     output: Any,
     transform: Callable[[torch.Tensor], torch.Tensor],
     *,
     fallback: Callable[[Any], Any] | None = None,
+    mode: str = "delta",
 ) -> Any:
-    """Apply ``transform`` to the primary hidden state within ``output``."""
+    """Apply ``transform`` to the primary hidden state within ``output``.
+
+    Parameters
+    ----------
+    mode :
+        ``"delta"`` applies the transform to the layer delta (output[0]) and returns
+        an updated tuple. ``"hidden"`` materializes HuggingFace-equivalent hidden
+        state ``residual + delta`` (when available), applies ``transform``, and
+        re-expresses the result as an updated delta so downstream layers receive
+        the transformed hidden state.
+    """
     _SEEN_OUTPUT_TYPES.add(type(output).__name__)
     if isinstance(output, torch.Tensor):
         return transform(output)
     if isinstance(output, tuple):
         if not output:
             return output
+        if mode == "hidden" and _is_qwen_layer_output(output):
+            delta, residual = output[0], output[1]
+            hidden = residual + delta
+            transformed = transform(hidden)
+            if transformed is hidden:
+                return output
+            new_delta = transformed - residual
+            return (new_delta,) + output[1:]
         hidden = output[0]
-        steered_hidden = transform(hidden)
-        if steered_hidden is hidden:
+        transformed = transform(hidden)
+        if transformed is hidden:
             return output
-        return (steered_hidden,) + output[1:]
+        return (transformed,) + output[1:]
     if isinstance(output, list):
         if not output:
             return output
         hidden = output[0]
-        steered_hidden = transform(hidden)
-        if steered_hidden is hidden:
+        transformed = transform(hidden)
+        if transformed is hidden:
             return output
         patched = list(output)
-        patched[0] = steered_hidden
+        patched[0] = transformed
         return patched
     if isinstance(output, dict) and "last_hidden_state" in output:
         patched = dict(output)
@@ -133,21 +207,26 @@ def _transform_output(
 
 
 def _apply_vector_to_output(output: Any, vector: torch.Tensor) -> Any:
-    return _transform_output(output, lambda hidden: hidden + vector, fallback=lambda value: value + vector)
+    return _transform_output(
+        output,
+        lambda delta: delta + vector,
+        fallback=lambda value: value + vector,
+        mode="delta",
+    )
 
 
 def _apply_projection_cap_to_output(output: Any, config: _ProjectionCapConfig) -> Any:
     def _cap(hidden: torch.Tensor) -> torch.Tensor:
         return _apply_projection_cap(hidden, config)
 
-    return _transform_output(output, _cap, fallback=None)
+    return _transform_output(output, _cap, fallback=None, mode="hidden")
 
 
 def _apply_ablation_to_output(output: Any, config: _AblationConfig) -> Any:
     def _ablate(hidden: torch.Tensor) -> torch.Tensor:
         return _apply_ablation(hidden, config)
 
-    return _transform_output(output, _ablate, fallback=None)
+    return _transform_output(output, _ablate, fallback=None, mode="hidden")
 
 
 def _reshape_for_component_ops(hidden: torch.Tensor, expected_dim: int) -> torch.Tensor:
@@ -269,6 +348,21 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
     @wraps(original_forward)
     def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
         output = original_forward(self, *args, **kwargs)
+
+        # Check if this layer should capture hidden states
+        capture_config = getattr(self, "_chatspace_capture_config", None)
+        captured_before: torch.Tensor | None = None
+
+        if isinstance(capture_config, _CaptureConfig) and capture_config.capture_before:
+            # Extract and capture hidden state before steering
+            try:
+                captured_before = _extract_hidden_from_output(output)
+                if captured_before is not None:
+                    captured_before = captured_before.detach().cpu().clone()
+            except Exception:  # pragma: no cover - graceful degradation
+                pass
+
+        # Apply steering operations
         vector = getattr(self, "_chatspace_steering_vector", None)
         if vector is not None:
             output = _apply_vector_to_output(output, vector)
@@ -278,6 +372,33 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         ablation_config = getattr(self, "_chatspace_ablation", None)
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
+
+        # Capture hidden state after steering if requested
+        if isinstance(capture_config, _CaptureConfig):
+            capture_queue = getattr(self, "_chatspace_capture_queue", None)
+            if capture_queue is not None:
+                try:
+                    captured_after: torch.Tensor | None = None
+                    if capture_config.capture_after:
+                        captured_after = _extract_hidden_from_output(output)
+                        if captured_after is not None:
+                            captured_after = captured_after.detach().cpu().clone()
+
+                    # Store capture if we have at least one state
+                    if captured_before is not None or captured_after is not None:
+                        capture_entry: dict[str, torch.Tensor] = {}
+                        if captured_before is not None:
+                            capture_entry["before"] = captured_before
+                        if captured_after is not None:
+                            capture_entry["after"] = captured_after
+
+                        # Check max_captures limit
+                        max_cap = capture_config.max_captures
+                        if max_cap is None or len(capture_queue) < max_cap:
+                            capture_queue.append(capture_entry)
+                except Exception:  # pragma: no cover - graceful degradation
+                    pass
+
         return output
 
     layer_cls.__init__ = _patched_init  # type: ignore[assignment]
@@ -435,6 +556,8 @@ def initialize_worker_state(
         layer_vectors={},
         projection_caps={},
         ablations={},
+        capture_configs={},
+        captured_states={},
     )
     worker._chatspace_steering = state
 
@@ -678,3 +801,138 @@ def inspect_layer_vector(worker: Any, layer_idx: int | None = None) -> dict[str,
         "projection_cap": proj_info,
         "ablation": ablation_info,
     }
+
+
+def enable_hidden_state_capture(
+    worker: Any,
+    layer_idx: int,
+    *,
+    capture_before: bool = True,
+    capture_after: bool = True,
+    max_captures: int | None = None,
+) -> None:
+    """Enable hidden state capture for a specific layer.
+
+    Parameters
+    ----------
+    worker :
+        The vLLM worker instance.
+    layer_idx :
+        Layer index to enable capture for.
+    capture_before :
+        Whether to capture hidden states before steering is applied.
+    capture_after :
+        Whether to capture hidden states after steering is applied.
+    max_captures :
+        Maximum number of capture entries to store. ``None`` means unlimited.
+    """
+    state = _ensure_state(worker)
+    target_idx = int(layer_idx)
+    _ensure_layer_entry(worker, state, target_idx)
+
+    capture_config = _CaptureConfig(
+        capture_before=bool(capture_before),
+        capture_after=bool(capture_after),
+        max_captures=int(max_captures) if max_captures is not None else None,
+    )
+    state.capture_configs[target_idx] = capture_config
+    state.captured_states[target_idx] = []
+
+    layers = _resolve_layers(worker.model_runner.model)
+    layer = layers[target_idx]
+    layer._chatspace_capture_config = capture_config  # type: ignore[attr-defined]
+    layer._chatspace_capture_queue = state.captured_states[target_idx]  # type: ignore[attr-defined]
+
+
+def disable_hidden_state_capture(
+    worker: Any, layer_idx: int | None = None
+) -> None:
+    """Disable hidden state capture for one or all layers.
+
+    Parameters
+    ----------
+    worker :
+        The vLLM worker instance.
+    layer_idx :
+        Layer index to disable capture for. If ``None``, disables for all layers.
+    """
+    state = _ensure_state(worker)
+    if layer_idx is None:
+        targets = tuple(state.capture_configs.keys())
+    else:
+        targets = (int(layer_idx),)
+
+    if not targets:
+        return
+
+    layers = _resolve_layers(worker.model_runner.model)
+    for idx in targets:
+        state.capture_configs.pop(idx, None)
+        state.captured_states.pop(idx, None)  # Also clear captured data
+        if 0 <= idx < len(layers):
+            layer = layers[idx]
+            if hasattr(layer, "_chatspace_capture_config"):
+                layer._chatspace_capture_config = None  # type: ignore[attr-defined]
+            if hasattr(layer, "_chatspace_capture_queue"):
+                layer._chatspace_capture_queue = None  # type: ignore[attr-defined]
+
+
+def fetch_captured_hidden_states(
+    worker: Any, layer_idx: int | None = None
+) -> dict[int, list[dict[str, torch.Tensor]]]:
+    """Retrieve captured hidden states from one or all layers.
+
+    Parameters
+    ----------
+    worker :
+        The vLLM worker instance.
+    layer_idx :
+        Layer index to fetch captures from. If ``None``, fetches from all layers.
+
+    Returns
+    -------
+    dict[int, list[dict[str, torch.Tensor]]]
+        Mapping of layer indices to lists of capture entries. Each entry is a dict
+        with ``"before"`` and/or ``"after"`` keys containing CPU tensors.
+    """
+    state = _ensure_state(worker)
+    if layer_idx is None:
+        return {
+            idx: [
+                {key: tensor.detach().cpu().clone() for key, tensor in entry.items()}
+                for entry in captures
+            ]
+            for idx, captures in state.captured_states.items()
+        }
+    else:
+        target_idx = int(layer_idx)
+        captures = state.captured_states.get(target_idx, [])
+        return {
+            target_idx: [
+                {key: tensor.detach().cpu().clone() for key, tensor in entry.items()}
+                for entry in captures
+            ]
+        }
+
+
+def clear_captured_hidden_states(
+    worker: Any, layer_idx: int | None = None
+) -> None:
+    """Clear captured hidden states for one or all layers without disabling capture.
+
+    Parameters
+    ----------
+    worker :
+        The vLLM worker instance.
+    layer_idx :
+        Layer index to clear captures from. If ``None``, clears all layers.
+    """
+    state = _ensure_state(worker)
+    if layer_idx is None:
+        for captures in state.captured_states.values():
+            captures.clear()
+    else:
+        target_idx = int(layer_idx)
+        captures = state.captured_states.get(target_idx)
+        if captures is not None:
+            captures.clear()

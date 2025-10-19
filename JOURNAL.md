@@ -362,3 +362,61 @@ User can now:
 
 ## 2025-10-15
 - 2025-10-15T22:11:51Z — Moved the steering hook into a `_SteeringModule` so vLLM CUDA graphs see live vector updates; smoke test now targets `Qwen/Qwen3-0.6B` with constrained GPU utilization. Verified in `notebooks/vllm_rollout_test.ipynb` that deterministic decoding (temp 0) diverges once `VLLMSteerModel(..., enforce_eager=True)` is used, and documented that extreme scales still crash captured graphs—clear the vector after probes.
+
+## 2025-10-19
+
+### vLLM Hidden State Capture Bug Fix (2025-10-19T05:30Z)
+
+**Problem Discovered**
+- Hidden state capture from vLLM layers was broken and inconsistent across layers
+- Layer 2 prefill: std ~0.67 (WRONG - too small)
+- Layer 4+ prefill: std ~126.5 (CORRECT)
+- Caused catastrophic divergence when comparing HF vs vLLM hidden states:
+  - Layer 2: cosine similarity 0.9999 (good)
+  - Layer 4: cosine similarity 0.004 (COLLAPSED!)
+  - Layer 8: cosine similarity 0.006 (COLLAPSED!)
+
+**Root Cause**
+- Critical inconsistency in `chatspace/vllm_steering/runtime.py`:
+  - `_transform_output()` modified `output[0]` (first tuple element) for steering
+  - `_extract_hidden_from_output()` extracted `output[1]` (second tuple element) for capture
+- This was a fundamental mismatch: capturing a different tensor than steering!
+
+**vLLM Layer Output Format**
+- vLLM `Qwen2DecoderLayer.forward()` returns `(delta, residual)` tuple:
+  - `delta` (output[0]): Per-layer update (MLP/attention output)
+  - `residual` (output[1]): Running residual stream before delta applied
+- HuggingFace-equivalent hidden state = `residual + delta` (full state after layer)
+
+**Solution Implemented** (by codex reasoning agent)
+1. Updated `_extract_hidden_from_output()` to compute `residual + delta`
+   - Now returns full hidden state matching HuggingFace behavior
+2. Added `mode` parameter to `_transform_output()`:
+   - `mode="delta"`: Applies transform directly to delta (used for vector addition)
+   - `mode="hidden"`: Materializes full hidden state, transforms it, re-expresses as delta
+3. Steering operations now use appropriate modes:
+   - Vector addition: `mode="delta"` (direct addition to delta)
+   - Projection caps & ablations: `mode="hidden"` (transform full hidden state)
+
+**Verification**
+- All layers now show correct magnitude (std ~126.5) for prefill captures
+- HF vs vLLM comparison should now maintain high cosine similarity across layers (>0.999)
+
+**Test Files Created During Investigation**
+- Temporary diagnostic tests (cleaned up):
+  - `tests/test_multi_layer_capture_bug.py`
+  - `tests/test_capture_count.py`
+  - `tests/test_vllm_hf_layer_propagation.py`
+  - `tests/test_debug_layer_outputs.py`
+  - `tests/test_vllm_output_structure.py`
+  - `tests/test_debug_capture_mechanism.py`
+- Production tests (kept):
+  - `tests/test_vllm_hidden_state_capture.py` - Comprehensive capture functionality tests
+  - `tests/test_vllm_hf_hidden_state_diagnostics.py` - Deep HF/vLLM comparison
+  - `tests/test_vllm_hf_steering_parity.py` - Steering behavior parity tests
+
+**Key Learnings**
+- vLLM's residual stream architecture differs from HuggingFace's monolithic hidden states
+- Must carefully track whether operations work on deltas vs full states
+- Hidden state capture must materialize the same representation that downstream code expects
+- Decode vs prefill phases have different tensor shapes/magnitudes (both correct)

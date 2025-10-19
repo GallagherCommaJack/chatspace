@@ -858,3 +858,131 @@ class VLLMSteerModel(SteerableModel):
                 )
             worker_vectors.append(worker_map)
         return worker_vectors
+
+    def enable_hidden_state_capture(
+        self,
+        layer_idx: int | Sequence[int],
+        *,
+        capture_before: bool = True,
+        capture_after: bool = True,
+        max_captures: int | None = None,
+    ) -> None:
+        """Enable hidden state capture for debugging and analysis.
+
+        Captured states are stored on workers and can be retrieved via
+        :meth:`fetch_hidden_states`. States remain in memory until cleared
+        with :meth:`clear_hidden_states` or disabled with
+        :meth:`disable_hidden_state_capture`.
+
+        Parameters
+        ----------
+        layer_idx :
+            Layer index or sequence of indices to enable capture for.
+        capture_before :
+            Capture hidden states before steering is applied.
+        capture_after :
+            Capture hidden states after steering is applied.
+        max_captures :
+            Maximum number of capture entries per layer. ``None`` means unlimited.
+            When the limit is reached, new captures are ignored.
+
+        Examples
+        --------
+        >>> model.enable_hidden_state_capture(2, capture_before=True, capture_after=True)
+        >>> model.generate(["test prompt"], sampling_params)
+        >>> states = model.fetch_hidden_states()
+        >>> print(states[0][2][0]["before"].shape)  # worker 0, layer 2, first capture
+        """
+        indices = (
+            [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
+        )
+        for idx in indices:
+            if idx < 0 or idx >= self.layer_count:
+                raise ValueError(
+                    f"Layer index {idx} out of range for model with {self.layer_count} layers"
+                )
+            self._engine_client.collective_rpc(
+                steering_runtime.enable_hidden_state_capture,
+                args=(idx,),
+                kwargs={
+                    "capture_before": capture_before,
+                    "capture_after": capture_after,
+                    "max_captures": max_captures,
+                },
+            )
+
+    def disable_hidden_state_capture(
+        self, layer_idx: int | Sequence[int] | None = None
+    ) -> None:
+        """Disable hidden state capture for one or more layers.
+
+        This also clears any captured states for the affected layers.
+
+        Parameters
+        ----------
+        layer_idx :
+            Layer index, sequence of indices, or ``None`` to disable all layers.
+        """
+        if layer_idx is None:
+            self._engine_client.collective_rpc(
+                steering_runtime.disable_hidden_state_capture, args=(None,)
+            )
+        else:
+            indices = (
+                [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
+            )
+            for idx in indices:
+                self._engine_client.collective_rpc(
+                    steering_runtime.disable_hidden_state_capture, args=(idx,)
+                )
+
+    def fetch_hidden_states(
+        self, layer_idx: int | None = None
+    ) -> list[dict[int, list[dict[str, torch.Tensor]]]]:
+        """Retrieve captured hidden states from workers.
+
+        Returns a list of capture maps, one per worker. Each map is keyed by
+        layer index and contains a list of capture entries. Each entry has
+        ``"before"`` and/or ``"after"`` keys with CPU tensors.
+
+        Parameters
+        ----------
+        layer_idx :
+            Layer index to fetch, or ``None`` to fetch all layers.
+
+        Returns
+        -------
+        list[dict[int, list[dict[str, torch.Tensor]]]]
+            List of worker capture maps. Length equals the number of workers
+            (tensor parallel size).
+
+        Examples
+        --------
+        >>> model.enable_hidden_state_capture(2)
+        >>> model.generate(["test"], sampling_params)
+        >>> states = model.fetch_hidden_states(layer_idx=2)
+        >>> worker_0_captures = states[0][2]
+        >>> first_capture = worker_0_captures[0]
+        >>> before_steering = first_capture["before"]  # shape: [batch, seq_len, hidden_size]
+        >>> after_steering = first_capture["after"]
+        """
+        payloads = self._engine_client.collective_rpc(
+            steering_runtime.fetch_captured_hidden_states,
+            args=(layer_idx,) if layer_idx is not None else (),
+        )
+        return cast(list[dict[int, list[dict[str, torch.Tensor]]]], payloads)
+
+    def clear_hidden_states(self, layer_idx: int | None = None) -> None:
+        """Clear captured hidden states without disabling capture.
+
+        This frees memory while keeping capture enabled for future generations.
+
+        Parameters
+        ----------
+        layer_idx :
+            Layer index to clear, or ``None`` to clear all layers.
+        """
+        self._engine_client.collective_rpc(
+            steering_runtime.clear_captured_hidden_states,
+            args=(layer_idx,) if layer_idx is not None else (),
+        )

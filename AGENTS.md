@@ -45,3 +45,4 @@
 - Running via `uv run …` keeps the repo root on `sys.path`, so the worker-side `sitecustomize.py` patch installer triggers automatically before model load.
 - Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) for quick verification; expect steered logprobs to diverge only under eager execution.
 - Scratch notes belong in `TEMP_JOURNAL.md`; the file is gitignored, so keep the canonical log in `JOURNAL.md` once work stabilizes.
+- vLLM’s Qwen decoder layers fuse the RMSNorm with the skip connection and return `(mlp_delta, residual_before_mlp)`; to mirror HuggingFace captures you must add `delta + residual` when extracting the hidden state.
