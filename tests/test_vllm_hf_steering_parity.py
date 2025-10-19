@@ -581,3 +581,192 @@ def test_vllm_hf_high_magnitude_steering():
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_hf_high_magnitude_ablation_and_capping():
+    """Test that ablation and projection capping work correctly at high magnitudes.
+
+    This test validates that the dual-mode transform system (mode="hidden" for
+    ablations and caps) works correctly under aggressive steering conditions.
+    """
+    torch.manual_seed(123)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    downstream_layer = 5
+    prompt = "The capital of France is Paris, which is known for"
+
+    # Load HF model
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model.config.hidden_size
+
+    # HIGH MAGNITUDE: 10.0 for vector, wide range for projection cap
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 10.0
+    cap_direction = torch.randn(hidden_size, dtype=torch.float32)
+    ablation_direction = torch.randn(hidden_size, dtype=torch.float32)
+
+    # Extreme projection cap range and aggressive ablation
+    projection_spec = ProjectionCapParams(vector=cap_direction, min=-50.0, max=50.0)  # Wide range
+    ablation_spec = AblationParams(vector=ablation_direction, scale=0.1)  # Aggressive ablation (90% removal)
+
+    print(f"\nSteering vector norm: {torch.norm(steering_vector).item():.2f}")
+    print(f"Projection cap range: [{projection_spec.min}, {projection_spec.max}]")
+    print(f"Ablation scale: {ablation_spec.scale}")
+
+    # -------------------------------------------------------------------------
+    # HuggingFace path
+    # -------------------------------------------------------------------------
+    captured_hf_hiddens: dict[int, torch.Tensor] = {}
+
+    def make_hook(layer_idx: int):
+        def hook(module, _args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            orig_dtype = hidden.dtype
+            hidden_fp32 = hidden.to(torch.float32)
+
+            # Apply all steering operations only at target layer
+            if layer_idx == target_layer:
+                # Vector addition
+                hidden_fp32 = hidden_fp32 + steering_vector.to(device=hidden_fp32.device)
+
+                # Projection cap
+                unit_cap = _normalize(cap_direction).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
+                hidden_fp32 = _apply_projection_cap(
+                    hidden_fp32,
+                    unit_cap,
+                    minimum=projection_spec.min,
+                    maximum=projection_spec.max,
+                )
+
+                # Ablation
+                unit_ablation = _normalize(ablation_direction).to(device=hidden_fp32.device, dtype=hidden_fp32.dtype)
+                hidden_fp32 = _apply_ablation(hidden_fp32, unit_ablation, scale=ablation_spec.scale)
+
+            captured_hf_hiddens[layer_idx] = hidden_fp32.detach().cpu().clone()
+            hidden_out = hidden_fp32.to(dtype=orig_dtype)
+            if isinstance(output, tuple):
+                return (hidden_out,) + output[1:]
+            return hidden_out
+        return hook
+
+    # Install hooks on both layers
+    target_handle = hf_model.model.layers[target_layer].register_forward_hook(make_hook(target_layer))
+    downstream_handle = hf_model.model.layers[downstream_layer].register_forward_hook(make_hook(downstream_layer))
+
+    with torch.no_grad():
+        hf_model(**inputs)
+
+    target_handle.remove()
+    downstream_handle.remove()
+
+    hf_target_hidden = captured_hf_hiddens[target_layer]
+    hf_downstream_hidden = captured_hf_hiddens[downstream_layer]
+
+    # -------------------------------------------------------------------------
+    # vLLM path
+    # -------------------------------------------------------------------------
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float16",
+    )
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+
+    # Set high-magnitude steering operations
+    vllm_model.set_layer_vector(target_layer, steering_vector)
+    vllm_model.set_layer_projection_cap(
+        target_layer,
+        cap_direction,
+        min=projection_spec.min,
+        max=projection_spec.max,
+    )
+    vllm_model.set_layer_ablation(
+        target_layer,
+        ablation_direction,
+        scale=ablation_spec.scale,
+    )
+
+    # Enable capture on both layers
+    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+
+    try:
+        vllm_model.generate([prompt], sampling_params=sampling)
+
+        states = vllm_model.fetch_hidden_states()
+        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
+        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+
+        # -------------------------------------------------------------------------
+        # Comparison
+        # -------------------------------------------------------------------------
+        # Target layer
+        hf_target_flat = hf_target_hidden.reshape(-1)
+        vllm_target_flat = vllm_target_hidden.reshape(-1)
+        target_mae = torch.mean(torch.abs(vllm_target_flat - hf_target_flat)).item()
+        target_cos = F.cosine_similarity(hf_target_flat.unsqueeze(0), vllm_target_flat.unsqueeze(0), dim=-1).item()
+
+        # Downstream layer
+        hf_downstream_flat = hf_downstream_hidden.reshape(-1)
+        vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
+        downstream_mae = torch.mean(torch.abs(vllm_downstream_flat - hf_downstream_flat)).item()
+        downstream_cos = F.cosine_similarity(hf_downstream_flat.unsqueeze(0), vllm_downstream_flat.unsqueeze(0), dim=-1).item()
+
+        # Print statistics
+        hf_target_norm = torch.norm(hf_target_flat).item()
+        vllm_target_norm = torch.norm(vllm_target_flat).item()
+        hf_downstream_norm = torch.norm(hf_downstream_flat).item()
+        vllm_downstream_norm = torch.norm(vllm_downstream_flat).item()
+
+        print(f"\nTarget layer (vector + cap + ablation):")
+        print(f"  HF norm: {hf_target_norm:.2f}, vLLM norm: {vllm_target_norm:.2f}")
+        print(f"  Cosine similarity: {target_cos:.6f}")
+        print(f"  MAE: {target_mae:.6f}")
+
+        print(f"\nDownstream layer (all operations propagated):")
+        print(f"  HF norm: {hf_downstream_norm:.2f}, vLLM norm: {vllm_downstream_norm:.2f}")
+        print(f"  Cosine similarity: {downstream_cos:.6f}")
+        print(f"  MAE: {downstream_mae:.6f}")
+
+        # Assert high similarity even with aggressive ablation and capping
+        assert target_cos > 0.999, (
+            f"Target layer: Cosine similarity {target_cos:.6f} should be >0.999 "
+            f"even with high-magnitude vector + cap + ablation"
+        )
+        assert target_mae < 0.01, (
+            f"Target layer: MAE {target_mae:.6f} should be <0.01"
+        )
+
+        assert downstream_cos > 0.999, (
+            f"Downstream layer: Cosine similarity {downstream_cos:.6f} should be >0.999, "
+            f"indicating all operations propagate correctly"
+        )
+        assert downstream_mae < 0.01, (
+            f"Downstream layer: MAE {downstream_mae:.6f} should be <0.01"
+        )
+
+        print(f"\n✓ High-magnitude ablation and projection capping work correctly")
+
+    finally:
+        vllm_model.clear_all_vectors()
+        vllm_model.clear_layer_projection_cap(target_layer)
+        vllm_model.clear_layer_ablation(target_layer)
+        del vllm_model
+        del hf_model
+        torch.cuda.empty_cache()
