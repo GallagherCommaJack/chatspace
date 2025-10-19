@@ -427,3 +427,157 @@ def test_vllm_decode_steering_matches_hf_prefill():
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_hf_high_magnitude_steering():
+    """Test that steering works correctly at high magnitudes (10x).
+
+    This test validates that the fix works under aggressive steering conditions.
+    High-magnitude steering can expose bugs in residual stream handling that
+    might not be visible with subtle perturbations.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    downstream_layer = 5
+    prompt = "The quick brown fox jumps over the lazy dog."
+
+    # Load HF model
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model.config.hidden_size
+
+    # HIGH MAGNITUDE: 10.0 instead of 0.05-0.1
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 10.0
+
+    print(f"\nSteering vector magnitude: {torch.norm(steering_vector).item():.2f}")
+
+    # -------------------------------------------------------------------------
+    # HuggingFace path
+    # -------------------------------------------------------------------------
+    captured_hf_hiddens: dict[int, torch.Tensor] = {}
+
+    def make_hook(layer_idx: int):
+        def hook(module, _args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            orig_dtype = hidden.dtype
+            hidden_fp32 = hidden.to(torch.float32)
+
+            # Apply steering only at target layer
+            if layer_idx == target_layer:
+                hidden_fp32 = hidden_fp32 + steering_vector.to(device=hidden_fp32.device)
+
+            captured_hf_hiddens[layer_idx] = hidden_fp32.detach().cpu().clone()
+            hidden_out = hidden_fp32.to(dtype=orig_dtype)
+            if isinstance(output, tuple):
+                return (hidden_out,) + output[1:]
+            return hidden_out
+        return hook
+
+    # Install hooks on both layers
+    target_handle = hf_model.model.layers[target_layer].register_forward_hook(make_hook(target_layer))
+    downstream_handle = hf_model.model.layers[downstream_layer].register_forward_hook(make_hook(downstream_layer))
+
+    with torch.no_grad():
+        hf_model(**inputs)
+
+    target_handle.remove()
+    downstream_handle.remove()
+
+    hf_target_hidden = captured_hf_hiddens[target_layer]
+    hf_downstream_hidden = captured_hf_hiddens[downstream_layer]
+
+    # -------------------------------------------------------------------------
+    # vLLM path
+    # -------------------------------------------------------------------------
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float16",
+    )
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+
+    # Set high-magnitude steering vector
+    vllm_model.set_layer_vector(target_layer, steering_vector)
+
+    # Enable capture on both layers
+    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+
+    try:
+        vllm_model.generate([prompt], sampling_params=sampling)
+
+        states = vllm_model.fetch_hidden_states()
+        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
+        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+
+        # -------------------------------------------------------------------------
+        # Comparison
+        # -------------------------------------------------------------------------
+        # Target layer
+        hf_target_flat = hf_target_hidden.reshape(-1)
+        vllm_target_flat = vllm_target_hidden.reshape(-1)
+        target_mae = torch.mean(torch.abs(vllm_target_flat - hf_target_flat)).item()
+        target_cos = F.cosine_similarity(hf_target_flat.unsqueeze(0), vllm_target_flat.unsqueeze(0), dim=-1).item()
+
+        # Downstream layer
+        hf_downstream_flat = hf_downstream_hidden.reshape(-1)
+        vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
+        downstream_mae = torch.mean(torch.abs(vllm_downstream_flat - hf_downstream_flat)).item()
+        downstream_cos = F.cosine_similarity(hf_downstream_flat.unsqueeze(0), vllm_downstream_flat.unsqueeze(0), dim=-1).item()
+
+        # Print statistics
+        hf_target_norm = torch.norm(hf_target_flat).item()
+        vllm_target_norm = torch.norm(vllm_target_flat).item()
+        hf_downstream_norm = torch.norm(hf_downstream_flat).item()
+        vllm_downstream_norm = torch.norm(vllm_downstream_flat).item()
+
+        print(f"\nTarget layer (where steering is applied):")
+        print(f"  HF norm: {hf_target_norm:.2f}, vLLM norm: {vllm_target_norm:.2f}")
+        print(f"  Cosine similarity: {target_cos:.6f}")
+        print(f"  MAE: {target_mae:.6f}")
+
+        print(f"\nDownstream layer (steering propagated):")
+        print(f"  HF norm: {hf_downstream_norm:.2f}, vLLM norm: {vllm_downstream_norm:.2f}")
+        print(f"  Cosine similarity: {downstream_cos:.6f}")
+        print(f"  MAE: {downstream_mae:.6f}")
+
+        # Assert high similarity even at high magnitude
+        assert target_cos > 0.999, (
+            f"Target layer: Cosine similarity {target_cos:.6f} should be >0.999 even at high magnitude"
+        )
+        assert target_mae < 0.01, (
+            f"Target layer: MAE {target_mae:.6f} should be <0.01"
+        )
+
+        assert downstream_cos > 0.999, (
+            f"Downstream layer: Cosine similarity {downstream_cos:.6f} should be >0.999, "
+            f"indicating steering propagates correctly even at high magnitude"
+        )
+        assert downstream_mae < 0.01, (
+            f"Downstream layer: MAE {downstream_mae:.6f} should be <0.01"
+        )
+
+        print(f"\n✓ High-magnitude steering (10x) works correctly at target and downstream layers")
+
+    finally:
+        vllm_model.clear_all_vectors()
+        del vllm_model
+        del hf_model
+        torch.cuda.empty_cache()
