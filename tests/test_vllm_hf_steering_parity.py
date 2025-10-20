@@ -920,3 +920,158 @@ def test_vllm_hf_multi_magnitude_steering():
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_hf_high_precision_steering():
+    """Test steering with float32 precision to check for subtle numerical issues.
+
+    If there's a bug in the residual stream handling, running both models in
+    higher precision should still show errors. If errors decrease significantly,
+    it suggests the implementation is correct but precision-limited.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    downstream_layer = 5
+    prompt = "The meaning of life is"
+
+    # Load HF model in FLOAT32
+    print("\nLoading models in float32 precision...")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32,  # FLOAT32 instead of float16
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model.config.hidden_size
+
+    # Normal magnitude steering
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 1.0
+
+    print(f"Steering vector norm: {torch.norm(steering_vector).item():.2f}")
+
+    # -------------------------------------------------------------------------
+    # HuggingFace path (float32)
+    # -------------------------------------------------------------------------
+    captured_hf_hiddens: dict[int, torch.Tensor] = {}
+
+    def make_hook(layer_idx: int):
+        def hook(module, _args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            # Already float32, no conversion needed
+
+            # Apply steering only at target layer
+            if layer_idx == target_layer:
+                hidden = hidden + steering_vector.to(device=hidden.device)
+
+            captured_hf_hiddens[layer_idx] = hidden.detach().cpu().clone()
+
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+        return hook
+
+    # Install hooks on both layers
+    target_handle = hf_model.model.layers[target_layer].register_forward_hook(make_hook(target_layer))
+    downstream_handle = hf_model.model.layers[downstream_layer].register_forward_hook(make_hook(downstream_layer))
+
+    with torch.no_grad():
+        hf_model(**inputs)
+
+    target_handle.remove()
+    downstream_handle.remove()
+
+    hf_target_hidden = captured_hf_hiddens[target_layer]
+    hf_downstream_hidden = captured_hf_hiddens[downstream_layer]
+
+    # -------------------------------------------------------------------------
+    # vLLM path (float32)
+    # -------------------------------------------------------------------------
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.1,  # Slightly more memory for float32
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float32",  # FLOAT32 instead of float16
+    )
+    vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+
+    # Set steering vector
+    vllm_model.set_layer_vector(target_layer, steering_vector)
+
+    # Enable capture on both layers
+    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+
+    try:
+        vllm_model.generate([prompt], sampling_params=sampling)
+
+        states = vllm_model.fetch_hidden_states()
+        vllm_target_hidden = states[0][target_layer][0]["after"]
+        vllm_downstream_hidden = states[0][downstream_layer][0]["after"]
+
+        # -------------------------------------------------------------------------
+        # Comparison (everything in float32)
+        # -------------------------------------------------------------------------
+        # Target layer
+        hf_target_flat = hf_target_hidden.reshape(-1)
+        vllm_target_flat = vllm_target_hidden.reshape(-1)
+        target_mae = torch.mean(torch.abs(vllm_target_flat - hf_target_flat)).item()
+        target_cos = F.cosine_similarity(hf_target_flat.unsqueeze(0), vllm_target_flat.unsqueeze(0), dim=-1).item()
+        target_max_diff = torch.max(torch.abs(vllm_target_flat - hf_target_flat)).item()
+
+        # Downstream layer
+        hf_downstream_flat = hf_downstream_hidden.reshape(-1)
+        vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
+        downstream_mae = torch.mean(torch.abs(vllm_downstream_flat - hf_downstream_flat)).item()
+        downstream_cos = F.cosine_similarity(hf_downstream_flat.unsqueeze(0), vllm_downstream_flat.unsqueeze(0), dim=-1).item()
+        downstream_max_diff = torch.max(torch.abs(vllm_downstream_flat - hf_downstream_flat)).item()
+
+        print(f"\nTarget layer (float32 precision):")
+        print(f"  Cosine similarity: {target_cos:.12f}")
+        print(f"  MAE: {target_mae:.12f}")
+        print(f"  Max diff: {target_max_diff:.12f}")
+
+        print(f"\nDownstream layer (float32 precision):")
+        print(f"  Cosine similarity: {downstream_cos:.12f}")
+        print(f"  MAE: {downstream_mae:.12f}")
+        print(f"  Max diff: {downstream_max_diff:.12f}")
+
+        # With float32, errors should be MUCH smaller if implementation is correct
+        # If MAE is still ~0.001-0.003, something might be wrong
+        print(f"\n{'='*60}")
+        if target_mae < 1e-5 and downstream_mae < 1e-5:
+            print("✓ Excellent: MAE < 1e-5 in float32")
+            print("  This suggests the implementation is correct and float16")
+            print("  precision was the limiting factor.")
+        elif target_mae < 1e-4:
+            print("⚠ Good but not perfect: MAE ~1e-4 to 1e-5")
+            print("  Implementation likely correct, but check for subtle issues.")
+        else:
+            print(f"⚠ WARNING: MAE still high ({target_mae:.6e}) in float32!")
+            print("  This suggests there may be a bug in the implementation.")
+        print(f"{'='*60}")
+
+        # More lenient assertion for float32 - should be near machine precision
+        assert target_cos > 0.99999, (
+            f"Target layer: Cosine similarity {target_cos:.12f} should be >0.99999 in float32"
+        )
+        assert downstream_cos > 0.99999, (
+            f"Downstream layer: Cosine similarity {downstream_cos:.12f} should be >0.99999 in float32"
+        )
+
+    finally:
+        vllm_model.clear_all_vectors()
+        del vllm_model
+        del hf_model
+        torch.cuda.empty_cache()
