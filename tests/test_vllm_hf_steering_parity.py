@@ -1075,3 +1075,197 @@ def test_vllm_hf_high_precision_steering():
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_delta_vs_residual_numerics():
+    """Compare numerical precision of adding steering to delta vs residual.
+
+    Tests both float16 and bfloat16, comparing delta vs residual approaches.
+    Uses float32 HuggingFace as ground truth for all comparisons.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    downstream_layer = 5
+    prompt = "The quick brown fox"
+
+    # -------------------------------------------------------------------------
+    # Ground truth: Float32 HuggingFace
+    # -------------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("Getting float32 HuggingFace ground truth...")
+    print("="*70)
+    
+    hf_model_fp32 = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model_fp32.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model_fp32.config.hidden_size
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 1.0
+
+    captured_ground_truth: dict[int, torch.Tensor] = {}
+
+    def make_hook_fp32(layer_idx: int):
+        def hook(module, _args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            if layer_idx == target_layer:
+                hidden = hidden + steering_vector.to(device=hidden.device)
+            captured_ground_truth[layer_idx] = hidden.detach().cpu().clone()
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+        return hook
+
+    target_handle = hf_model_fp32.model.layers[target_layer].register_forward_hook(make_hook_fp32(target_layer))
+    downstream_handle = hf_model_fp32.model.layers[downstream_layer].register_forward_hook(make_hook_fp32(downstream_layer))
+
+    with torch.no_grad():
+        hf_model_fp32(**inputs)
+
+    target_handle.remove()
+    downstream_handle.remove()
+
+    ground_truth_target = captured_ground_truth[target_layer]
+    ground_truth_downstream = captured_ground_truth[downstream_layer]
+
+    del hf_model_fp32
+    torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # Test both dtypes and both approaches
+    # -------------------------------------------------------------------------
+    from chatspace.vllm_steering import runtime as steering_runtime
+    original_apply_vector = steering_runtime._apply_vector_to_output
+
+    def _apply_vector_to_residual(output, vector):
+        """Alternative: add to RESIDUAL instead of delta."""
+        if isinstance(output, tuple) and len(output) >= 2:
+            delta, residual = output[0], output[1]
+            if isinstance(delta, torch.Tensor) and isinstance(residual, torch.Tensor):
+                new_residual = residual + vector
+                return (delta, new_residual) + output[2:]
+        return original_apply_vector(output, vector)
+
+    results = {}
+    dtypes = ["float16", "bfloat16"]
+    approaches = [("delta", original_apply_vector), ("residual", _apply_vector_to_residual)]
+
+    for dtype_name in dtypes:
+        for approach_name, apply_fn in approaches:
+            test_name = f"{dtype_name}_{approach_name}"
+            print(f"\nTesting {dtype_name} with add-to-{approach_name}...")
+
+            # Monkey-patch the apply function
+            steering_runtime._apply_vector_to_output = apply_fn
+
+            try:
+                vllm_cfg = VLLMSteeringConfig(
+                    model_name=model_name,
+                    tensor_parallel_size=1,
+                    gpu_memory_utilization=0.05,
+                    max_model_len=inputs.input_ids.shape[1] + 16,
+                    dtype=dtype_name,
+                )
+                vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
+                vllm_model.set_layer_vector(target_layer, steering_vector)
+                vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
+
+                sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+                vllm_model.generate([prompt], sampling_params=sampling)
+
+                states = vllm_model.fetch_hidden_states()
+                target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
+                downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+
+                # Compute errors vs ground truth
+                target_error = torch.mean(torch.abs(target_hidden.reshape(-1) - ground_truth_target.reshape(-1))).item()
+                downstream_error = torch.mean(torch.abs(downstream_hidden.reshape(-1) - ground_truth_downstream.reshape(-1))).item()
+                avg_error = (target_error + downstream_error) / 2
+
+                results[test_name] = {
+                    "target_error": target_error,
+                    "downstream_error": downstream_error,
+                    "avg_error": avg_error,
+                }
+
+                vllm_model.clear_all_vectors()
+                del vllm_model
+                torch.cuda.empty_cache()
+
+            finally:
+                # Restore original
+                steering_runtime._apply_vector_to_output = original_apply_vector
+
+    # -------------------------------------------------------------------------
+    # Print comparison results
+    # -------------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("RESULTS: Error vs float32 HuggingFace ground truth")
+    print("="*70)
+
+    for dtype_name in dtypes:
+        print(f"\n{dtype_name.upper()}:")
+        delta_result = results[f"{dtype_name}_delta"]
+        residual_result = results[f"{dtype_name}_residual"]
+
+        print(f"  Add to DELTA (current):")
+        print(f"    Target:     {delta_result['target_error']:.6e}")
+        print(f"    Downstream: {delta_result['downstream_error']:.6e}")
+        print(f"    Average:    {delta_result['avg_error']:.6e}")
+
+        print(f"  Add to RESIDUAL (alternative):")
+        print(f"    Target:     {residual_result['target_error']:.6e}")
+        print(f"    Downstream: {residual_result['downstream_error']:.6e}")
+        print(f"    Average:    {residual_result['avg_error']:.6e}")
+
+        if residual_result['avg_error'] < delta_result['avg_error'] * 0.95:
+            improvement = (delta_result['avg_error'] - residual_result['avg_error']) / delta_result['avg_error'] * 100
+            print(f"  → RESIDUAL is better by {improvement:.1f}%")
+        elif delta_result['avg_error'] < residual_result['avg_error'] * 0.95:
+            improvement = (residual_result['avg_error'] - delta_result['avg_error']) / residual_result['avg_error'] * 100
+            print(f"  → DELTA is better by {improvement:.1f}%")
+        else:
+            print(f"  → Similar precision")
+
+    print("\n" + "="*70)
+    print("SUMMARY:")
+    print("="*70)
+
+    # Find best overall
+    best_name = min(results.keys(), key=lambda k: results[k]['avg_error'])
+    best_error = results[best_name]['avg_error']
+
+    print(f"Best configuration: {best_name}")
+    print(f"  Average error: {best_error:.6e}")
+
+    # Compare dtypes
+    fp16_best = min(results[f"float16_{a}"]["avg_error"] for a, _ in approaches)
+    bf16_best = min(results[f"bfloat16_{a}"]["avg_error"] for a, _ in approaches)
+
+    print(f"\nBest by dtype:")
+    print(f"  float16:  {fp16_best:.6e}")
+    print(f"  bfloat16: {bf16_best:.6e}")
+
+    if bf16_best < fp16_best * 0.95:
+        improvement = (fp16_best - bf16_best) / fp16_best * 100
+        print(f"  → bfloat16 is better by {improvement:.1f}%")
+    elif fp16_best < bf16_best * 0.95:
+        improvement = (bf16_best - fp16_best) / bf16_best * 100
+        print(f"  → float16 is better by {improvement:.1f}%")
+    else:
+        print(f"  → Similar precision")
+
+    print("="*70)
