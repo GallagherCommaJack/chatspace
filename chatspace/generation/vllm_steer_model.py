@@ -349,7 +349,7 @@ class VLLMSteerModel(SteerableModel):
     ) -> None:
         payload = {
             "vector": steering_runtime.serialize_tensor(
-                spec.vector.to(dtype=self._vector_dtype)
+                spec.vector.to(dtype=torch.float32)
             ),
             "min": spec.min,
             "max": spec.max,
@@ -467,6 +467,22 @@ class VLLMSteerModel(SteerableModel):
         if layer_spec is None or layer_spec.projection_cap is None:
             return None
         return layer_spec.projection_cap.clone()
+
+    def set_projection_cap_precision(
+        self, dtype: torch.dtype | str | None
+    ) -> None:
+        """Override the working precision used for projection cap math."""
+        if dtype is None:
+            dtype_name: str | None = None
+        elif isinstance(dtype, torch.dtype):
+            dtype_name = str(dtype).removeprefix("torch.")
+        elif isinstance(dtype, str):
+            dtype_name = dtype.removeprefix("torch.")
+        else:
+            raise TypeError("dtype must be a torch.dtype, string, or None.")
+        self._engine_client.collective_rpc(
+            steering_runtime.set_projection_cap_precision, args=(dtype_name,)
+        )
 
     def set_layer_ablation(
         self,

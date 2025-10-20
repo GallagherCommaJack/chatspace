@@ -1269,3 +1269,752 @@ def test_delta_vs_residual_numerics():
         print(f"  → Similar precision")
 
     print("="*70)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_delta_vs_residual_instrumented():
+    """Instrument code paths to verify delta vs residual approaches are actually different.
+    
+    The previous test showed identical results, but we need to verify we're actually
+    hitting different code paths and that the steering is being applied correctly.
+    """
+    torch.manual_seed(42)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 4
+    prompt = "The quick brown"
+
+    # Get HF ground truth
+    hf_model_fp32 = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float32, device_map="cuda", attn_implementation="eager"
+    )
+    hf_model_fp32.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model_fp32.config.hidden_size
+    steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 1.0
+
+    captured_hf = None
+    def hf_hook(module, args, output):
+        nonlocal captured_hf
+        hidden = output[0] if isinstance(output, tuple) else output
+        hidden = hidden + steering_vector.to(device=hidden.device)
+        captured_hf = hidden.detach().cpu().clone()
+        if isinstance(output, tuple):
+            return (hidden,) + output[1:]
+        return hidden
+
+    handle = hf_model_fp32.model.layers[target_layer].register_forward_hook(hf_hook)
+    with torch.no_grad():
+        hf_model_fp32(**inputs)
+    handle.remove()
+
+    print(f"\nHF ground truth: shape={captured_hf.shape}, mean={captured_hf.mean().item():.6f}, norm={torch.norm(captured_hf).item():.2f}")
+
+    del hf_model_fp32
+    torch.cuda.empty_cache()
+
+    # Test vLLM with instrumentation
+    from chatspace.vllm_steering import runtime as steering_runtime
+
+    original_apply = steering_runtime._apply_vector_to_output
+    call_logs = []
+
+    def instrumented_apply(approach_name):
+        def wrapped(output, vector):
+            if isinstance(output, tuple) and len(output) >= 2:
+                delta, residual = output[0], output[1]
+                log_entry = {
+                    "approach": approach_name,
+                    "delta_mean": delta.mean().item(),
+                    "residual_mean": residual.mean().item(),
+                    "vector_norm": torch.norm(vector).item(),
+                }
+                
+                if approach_name == "delta":
+                    result = original_apply(output, vector)
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        log_entry["modified_delta_mean"] = result[0].mean().item()
+                        log_entry["modified_residual_mean"] = result[1].mean().item()
+                        log_entry["delta_changed"] = abs(result[0].mean().item() - delta.mean().item()) > 1e-6
+                        log_entry["residual_changed"] = abs(result[1].mean().item() - residual.mean().item()) > 1e-6
+                else:  # residual
+                    new_residual = residual + vector
+                    result = (delta, new_residual) + output[2:]
+                    log_entry["modified_delta_mean"] = delta.mean().item()
+                    log_entry["modified_residual_mean"] = new_residual.mean().item()
+                    log_entry["delta_changed"] = False
+                    log_entry["residual_changed"] = True
+                
+                call_logs.append(log_entry)
+                return result
+            return original_apply(output, vector)
+        return wrapped
+
+    results = {}
+    for approach_name in ["delta", "residual"]:
+        call_logs.clear()
+        steering_runtime._apply_vector_to_output = instrumented_apply(approach_name)
+
+        try:
+            vllm_cfg = VLLMSteeringConfig(
+                model_name=model_name, tensor_parallel_size=1, gpu_memory_utilization=0.05,
+                max_model_len=inputs.input_ids.shape[1] + 16, dtype="float32"
+            )
+            vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
+            vllm_model.set_layer_vector(target_layer, steering_vector)
+            vllm_model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
+
+            sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+            vllm_model.generate([prompt], sampling_params=sampling)
+
+            states = vllm_model.fetch_hidden_states()
+            hidden = states[0][target_layer][0]["after"]
+
+            results[approach_name] = {
+                "hidden": hidden,
+                "call_count": len(call_logs),
+                "call_logs": call_logs.copy(),
+            }
+
+            print(f"\n{approach_name.upper()} approach:")
+            print(f"  Steering calls: {len(call_logs)}")
+            print(f"  Hidden: shape={hidden.shape}, mean={hidden.mean().item():.6f}, norm={torch.norm(hidden).item():.2f}")
+            
+            for i, log in enumerate(call_logs):
+                print(f"  Call {i+1}: delta_changed={log['delta_changed']}, residual_changed={log['residual_changed']}")
+
+            error = torch.mean(torch.abs(hidden.cpu() - captured_hf)).item()
+            results[approach_name]["error_vs_hf"] = error
+            print(f"  Error vs HF: {error:.6e}")
+
+            vllm_model.clear_all_vectors()
+            del vllm_model
+            torch.cuda.empty_cache()
+
+        finally:
+            steering_runtime._apply_vector_to_output = original_apply
+
+    # Compare approaches
+    delta_hidden = results["delta"]["hidden"]
+    residual_hidden = results["residual"]["hidden"]
+    diff = torch.mean(torch.abs(delta_hidden.cpu() - residual_hidden.cpu())).item()
+
+    print(f"\n{'='*70}")
+    print(f"Difference between delta vs residual approaches: {diff:.6e}")
+    
+    # Check if they're actually hitting different code paths
+    delta_modified_delta = any(log["delta_changed"] for log in results["delta"]["call_logs"])
+    delta_modified_residual = any(log["residual_changed"] for log in results["delta"]["call_logs"])
+    residual_modified_delta = any(log["delta_changed"] for log in results["residual"]["call_logs"])
+    residual_modified_residual = any(log["residual_changed"] for log in results["residual"]["call_logs"])
+
+    print(f"\nCode path verification:")
+    print(f"  Delta approach:    modified delta={delta_modified_delta}, modified residual={delta_modified_residual}")
+    print(f"  Residual approach: modified delta={residual_modified_delta}, modified residual={residual_modified_residual}")
+
+    if delta_modified_delta and not delta_modified_residual and not residual_modified_delta and residual_modified_residual:
+        print(f"  ✓ Code paths are DIFFERENT (as intended)")
+    else:
+        print(f"  ⚠ WARNING: Code paths may not be what we expect!")
+
+    print(f"{'='*70}")
+
+    # They should be mathematically equivalent
+    assert diff < 1e-5, f"Delta and residual should give same results, got diff={diff:.6e}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_vllm_hf_multi_layer_steering_float32():
+    """Test multi-layer steering in float32 to verify logic correctness.
+
+    This test addresses real-world observations of performance degradation that gets worse
+    with more layers (and collapses with every-layer steering). We use float32 to eliminate
+    numerical precision as a confounding factor and focus on logic correctness.
+
+    We validate:
+    1. Multiple consecutive steered layers (3, 4, 5, 6)
+    2. Downstream propagation (check layers 7, 8 which are 2+ layers beyond last steered layer)
+    3. Both multi-layer and every-layer steering scenarios
+    """
+    torch.manual_seed(789)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    prompt = "The nature of consciousness and the boundaries between"
+
+    # Load HF model in float32
+    print("\n" + "="*70)
+    print("Loading HuggingFace model in float32...")
+    print("="*70)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    hidden_size = hf_model.config.hidden_size
+    num_layers = hf_model.config.num_hidden_layers
+
+    # Test 1: Steer on layers 3, 4, 5, 6 (4 consecutive mid-layers)
+    print("\n" + "="*70)
+    print("Test 1: Multi-layer steering (layers 3, 4, 5, 6)")
+    print("="*70)
+
+    steered_layers = [3, 4, 5, 6]
+    downstream_layers = [7, 8]  # Check 2 layers beyond last steered layer
+    all_check_layers = steered_layers + downstream_layers
+
+    # Create independent steering vectors for each layer
+    steering_vectors = {}
+    for layer_idx in steered_layers:
+        steering_vectors[layer_idx] = torch.randn(hidden_size, dtype=torch.float32) * 0.1
+
+    # HF: Install hooks on all layers we want to check
+    hf_captured = {layer: None for layer in all_check_layers}
+
+    def make_hf_hook(layer_idx: int):
+        def hook(module, args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            # Apply steering if this is a steered layer
+            if layer_idx in steering_vectors:
+                hidden = hidden + steering_vectors[layer_idx].to(device=hidden.device, dtype=hidden.dtype)
+            # Capture for comparison
+            hf_captured[layer_idx] = hidden.detach().cpu().clone()
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+        return hook
+
+    handles = []
+    for layer_idx in all_check_layers:
+        handle = hf_model.model.layers[layer_idx].register_forward_hook(make_hf_hook(layer_idx))
+        handles.append(handle)
+
+    with torch.no_grad():
+        hf_model(**inputs)
+
+    for handle in handles:
+        handle.remove()
+
+    print("\nHuggingFace results:")
+    for layer_idx in all_check_layers:
+        captured = hf_captured[layer_idx]
+        print(f"  Layer {layer_idx}: shape={captured.shape}, mean={captured.mean().item():.6f}, "
+              f"std={captured.std().item():.6f}, norm={torch.norm(captured).item():.2f}")
+
+    # Clean up HF model
+    del hf_model
+    torch.cuda.empty_cache()
+
+    # vLLM: Set up model with steering
+    print("\n" + "="*70)
+    print("Loading vLLM model in float32...")
+    print("="*70)
+
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.3,
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float32",
+    )
+
+    vllm_model = VLLMSteerModel(
+        vllm_cfg,
+        enforce_eager=True,
+        bootstrap_layers=tuple(all_check_layers),
+    )
+
+    # Apply steering vectors to each layer
+    for layer_idx, vector in steering_vectors.items():
+        vllm_model.set_layer_vector(layer_idx, vector)
+
+    # Enable capture on all layers we want to check
+    for layer_idx in all_check_layers:
+        vllm_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+    vllm_model.generate([prompt], sampling_params=sampling)
+
+    states = vllm_model.fetch_hidden_states()
+
+    print("\nvLLM results:")
+    for layer_idx in all_check_layers:
+        vllm_hidden = states[0][layer_idx][0]["after"]
+        print(f"  Layer {layer_idx}: shape={vllm_hidden.shape}, mean={vllm_hidden.mean().item():.6f}, "
+              f"std={vllm_hidden.std().item():.6f}, norm={torch.norm(vllm_hidden).item():.2f}")
+
+    # Compare HF vs vLLM for all layers
+    print("\n" + "="*70)
+    print("Multi-layer steering comparison (HF vs vLLM):")
+    print("="*70)
+
+    all_pass = True
+    for layer_idx in all_check_layers:
+        hf_hidden = hf_captured[layer_idx]
+        vllm_hidden = states[0][layer_idx][0]["after"]
+
+        cos_sim = F.cosine_similarity(
+            hf_hidden.flatten().unsqueeze(0),
+            vllm_hidden.cpu().flatten().unsqueeze(0),
+        ).item()
+
+        mae = torch.mean(torch.abs(vllm_hidden.cpu() - hf_hidden)).item()
+        max_diff = torch.max(torch.abs(vllm_hidden.cpu() - hf_hidden)).item()
+
+        is_steered = layer_idx in steered_layers
+        is_downstream = layer_idx in downstream_layers
+
+        layer_type = "STEERED" if is_steered else "DOWNSTREAM"
+        print(f"\nLayer {layer_idx} ({layer_type}):")
+        print(f"  Cosine similarity: {cos_sim:.9f}")
+        print(f"  MAE: {mae:.6e}")
+        print(f"  Max diff: {max_diff:.6e}")
+
+        # Stricter threshold for float32
+        threshold = 0.99999
+        if cos_sim < threshold:
+            print(f"  ❌ FAIL: cosine similarity {cos_sim:.9f} < {threshold}")
+            all_pass = False
+        else:
+            print(f"  ✓ PASS: cosine similarity {cos_sim:.9f} >= {threshold}")
+
+    vllm_model.clear_all_vectors()
+    del vllm_model
+    torch.cuda.empty_cache()
+
+    print("\n" + "="*70)
+    if all_pass:
+        print("✓ Multi-layer steering: ALL LAYERS PASS")
+    else:
+        print("❌ Multi-layer steering: SOME LAYERS FAILED")
+    print("="*70)
+
+    # Test 2: Steer on EVERY layer (stress test to reproduce collapse)
+    print("\n" + "="*70)
+    print("Test 2: Every-layer steering (stress test)")
+    print("="*70)
+
+    # Only test on a subset of layers due to memory constraints
+    every_layer_test_layers = list(range(0, min(10, num_layers)))  # First 10 layers
+    downstream_for_every = [10, 11]  # Check downstream propagation
+    all_every_check = every_layer_test_layers + downstream_for_every
+
+    print(f"Steering layers: {every_layer_test_layers}")
+    print(f"Checking downstream: {downstream_for_every}")
+
+    # Create steering vectors for every layer
+    every_layer_vectors = {}
+    for layer_idx in every_layer_test_layers:
+        every_layer_vectors[layer_idx] = torch.randn(hidden_size, dtype=torch.float32) * 0.1
+
+    # Load HF model again
+    print("\nLoading HuggingFace model...")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32,
+        device_map="cuda",
+        attn_implementation="eager",
+    )
+    hf_model.eval()
+
+    # HF: Install hooks
+    hf_every_captured = {layer: None for layer in all_every_check}
+
+    def make_every_hf_hook(layer_idx: int):
+        def hook(module, args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            if layer_idx in every_layer_vectors:
+                hidden = hidden + every_layer_vectors[layer_idx].to(device=hidden.device, dtype=hidden.dtype)
+            hf_every_captured[layer_idx] = hidden.detach().cpu().clone()
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+        return hook
+
+    handles = []
+    for layer_idx in all_every_check:
+        handle = hf_model.model.layers[layer_idx].register_forward_hook(make_every_hf_hook(layer_idx))
+        handles.append(handle)
+
+    with torch.no_grad():
+        hf_model(**inputs)
+
+    for handle in handles:
+        handle.remove()
+
+    print("\nHuggingFace results (sample layers):")
+    for layer_idx in [0, 5, 9, 10, 11]:
+        if layer_idx in hf_every_captured and hf_every_captured[layer_idx] is not None:
+            captured = hf_every_captured[layer_idx]
+            print(f"  Layer {layer_idx}: mean={captured.mean().item():.6f}, "
+                  f"norm={torch.norm(captured).item():.2f}")
+
+    del hf_model
+    torch.cuda.empty_cache()
+
+    # vLLM: Every-layer steering
+    print("\nLoading vLLM model...")
+    vllm_cfg_every = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.3,
+        max_model_len=inputs.input_ids.shape[1] + 16,
+        dtype="float32",
+    )
+
+    vllm_every_model = VLLMSteerModel(
+        vllm_cfg_every,
+        enforce_eager=True,
+        bootstrap_layers=tuple(all_every_check),
+    )
+
+    # Apply steering to every layer
+    for layer_idx, vector in every_layer_vectors.items():
+        vllm_every_model.set_layer_vector(layer_idx, vector)
+
+    # Enable capture
+    for layer_idx in all_every_check:
+        vllm_every_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
+
+    vllm_every_model.generate([prompt], sampling_params=sampling)
+    states_every = vllm_every_model.fetch_hidden_states()
+
+    print("\nvLLM results (sample layers):")
+    for layer_idx in [0, 5, 9, 10, 11]:
+        if layer_idx in all_every_check:
+            vllm_hidden = states_every[0][layer_idx][0]["after"]
+            print(f"  Layer {layer_idx}: mean={vllm_hidden.mean().item():.6f}, "
+                  f"norm={torch.norm(vllm_hidden).item():.2f}")
+
+    # Compare key layers
+    print("\n" + "="*70)
+    print("Every-layer steering comparison (HF vs vLLM):")
+    print("="*70)
+
+    every_pass = True
+    for layer_idx in all_every_check:
+        hf_hidden = hf_every_captured[layer_idx]
+        vllm_hidden = states_every[0][layer_idx][0]["after"]
+
+        cos_sim = F.cosine_similarity(
+            hf_hidden.flatten().unsqueeze(0),
+            vllm_hidden.cpu().flatten().unsqueeze(0),
+        ).item()
+
+        mae = torch.mean(torch.abs(vllm_hidden.cpu() - hf_hidden)).item()
+
+        is_steered = layer_idx in every_layer_vectors
+        is_downstream = layer_idx in downstream_for_every
+
+        layer_type = "STEERED" if is_steered else "DOWNSTREAM"
+        print(f"\nLayer {layer_idx} ({layer_type}):")
+        print(f"  Cosine similarity: {cos_sim:.9f}")
+        print(f"  MAE: {mae:.6e}")
+
+        if cos_sim < 0.99999:
+            print(f"  ❌ FAIL")
+            every_pass = False
+        else:
+            print(f"  ✓ PASS")
+
+    vllm_every_model.clear_all_vectors()
+    del vllm_every_model
+    torch.cuda.empty_cache()
+
+    print("\n" + "="*70)
+    if every_pass:
+        print("✓ Every-layer steering: ALL LAYERS PASS")
+    else:
+        print("❌ Every-layer steering: SOME LAYERS FAILED")
+    print("="*70)
+
+    # Overall assertion
+    assert all_pass, "Multi-layer steering test failed - some layers showed divergence"
+    assert every_pass, "Every-layer steering test failed - some layers showed divergence"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_bf16_degradation_hf_vs_vllm():
+    """Compare bfloat16 degradation patterns between HuggingFace and vLLM.
+
+    This test measures how numerical errors accumulate differently in HF vs vLLM
+    as we increase the number of steered layers. We use float32 HF as ground truth
+    and measure MAE for both bf16 implementations across different layer counts.
+
+    Expected: If vLLM degrades worse, this reveals amplification in our steering path.
+    """
+    torch.manual_seed(999)
+
+    model_name = "Qwen/Qwen3-0.6B"
+    prompt = "In the depths of computational theory and practice"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    # Get model config
+    print("\n" + "="*70)
+    print("Loading config to determine architecture...")
+    print("="*70)
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_name)
+    hidden_size = config.hidden_size
+    num_layers = config.num_hidden_layers
+    print(f"Model: {num_layers} layers, hidden_size={hidden_size}")
+
+    # Test configurations: increasing layer counts
+    layer_configs = [
+        {"name": "1_layer", "layers": [10]},
+        {"name": "4_layers", "layers": [8, 9, 10, 11]},
+        {"name": "10_layers", "layers": list(range(5, 15))},
+        {"name": "all_layers", "layers": list(range(num_layers))},
+    ]
+
+    results = {
+        "config": [],
+        "num_steered": [],
+        "check_layer": [],
+        "hf_bf16_mae": [],
+        "vllm_bf16_mae": [],
+        "hf_bf16_cos": [],
+        "vllm_bf16_cos": [],
+    }
+
+    for config_idx, layer_config in enumerate(layer_configs):
+        config_name = layer_config["name"]
+        steered_layers = layer_config["layers"]
+        # Check the last steered layer and 2 layers downstream
+        check_layer = max(steered_layers) + 2
+        if check_layer >= num_layers:
+            check_layer = num_layers - 1
+
+        print(f"\n{'='*70}")
+        print(f"Config {config_idx+1}/{len(layer_configs)}: {config_name}")
+        print(f"  Steering {len(steered_layers)} layers: {steered_layers[:3]}...{steered_layers[-3:]}" if len(steered_layers) > 6 else f"  Steering layers: {steered_layers}")
+        print(f"  Checking layer {check_layer} (downstream)")
+        print(f"{'='*70}")
+
+        # Create steering vectors for this config
+        steering_vectors = {}
+        for layer_idx in steered_layers:
+            steering_vectors[layer_idx] = torch.randn(hidden_size, dtype=torch.float32) * 0.1
+
+        # GROUND TRUTH: HuggingFace float32
+        print("\n[1/3] Loading HuggingFace float32 (ground truth)...")
+        hf_fp32 = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map="cuda",
+            attn_implementation="eager",
+        )
+        hf_fp32.eval()
+
+        hf_fp32_hidden = None
+        def hf_fp32_hook(module, args, output):
+            nonlocal hf_fp32_hidden
+            hidden = output[0] if isinstance(output, tuple) else output
+            # Apply steering if this layer is in our config
+            for layer_idx in steered_layers:
+                if module == hf_fp32.model.layers[layer_idx]:
+                    hidden = hidden + steering_vectors[layer_idx].to(device=hidden.device, dtype=hidden.dtype)
+                    break
+            # Capture at check layer
+            if module == hf_fp32.model.layers[check_layer]:
+                hf_fp32_hidden = hidden.detach().cpu().clone()
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+
+        handles = []
+        for layer_idx in steered_layers + [check_layer]:
+            handle = hf_fp32.model.layers[layer_idx].register_forward_hook(hf_fp32_hook)
+            handles.append(handle)
+
+        with torch.no_grad():
+            hf_fp32(**inputs)
+
+        for handle in handles:
+            handle.remove()
+
+        print(f"  Ground truth: norm={torch.norm(hf_fp32_hidden).item():.2f}")
+
+        del hf_fp32
+        torch.cuda.empty_cache()
+
+        # TEST 1: HuggingFace bfloat16
+        print("\n[2/3] Loading HuggingFace bfloat16...")
+        hf_bf16 = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            attn_implementation="eager",
+        )
+        hf_bf16.eval()
+
+        hf_bf16_hidden = None
+        def hf_bf16_hook(module, args, output):
+            nonlocal hf_bf16_hidden
+            hidden = output[0] if isinstance(output, tuple) else output
+            for layer_idx in steered_layers:
+                if module == hf_bf16.model.layers[layer_idx]:
+                    hidden = hidden + steering_vectors[layer_idx].to(device=hidden.device, dtype=hidden.dtype)
+                    break
+            if module == hf_bf16.model.layers[check_layer]:
+                hf_bf16_hidden = hidden.detach().cpu().clone()
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+
+        handles = []
+        for layer_idx in steered_layers + [check_layer]:
+            handle = hf_bf16.model.layers[layer_idx].register_forward_hook(hf_bf16_hook)
+            handles.append(handle)
+
+        with torch.no_grad():
+            hf_bf16(**inputs)
+
+        for handle in handles:
+            handle.remove()
+
+        hf_bf16_mae = torch.mean(torch.abs(hf_bf16_hidden.float() - hf_fp32_hidden)).item()
+        hf_bf16_cos = F.cosine_similarity(
+            hf_fp32_hidden.flatten().unsqueeze(0),
+            hf_bf16_hidden.float().flatten().unsqueeze(0),
+        ).item()
+
+        print(f"  HF bf16 vs fp32: MAE={hf_bf16_mae:.6e}, cos={hf_bf16_cos:.9f}")
+
+        del hf_bf16
+        torch.cuda.empty_cache()
+
+        # TEST 2: vLLM bfloat16
+        print("\n[3/3] Loading vLLM bfloat16...")
+        vllm_cfg = VLLMSteeringConfig(
+            model_name=model_name,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.3,
+            max_model_len=inputs.input_ids.shape[1] + 16,
+            dtype="bfloat16",
+        )
+
+        all_layers_to_bootstrap = list(set(steered_layers + [check_layer]))
+        vllm_model = VLLMSteerModel(
+            vllm_cfg,
+            enforce_eager=True,
+            bootstrap_layers=tuple(all_layers_to_bootstrap),
+        )
+
+        # Apply steering
+        for layer_idx, vector in steering_vectors.items():
+            vllm_model.set_layer_vector(layer_idx, vector)
+
+        # Enable capture at check layer
+        vllm_model.enable_hidden_state_capture(check_layer, capture_before=False, capture_after=True)
+
+        sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+        vllm_model.generate([prompt], sampling_params=sampling)
+
+        states = vllm_model.fetch_hidden_states()
+        vllm_bf16_hidden = states[0][check_layer][0]["after"]
+
+        vllm_bf16_mae = torch.mean(torch.abs(vllm_bf16_hidden.cpu().float() - hf_fp32_hidden)).item()
+        vllm_bf16_cos = F.cosine_similarity(
+            hf_fp32_hidden.flatten().unsqueeze(0),
+            vllm_bf16_hidden.cpu().float().flatten().unsqueeze(0),
+        ).item()
+
+        print(f"  vLLM bf16 vs fp32: MAE={vllm_bf16_mae:.6e}, cos={vllm_bf16_cos:.9f}")
+
+        vllm_model.clear_all_vectors()
+        del vllm_model
+        torch.cuda.empty_cache()
+
+        # Record results
+        results["config"].append(config_name)
+        results["num_steered"].append(len(steered_layers))
+        results["check_layer"].append(check_layer)
+        results["hf_bf16_mae"].append(hf_bf16_mae)
+        results["vllm_bf16_mae"].append(vllm_bf16_mae)
+        results["hf_bf16_cos"].append(hf_bf16_cos)
+        results["vllm_bf16_cos"].append(vllm_bf16_cos)
+
+        # Compare degradation
+        ratio = vllm_bf16_mae / hf_bf16_mae if hf_bf16_mae > 0 else float('inf')
+        print(f"\n  Degradation ratio (vLLM/HF): {ratio:.2f}x")
+        if ratio > 1.5:
+            print(f"  ⚠️  vLLM degrades {ratio:.1f}x WORSE than HF")
+        elif ratio < 0.67:
+            print(f"  ✓ vLLM degrades {1/ratio:.1f}x BETTER than HF")
+        else:
+            print(f"  ≈ Similar degradation")
+
+    # Summary report
+    print("\n" + "="*70)
+    print("DEGRADATION SUMMARY")
+    print("="*70)
+    print(f"{'Config':<15} {'Layers':<8} {'HF bf16 MAE':<15} {'vLLM bf16 MAE':<15} {'Ratio':<10}")
+    print("-"*70)
+
+    for i in range(len(results["config"])):
+        config_name = results["config"][i]
+        num_steered = results["num_steered"][i]
+        hf_mae = results["hf_bf16_mae"][i]
+        vllm_mae = results["vllm_bf16_mae"][i]
+        ratio = vllm_mae / hf_mae if hf_mae > 0 else float('inf')
+
+        print(f"{config_name:<15} {num_steered:<8} {hf_mae:<15.6e} {vllm_mae:<15.6e} {ratio:<10.2f}x")
+
+    print("="*70)
+
+    # Analyze trend
+    import numpy as np
+    ratios = np.array([results["vllm_bf16_mae"][i] / results["hf_bf16_mae"][i]
+                       for i in range(len(results["config"]))
+                       if results["hf_bf16_mae"][i] > 0])
+
+    print(f"\nDegradation ratio statistics:")
+    print(f"  Mean: {ratios.mean():.2f}x")
+    print(f"  Std:  {ratios.std():.2f}x")
+    print(f"  Min:  {ratios.min():.2f}x")
+    print(f"  Max:  {ratios.max():.2f}x")
+
+    if ratios.mean() > 2.0:
+        print(f"\n❌ vLLM degrades significantly worse than HF (avg {ratios.mean():.1f}x)")
+        print("   → This suggests our steering path amplifies bf16 precision errors")
+    elif ratios.mean() < 0.5:
+        print(f"\n✓ vLLM degrades less than HF (avg {1/ratios.mean():.1f}x better)")
+    else:
+        print(f"\n≈ Similar degradation patterns between HF and vLLM")
+
+    # Check if degradation grows with layer count
+    num_layers_list = np.array(results["num_steered"])
+    if len(num_layers_list) >= 3:
+        # Simple correlation check
+        from scipy.stats import pearsonr
+        hf_corr, _ = pearsonr(num_layers_list, results["hf_bf16_mae"])
+        vllm_corr, _ = pearsonr(num_layers_list, results["vllm_bf16_mae"])
+
+        print(f"\nError growth with layer count:")
+        print(f"  HF bf16:   correlation = {hf_corr:.3f}")
+        print(f"  vLLM bf16: correlation = {vllm_corr:.3f}")
+
+        if vllm_corr > hf_corr + 0.1:
+            print(f"  → vLLM error grows faster with more layers")
+        elif hf_corr > vllm_corr + 0.1:
+            print(f"  → HF error grows faster with more layers")
+        else:
+            print(f"  → Similar growth patterns")
+
+    print("="*70)

@@ -23,6 +23,10 @@ except Exception:  # pragma: no cover - fallback when unavailable
 
 LayerLike = Any
 
+# Optional override for projection cap math precision. When set the cap
+# operations are evaluated in the requested dtype before casting back.
+_PROJECTION_CAP_PRECISION: torch.dtype | None = None
+
 
 @dataclass
 class _CaptureConfig:
@@ -172,11 +176,21 @@ def _transform_output(
             return output
         if mode == "hidden" and _is_qwen_layer_output(output):
             delta, residual = output[0], output[1]
-            hidden = residual + delta
+            target_dtype = _PROJECTION_CAP_PRECISION
+            if target_dtype is not None:
+                working_residual = residual.to(target_dtype)
+                working_delta = delta.to(target_dtype)
+            else:
+                working_residual = residual
+                working_delta = delta
+            hidden = working_residual + working_delta
             transformed = transform(hidden)
             if transformed is hidden:
                 return output
-            new_delta = transformed - residual
+            if target_dtype is not None:
+                new_delta = (transformed - working_residual).to(delta.dtype)
+            else:
+                new_delta = transformed - residual
             return (new_delta,) + output[1:]
         hidden = output[0]
         transformed = transform(hidden)
@@ -248,18 +262,24 @@ def _normalize_direction(vector: torch.Tensor) -> torch.Tensor:
 
 
 def _deserialize_direction_payload(
-    payload: Any, *, dest: torch.Tensor, state: _SteeringState
+    payload: Any,
+    *,
+    dest: torch.Tensor,
+    state: _SteeringState,
+    target_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     try:
         vector = deserialize_tensor(
             payload,
             device=dest.device,
-            dtype=dest.dtype,
+            dtype=target_dtype,
         )
     except TypeError:
         if not isinstance(payload, torch.Tensor):
             raise
-        vector = payload.to(device=dest.device, dtype=dest.dtype)
+        vector = payload.to(device=dest.device)
+        if target_dtype is not None and vector.dtype != target_dtype:
+            vector = vector.to(dtype=target_dtype)
     if vector.ndim != 1:
         raise ValueError("Direction vector must be 1D.")
     if vector.shape[0] != state.hidden_size:
@@ -272,8 +292,21 @@ def _deserialize_direction_payload(
 def _apply_projection_cap(hidden: torch.Tensor, config: _ProjectionCapConfig) -> torch.Tensor:
     if config.min is None and config.max is None:
         return hidden
-    flat = _reshape_for_component_ops(hidden, config.unit_vector.shape[0])
+    target_dtype = _PROJECTION_CAP_PRECISION
+    working = hidden
+    cast_back = False
     unit = config.unit_vector
+    if target_dtype is None:
+        target_dtype = unit.dtype
+        if hidden.dtype != target_dtype:
+            working = hidden.to(target_dtype)
+            cast_back = True
+    elif hidden.dtype != target_dtype:
+        working = hidden.to(target_dtype)
+        cast_back = True
+    if unit.dtype != target_dtype:
+        unit = unit.to(target_dtype)
+    flat = _reshape_for_component_ops(working, unit.shape[0])
     projection = flat @ unit
     clamp_kwargs: dict[str, torch.Tensor] = {}
     if config.min is not None:
@@ -284,7 +317,10 @@ def _apply_projection_cap(hidden: torch.Tensor, config: _ProjectionCapConfig) ->
     if clamped is not projection:
         delta = (clamped - projection).unsqueeze(-1) * unit
         flat = flat + delta
-    return flat.reshape_as(hidden)
+    result = flat.reshape_as(working)
+    if cast_back:
+        return result.to(hidden.dtype)
+    return result
 
 
 def _apply_ablation(hidden: torch.Tensor, config: _AblationConfig) -> torch.Tensor:
@@ -377,6 +413,8 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if isinstance(capture_config, _CaptureConfig):
             capture_queue = getattr(self, "_chatspace_capture_queue", None)
             if capture_queue is not None:
+                if capture_config.max_captures is not None and len(capture_queue) >= capture_config.max_captures:
+                    capture_queue.pop(0)
                 try:
                     captured_after: torch.Tensor | None = None
                     if capture_config.capture_after:
@@ -617,7 +655,9 @@ def set_worker_projection_cap(worker: Any, layer_idx: int, payload: dict[str, An
     vector_payload = payload.get("vector")
     if vector_payload is None:
         raise ValueError("Projection cap payload missing 'vector'.")
-    unit = _deserialize_direction_payload(vector_payload, dest=dest, state=state)
+    unit = _deserialize_direction_payload(
+        vector_payload, dest=dest, state=state, target_dtype=torch.float32
+    )
     min_val = payload.get("min")
     max_val = payload.get("max")
     min_float = float(min_val) if min_val is not None else None
@@ -654,6 +694,21 @@ def clear_worker_projection_cap(worker: Any, layer_idx: int | None = None) -> No
             layer = layers[idx]
             if hasattr(layer, "_chatspace_projection_cap"):
                 layer._chatspace_projection_cap = None  # type: ignore[attr-defined]
+
+
+def set_projection_cap_precision(worker: Any, dtype_name: str | None) -> None:
+    """Adjust the working precision used for projection cap math."""
+    global _PROJECTION_CAP_PRECISION
+    if dtype_name is None:
+        _PROJECTION_CAP_PRECISION = None
+        return
+    if not isinstance(dtype_name, str):
+        raise TypeError("dtype_name must be a string or None.")
+    attr = dtype_name.removeprefix("torch.")
+    target = getattr(torch, attr, None)
+    if not isinstance(target, torch.dtype):
+        raise ValueError(f"Unsupported projection cap dtype: {dtype_name}")
+    _PROJECTION_CAP_PRECISION = target
 
 
 def set_worker_ablation(worker: Any, layer_idx: int, payload: dict[str, Any]) -> None:
