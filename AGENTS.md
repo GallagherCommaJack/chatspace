@@ -23,6 +23,7 @@
 - Add or update tests in `tests/` that cover new code paths; mirror naming (`test_<module>.py`) and use `pytest` fixtures.
 - Validate concurrency changes with `python test_multiprocessing.py`; include small `uv run chatspace embed-hf --max-rows` dry runs when touching dataset or writer logic.
 - Guard against regressions by checking embedding dimension, norm bounds, and manifest integrity in tests whenever feasible.
+- ALWAYS run tests with some kind of timeout - bugs can cause the session to hang and recollecting GPU memory from stuck processes can be quite tricky
 
 ## Commit & Pull Request Guidelines
 - Use concise, imperative commit subjects similar to `Fix steering vector training pipeline and data loader`; squash noisy intermediate commits before review.
@@ -45,4 +46,5 @@
 - Running via `uv run …` keeps the repo root on `sys.path`, so the worker-side `sitecustomize.py` patch installer triggers automatically before model load.
 - Use `scripts/steering_smoke.py` (`uv run python scripts/steering_smoke.py --layer 16 --scale 100000`) for quick verification; expect steered logprobs to diverge only under eager execution.
 - Scratch notes belong in `TEMP_JOURNAL.md`; the file is gitignored, so keep the canonical log in `JOURNAL.md` once work stabilizes.
+- Log anything interesting / surprising to TEMP_JOURNAL.md
 - vLLM’s Qwen decoder layers fuse the RMSNorm with the skip connection and return `(mlp_delta, residual_before_mlp)`; to mirror HuggingFace captures you must add `delta + residual` when extracting the hidden state.
