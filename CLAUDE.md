@@ -127,3 +127,40 @@ Each run records:
 - Shard-level checksums (SHA256) in manifest
 - Sampling seed and parameters
 - Pipeline stage timings and utilization metrics
+
+## Testing Guidelines
+
+- Add or update tests in `tests/` that cover new code paths; mirror naming (`test_<module>.py`) and use `pytest` fixtures
+- Validate concurrency changes with `python test_multiprocessing.py`
+- Include small `uv run chatspace embed-hf --max-rows` dry runs when touching dataset or writer logic
+- Guard against regressions by checking embedding dimension, norm bounds, and manifest integrity
+- **IMPORTANT**: Always run tests with timeouts - bugs can cause hangs and GPU memory recovery is tricky
+
+## Coding Style
+
+- Follow PEP 8 with 4-space indentation, descriptive snake_case for functions, UpperCamelCase for classes
+- Prefer type hints and module-level docstrings; mirror existing tone in `chatspace/hf_embed/pipeline.py`
+- Route diagnostics through `logging` module; avoid bare `print` except in CLI entry points
+- Keep shard and manifest writers immutable: create new files rather than mutating outputs in-place
+
+## Commit Guidelines
+
+- Use concise, imperative commit subjects (e.g., "Fix steering vector training pipeline")
+- **DO NOT commit with --amend unless explicitly asked**
+- PRs should describe motivation, summarize changes, list validation commands, and link issues
+
+## vLLM Steering Runtime Notes
+
+- `chatspace/vllm_steering/runtime.py` monkey-patches decoder layer `forward` to add steering vectors
+- **Requires eager execution**: Always launch `VLLMSteerModel` with `enforce_eager=True` (default)
+- CUDA-graph capture breaks steering because compiled graphs ignore the Python-side patch
+- Running via `uv run` keeps repo root on `sys.path`, so `sitecustomize.py` patch triggers automatically
+- Use `scripts/steering_smoke.py` for quick verification of steering behavior
+- **Qwen decoder layer fusion**: vLLM fuses RMSNorm with skip connection, returns `(mlp_delta, residual_before_mlp)` - must add `delta + residual` to mirror HuggingFace captures
+
+## Journaling Practices
+
+- Scratch notes and active investigations go in `TEMP_JOURNAL.md` (gitignored)
+- Capture UTC timestamp with `date -u` before editing logs
+- Once work stabilizes, move key findings to canonical `JOURNAL.md`
+- Note tmux sessions, long-running jobs, and `/workspace` artifact paths for resumability
