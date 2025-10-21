@@ -53,6 +53,7 @@ def test_hidden_state_capture_basic():
     first_capture = layer_captures[0]
     assert "before" in first_capture, "Expected 'before' key in capture"
     assert "after" in first_capture, "Expected 'after' key in capture"
+    assert "meta" in first_capture, "Expected capture metadata"
 
     before_state = first_capture["before"]
     after_state = first_capture["after"]
@@ -61,10 +62,32 @@ def test_hidden_state_capture_basic():
     assert before_state.shape == after_state.shape, "Before/after shapes should match"
     assert before_state.shape[-1] == model.hidden_size, "Hidden dimension should match model"
 
+    meta = first_capture["meta"]
+    assert meta["phase"] == "prefill", "First capture should correspond to prefill phase"
+    assert meta["step"] == 0, "First capture should have step index 0"
+
     # Clear captured states
     model.clear_hidden_states(target_layer)
     cleared_states = model.fetch_hidden_states(layer_idx=target_layer)
     assert len(cleared_states[0][target_layer]) == 0, "States should be cleared"
+
+    # Generate again to ensure counters reset after clearing
+    model.generate([prompt], sampling_params=sampling)
+    refreshed_states = model.fetch_hidden_states(layer_idx=target_layer)
+    refreshed_capture = refreshed_states[0][target_layer][0]
+    assert refreshed_capture["meta"]["step"] == 0, "Counters should reset after clearing"
+
+    # Enable projection cap and verify cap delta instrumentation is present
+    unit = torch.zeros(model.hidden_size, dtype=torch.float32)
+    unit[0] = 1.0
+    model.set_layer_projection_cap(target_layer, unit, max=0.0)
+    model.clear_hidden_states(target_layer)
+    model.generate([prompt], sampling_params=sampling)
+    capped_states = model.fetch_hidden_states(layer_idx=target_layer)
+    capped_capture = capped_states[0][target_layer][0]
+    assert "cap_delta" in capped_capture, "Expected projection delta in capture entry"
+    assert "cap_meta" in capped_capture, "Expected projection delta metadata"
+    model.clear_layer_projection_cap(target_layer)
 
     # Disable capture
     model.disable_hidden_state_capture(target_layer)
@@ -608,6 +631,11 @@ def test_hidden_states_match_hf_decode_phase():
     # Use the minimum of what we generated
     num_tokens_to_compare = min(num_decode_tokens, num_vllm_decode_tokens)
 
+    # Prefill metadata should report phase information
+    prefill_meta = vllm_captures[0]["meta"]
+    assert prefill_meta["phase"] == "prefill"
+    assert prefill_meta["step"] == 0
+
     # -------------------------------------------------------------------------
     # Compare decode-phase hidden states
     # -------------------------------------------------------------------------
@@ -618,7 +646,11 @@ def test_hidden_states_match_hf_decode_phase():
         hf_hidden = hf_decode_hiddens[step_idx].squeeze(0).squeeze(0)  # Remove batch and seq dims
 
         # vLLM: hidden state from decode step (+1 to skip prefill)
-        vllm_hidden = vllm_captures[step_idx + 1]["before"].to(dtype=torch.float32)
+        capture_entry = vllm_captures[step_idx + 1]
+        capture_meta = capture_entry["meta"]
+        assert capture_meta["phase"] == "decode", "Decode captures should be tagged as decode"
+        assert capture_meta["phase_index"] == step_idx, "Decode phase index should align with step"
+        vllm_hidden = capture_entry["before"].to(dtype=torch.float32)
 
         # vLLM decode states are typically (1, hidden_size), squeeze to (hidden_size,)
         if vllm_hidden.dim() > 1:

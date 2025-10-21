@@ -107,9 +107,12 @@ def run_once(
 
 
 def classify_capture(entry: dict[str, torch.Tensor]) -> str:
-    tensor = entry.get("after")
-    if tensor is None:
-        tensor = entry.get("before")
+    meta = entry.get("meta")
+    if isinstance(meta, dict):
+        phase = meta.get("phase")
+        if isinstance(phase, str):
+            return phase
+    tensor = entry.get("after") or entry.get("before")
     if tensor is None:
         return "unknown"
     return "decode" if tensor.shape[1] == 1 else "prefill"
@@ -127,6 +130,12 @@ def summarise_diff(
     for idx, (base, comp) in enumerate(zip(baseline, compare)):
         phase = classify_capture(base)
         entry: dict[str, float | int | str] = {"capture": idx, "phase": phase}
+        base_meta = base.get("meta")
+        if isinstance(base_meta, dict):
+            for key in ("step", "phase_index", "seq_len"):
+                value = base_meta.get(key)
+                if isinstance(value, (int, float)):
+                    entry[key] = int(value)
         for key in ("before", "after"):
             base_tensor = base.get(key)
             comp_tensor = comp.get(key)
@@ -136,6 +145,18 @@ def summarise_diff(
             entry[f"{key}_max_abs"] = float(diff.abs().max().item())
             entry[f"{key}_mean_abs"] = float(diff.abs().mean().item())
             entry[f"{key}_rmse"] = float(diff.pow(2).mean().sqrt().item())
+        base_cap = base.get("cap_delta")
+        comp_cap = comp.get("cap_delta")
+        if isinstance(base_cap, torch.Tensor) and isinstance(comp_cap, torch.Tensor):
+            cap_diff = comp_cap.to(torch.float32) - base_cap.to(torch.float32)
+            entry["cap_delta_max_abs"] = float(cap_diff.abs().max().item())
+            entry["cap_delta_mean_abs"] = float(cap_diff.abs().mean().item())
+            entry["cap_delta_rmse"] = float(cap_diff.pow(2).mean().sqrt().item())
+        base_cap_meta = base.get("cap_meta")
+        if isinstance(base_cap_meta, dict):
+            precision = base_cap_meta.get("target_dtype")
+            if isinstance(precision, str):
+                entry["cap_precision"] = precision
         summary.append(entry)
     return summary
 

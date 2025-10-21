@@ -954,12 +954,13 @@ class VLLMSteerModel(SteerableModel):
 
     def fetch_hidden_states(
         self, layer_idx: int | None = None
-    ) -> list[dict[int, list[dict[str, torch.Tensor]]]]:
+    ) -> list[dict[int, list[dict[str, Any]]]]:
         """Retrieve captured hidden states from workers.
 
         Returns a list of capture maps, one per worker. Each map is keyed by
         layer index and contains a list of capture entries. Each entry has
-        ``"before"`` and/or ``"after"`` keys with CPU tensors.
+        ``"before"``/``"after"`` tensors plus optional ``"meta"`` (phase, step) and
+        ``"cap_delta"`` diagnostics captured when projection caps are active.
 
         Parameters
         ----------
@@ -968,7 +969,7 @@ class VLLMSteerModel(SteerableModel):
 
         Returns
         -------
-        list[dict[int, list[dict[str, torch.Tensor]]]]
+        list[dict[int, list[dict[str, Any]]]]
             List of worker capture maps. Length equals the number of workers
             (tensor parallel size).
 
@@ -981,12 +982,13 @@ class VLLMSteerModel(SteerableModel):
         >>> first_capture = worker_0_captures[0]
         >>> before_steering = first_capture["before"]  # shape: [batch, seq_len, hidden_size]
         >>> after_steering = first_capture["after"]
+        >>> step_meta = first_capture["meta"]  # {'phase': 'prefill', 'step': 0, ...}
         """
         payloads = self._engine_client.collective_rpc(
             steering_runtime.fetch_captured_hidden_states,
             args=(layer_idx,) if layer_idx is not None else (),
         )
-        return cast(list[dict[int, list[dict[str, torch.Tensor]]]], payloads)
+        return cast(list[dict[int, list[dict[str, Any]]]], payloads)
 
     def clear_hidden_states(self, layer_idx: int | None = None) -> None:
         """Clear captured hidden states without disabling capture.

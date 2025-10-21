@@ -38,6 +38,37 @@ class _CaptureConfig:
 
 
 @dataclass
+class _CaptureCounters:
+    """Track capture step indices for prefill/decode phases."""
+
+    total: int = 0
+    prefill: int = 0
+    decode: int = 0
+    prefill_complete: bool = False
+
+    def reset(self) -> None:
+        self.total = 0
+        self.prefill = 0
+        self.decode = 0
+        self.prefill_complete = False
+
+    def next(self, seq_len: int) -> tuple[str, int, int]:
+        """Advance counters and return (phase, phase_index, step)."""
+        if not self.prefill_complete and seq_len > 1:
+            phase = "prefill"
+            phase_index = self.prefill
+            self.prefill += 1
+        else:
+            phase = "decode"
+            phase_index = self.decode
+            self.decode += 1
+            self.prefill_complete = True
+        step = self.total
+        self.total += 1
+        return phase, phase_index, step
+
+
+@dataclass
 class _SteeringState:
     """Track steering metadata for a worker."""
 
@@ -49,6 +80,7 @@ class _SteeringState:
     ablations: dict[int, "_AblationConfig"]
     capture_configs: dict[int, _CaptureConfig]
     captured_states: dict[int, list[dict[str, torch.Tensor]]]
+    capture_counters: dict[int, _CaptureCounters]
 
 
 @dataclass
@@ -141,6 +173,29 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
     return None
 
 
+def _infer_sequence_length(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 1
+    if tensor.ndim >= 2:
+        return int(tensor.shape[-2])
+    return 1
+
+
+def _prepare_capture_metadata(
+    counter: _CaptureCounters | None, reference: torch.Tensor | None
+) -> dict[str, int | str]:
+    if counter is None:
+        return {}
+    seq_len = _infer_sequence_length(reference)
+    phase, phase_index, step = counter.next(seq_len)
+    return {
+        "phase": phase,
+        "phase_index": phase_index,
+        "step": step,
+        "seq_len": seq_len,
+    }
+
+
 def _is_qwen_layer_output(output: Any) -> bool:
     return (
         isinstance(output, tuple)
@@ -156,6 +211,7 @@ def _transform_output(
     *,
     fallback: Callable[[Any], Any] | None = None,
     mode: str = "delta",
+    debug_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Apply ``transform`` to the primary hidden state within ``output``.
 
@@ -167,6 +223,9 @@ def _transform_output(
         state ``residual + delta`` (when available), applies ``transform``, and
         re-expresses the result as an updated delta so downstream layers receive
         the transformed hidden state.
+    debug_hook :
+        Optional callback receiving intermediate tensors (as a dict). Used for
+        instrumentation such as projection delta dumps.
     """
     _SEEN_OUTPUT_TYPES.add(type(output).__name__)
     if isinstance(output, torch.Tensor):
@@ -188,9 +247,33 @@ def _transform_output(
             if transformed is hidden:
                 return output
             if target_dtype is not None:
-                new_delta = (transformed - working_residual).to(delta.dtype)
+                projected_delta = transformed - working_residual
+                if debug_hook is not None:
+                    debug_hook(
+                        {
+                            "projected_delta": projected_delta,
+                            "target_dtype": target_dtype,
+                            "input_delta_dtype": delta.dtype,
+                            "residual_dtype": working_residual.dtype,
+                            "hidden_before_dtype": hidden.dtype,
+                            "hidden_after_dtype": transformed.dtype,
+                        }
+                    )
+                new_delta = projected_delta.to(delta.dtype)
             else:
-                new_delta = transformed - residual
+                projected_delta = transformed - residual
+                if debug_hook is not None:
+                    debug_hook(
+                        {
+                            "projected_delta": projected_delta,
+                            "target_dtype": residual.dtype,
+                            "input_delta_dtype": delta.dtype,
+                            "residual_dtype": residual.dtype,
+                            "hidden_before_dtype": hidden.dtype,
+                            "hidden_after_dtype": transformed.dtype,
+                        }
+                    )
+                new_delta = projected_delta
             return (new_delta,) + output[1:]
         hidden = output[0]
         transformed = transform(hidden)
@@ -229,11 +312,22 @@ def _apply_vector_to_output(output: Any, vector: torch.Tensor) -> Any:
     )
 
 
-def _apply_projection_cap_to_output(output: Any, config: _ProjectionCapConfig) -> Any:
+def _apply_projection_cap_to_output(
+    output: Any,
+    config: _ProjectionCapConfig,
+    *,
+    debug_hook: Callable[[dict[str, Any]], None] | None = None,
+) -> Any:
     def _cap(hidden: torch.Tensor) -> torch.Tensor:
         return _apply_projection_cap(hidden, config)
 
-    return _transform_output(output, _cap, fallback=None, mode="hidden")
+    return _transform_output(
+        output,
+        _cap,
+        fallback=None,
+        mode="hidden",
+        debug_hook=debug_hook,
+    )
 
 
 def _apply_ablation_to_output(output: Any, config: _AblationConfig) -> Any:
@@ -387,9 +481,19 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
 
         # Check if this layer should capture hidden states
         capture_config = getattr(self, "_chatspace_capture_config", None)
+        capture_enabled = isinstance(capture_config, _CaptureConfig)
         captured_before: torch.Tensor | None = None
+        cap_debug_payload: dict[str, Any] | None = None
 
-        if isinstance(capture_config, _CaptureConfig) and capture_config.capture_before:
+        def _capture_cap_debug(payload: dict[str, Any]) -> None:
+            nonlocal cap_debug_payload
+            projected_delta = payload.get("projected_delta")
+            if isinstance(projected_delta, torch.Tensor):
+                payload = dict(payload)
+                payload["projected_delta"] = projected_delta.detach().cpu().clone()
+            cap_debug_payload = payload
+
+        if capture_enabled and capture_config.capture_before:
             # Extract and capture hidden state before steering
             try:
                 captured_before = _extract_hidden_from_output(output)
@@ -404,13 +508,18 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
             output = _apply_vector_to_output(output, vector)
         cap_config = getattr(self, "_chatspace_projection_cap", None)
         if isinstance(cap_config, _ProjectionCapConfig):
-            output = _apply_projection_cap_to_output(output, cap_config)
+            debug_hook = _capture_cap_debug if capture_enabled else None
+            output = _apply_projection_cap_to_output(
+                output,
+                cap_config,
+                debug_hook=debug_hook,
+            )
         ablation_config = getattr(self, "_chatspace_ablation", None)
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
 
         # Capture hidden state after steering if requested
-        if isinstance(capture_config, _CaptureConfig):
+        if capture_enabled:
             capture_queue = getattr(self, "_chatspace_capture_queue", None)
             if capture_queue is not None:
                 if capture_config.max_captures is not None and len(capture_queue) >= capture_config.max_captures:
@@ -424,11 +533,35 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
 
                     # Store capture if we have at least one state
                     if captured_before is not None or captured_after is not None:
-                        capture_entry: dict[str, torch.Tensor] = {}
+                        capture_entry: dict[str, Any] = {}
                         if captured_before is not None:
                             capture_entry["before"] = captured_before
                         if captured_after is not None:
                             capture_entry["after"] = captured_after
+                        counter = getattr(self, "_chatspace_capture_counter", None)
+                        reference_tensor = captured_after if captured_after is not None else captured_before
+                        metadata = _prepare_capture_metadata(counter, reference_tensor)
+                        if metadata:
+                            capture_entry["meta"] = metadata
+                        if cap_debug_payload is not None:
+                            projected_delta = cap_debug_payload.get("projected_delta")
+                            if isinstance(projected_delta, torch.Tensor):
+                                capture_entry["cap_delta"] = projected_delta
+                            cap_meta = {
+                                key: str(value)
+                                for key, value in cap_debug_payload.items()
+                                if key in {
+                                    "target_dtype",
+                                    "input_delta_dtype",
+                                    "residual_dtype",
+                                    "hidden_before_dtype",
+                                    "hidden_after_dtype",
+                                }
+                                and value is not None
+                            }
+                            if cap_meta:
+                                capture_entry["cap_meta"] = cap_meta
+                            cap_debug_payload = None
 
                         # Check max_captures limit
                         max_cap = capture_config.max_captures
@@ -436,6 +569,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                             capture_queue.append(capture_entry)
                 except Exception:  # pragma: no cover - graceful degradation
                     pass
+            cap_debug_payload = None
 
         return output
 
@@ -596,6 +730,7 @@ def initialize_worker_state(
         ablations={},
         capture_configs={},
         captured_states={},
+        capture_counters={},
     )
     worker._chatspace_steering = state
 
@@ -892,11 +1027,14 @@ def enable_hidden_state_capture(
     )
     state.capture_configs[target_idx] = capture_config
     state.captured_states[target_idx] = []
+    counter = _CaptureCounters()
+    state.capture_counters[target_idx] = counter
 
     layers = _resolve_layers(worker.model_runner.model)
     layer = layers[target_idx]
     layer._chatspace_capture_config = capture_config  # type: ignore[attr-defined]
     layer._chatspace_capture_queue = state.captured_states[target_idx]  # type: ignore[attr-defined]
+    layer._chatspace_capture_counter = counter  # type: ignore[attr-defined]
 
 
 def disable_hidden_state_capture(
@@ -924,17 +1062,20 @@ def disable_hidden_state_capture(
     for idx in targets:
         state.capture_configs.pop(idx, None)
         state.captured_states.pop(idx, None)  # Also clear captured data
+        state.capture_counters.pop(idx, None)
         if 0 <= idx < len(layers):
             layer = layers[idx]
             if hasattr(layer, "_chatspace_capture_config"):
                 layer._chatspace_capture_config = None  # type: ignore[attr-defined]
             if hasattr(layer, "_chatspace_capture_queue"):
                 layer._chatspace_capture_queue = None  # type: ignore[attr-defined]
+            if hasattr(layer, "_chatspace_capture_counter"):
+                layer._chatspace_capture_counter = None  # type: ignore[attr-defined]
 
 
 def fetch_captured_hidden_states(
     worker: Any, layer_idx: int | None = None
-) -> dict[int, list[dict[str, torch.Tensor]]]:
+) -> dict[int, list[dict[str, Any]]]:
     """Retrieve captured hidden states from one or all layers.
 
     Parameters
@@ -946,15 +1087,28 @@ def fetch_captured_hidden_states(
 
     Returns
     -------
-    dict[int, list[dict[str, torch.Tensor]]]
+    dict[int, list[dict[str, Any]]]
         Mapping of layer indices to lists of capture entries. Each entry is a dict
-        with ``"before"`` and/or ``"after"`` keys containing CPU tensors.
+        with ``"before"``/``"after"`` tensors plus optional ``"meta"``, ``"cap_delta"``,
+        and ``"cap_meta"`` diagnostics.
     """
     state = _ensure_state(worker)
+
+    def _clone_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        cloned: dict[str, Any] = {}
+        for key, value in entry.items():
+            if isinstance(value, torch.Tensor):
+                cloned[key] = value.detach().cpu().clone()
+            elif isinstance(value, dict):
+                cloned[key] = dict(value)
+            else:
+                cloned[key] = value
+        return cloned
+
     if layer_idx is None:
         return {
             idx: [
-                {key: tensor.detach().cpu().clone() for key, tensor in entry.items()}
+                _clone_entry(entry)
                 for entry in captures
             ]
             for idx, captures in state.captured_states.items()
@@ -964,7 +1118,7 @@ def fetch_captured_hidden_states(
         captures = state.captured_states.get(target_idx, [])
         return {
             target_idx: [
-                {key: tensor.detach().cpu().clone() for key, tensor in entry.items()}
+                _clone_entry(entry)
                 for entry in captures
             ]
         }
@@ -986,8 +1140,13 @@ def clear_captured_hidden_states(
     if layer_idx is None:
         for captures in state.captured_states.values():
             captures.clear()
+        for counter in state.capture_counters.values():
+            counter.reset()
     else:
         target_idx = int(layer_idx)
         captures = state.captured_states.get(target_idx)
         if captures is not None:
             captures.clear()
+        counter = state.capture_counters.get(target_idx)
+        if counter is not None:
+            counter.reset()
