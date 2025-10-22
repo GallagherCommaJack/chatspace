@@ -164,3 +164,4 @@ Each run records:
 - Capture UTC timestamp with `date -u` before editing logs
 - Once work stabilizes, move key findings to canonical `JOURNAL.md`
 - Note tmux sessions, long-running jobs, and `/workspace` artifact paths for resumability
+- **IMPORTANT**: Implementation summaries, feature documentation, and completion notes should be added to `JOURNAL.md`, NOT as separate markdown files in the repo root. Keep the repo clean by consolidating documentation in the journal.

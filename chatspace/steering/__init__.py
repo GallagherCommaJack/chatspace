@@ -20,7 +20,7 @@ __all__ = [
 
 try:  # pragma: no cover - optional dependencies (datasets, transformers)
     from .data import PersonaSteeringDatasetConfig, load_persona_steering_dataset, prepare_persona_token_budget
-    from .model import QwenSteerModel, SteeringVectorConfig
+    from .model import QwenSteerModel, SteeringVectorConfig, TransformerSteerModel
 except ImportError:  # pragma: no cover - gracefully degrade when optional deps missing
     pass
 else:  # pragma: no cover - executed when optional deps available
@@ -31,5 +31,6 @@ else:  # pragma: no cover - executed when optional deps available
             "prepare_persona_token_budget",
             "SteeringVectorConfig",
             "QwenSteerModel",
+            "TransformerSteerModel",
         ]
     )

@@ -1,7 +1,7 @@
 """Worker-side utilities for steering vector control inside vLLM workers.
 
 These helpers are executed inside vLLM worker processes via collective RPCs.
-They patch the target Qwen3 transformer layer so steering vectors participate
+They patch decoder layers in Qwen and Llama models so steering vectors participate
 in CUDA-graph captures, and provide APIs to update vectors or retarget layers
 at runtime.
 """
@@ -124,6 +124,7 @@ class _SteeredModelWrapper(nn.Module):
 
 
 _PATCH_TARGETS: Sequence[tuple[str, str]] = (
+    # Qwen models
     ("vllm.model_executor.models.qwen2", "Qwen2DecoderLayer"),
     ("vllm.model_executor.models.qwen2_moe", "Qwen2MoeDecoderLayer"),
     ("vllm.model_executor.models.qwen2_vl", "Qwen2VLDecoderLayer"),
@@ -131,6 +132,12 @@ _PATCH_TARGETS: Sequence[tuple[str, str]] = (
     ("vllm.model_executor.models.qwen3_moe", "Qwen3MoeDecoderLayer"),
     ("vllm.model_executor.models.qwen3_next", "Qwen3NextDecoderLayer"),
     ("vllm.model_executor.models.qwen3_vl", "Qwen3DecoderLayer"),
+    # Llama models
+    ("vllm.model_executor.models.llama", "LlamaDecoderLayer"),
+    ("vllm.model_executor.models.llama4", "Llama4DecoderLayer"),
+    ("vllm.model_executor.models.llama_eagle", "LlamaDecoderLayer"),
+    ("vllm.model_executor.models.llama_eagle3", "LlamaDecoderLayer"),
+    ("vllm.model_executor.models.llama4_eagle", "Llama4DecoderLayer"),
 )
 
 _PATCHED_CLASSES: set[type] = set()
@@ -141,7 +148,7 @@ _SEEN_OUTPUT_TYPES: set[str] = set()
 def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
     """Extract the primary hidden state tensor from layer output.
 
-    For vLLM Qwen layers, the forward returns (delta, residual) where:
+    For vLLM Qwen and Llama layers, the forward returns (delta, residual) where:
     - delta (output[0]): The per-layer update that will be added to the residual.
     - residual (output[1]): The running residual stream before the delta is applied.
 
@@ -579,7 +586,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
 
 
 def ensure_layer_patch_installed() -> None:
-    """Patch known Qwen decoder layers so CUDA graphs include steering."""
+    """Patch known Qwen and Llama decoder layers so CUDA graphs include steering."""
     global _PATCH_INSTALLED
     if _PATCH_INSTALLED:
         return
@@ -599,7 +606,7 @@ def ensure_layer_patch_installed() -> None:
 
 
 def _resolve_layers(model: Any) -> list[LayerLike]:
-    """Return the list of transformer layers for Qwen-like architectures."""
+    """Return the list of transformer layers for Qwen and Llama architectures."""
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return list(model.model.layers)
     if hasattr(model, "layers"):

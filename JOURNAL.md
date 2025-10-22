@@ -1,5 +1,56 @@
 # Engineering Journal
 
+## 2025-10-22
+
+### Llama Steering Support Implementation
+
+**Timestamp:** 2025-10-22 22:31 UTC
+
+Added comprehensive Llama model support to the vLLM steering infrastructure, achieving full parity with existing Qwen model support.
+
+**Core Implementation:**
+- Added 5 Llama decoder layer variants to `chatspace/vllm_steering/runtime.py` patch targets: `LlamaDecoderLayer`, `Llama4DecoderLayer`, and EAGLE variants
+- Key insight: Llama models use the same `(delta, residual)` tuple output format as Qwen, so no steering logic changes were needed
+- Renamed `QwenSteerModel` → `TransformerSteerModel` in `chatspace/steering/model.py` with backward-compatible alias
+- Updated docstrings across `chatspace/generation/vllm_steer_model.py` and `chatspace/steering/__init__.py` to reflect broader model support
+
+**Testing:**
+- Created comprehensive test suite `tests/test_llama_vllm_steering.py` with 4 test functions covering vector round-trip, chat interface, hidden state capture, and HF parity
+- Created smoke test script `scripts/test_llama_steering.py` for standalone verification
+- All 6 existing Qwen tests pass with no regressions
+- Verified 9 decoder layer classes now patched (Qwen + Llama variants)
+- Tests parametrized for `meta-llama/Llama-3.2-1B-Instruct`, gracefully skip if model unavailable
+
+**Technical Details:**
+- Both Qwen and Llama use `tuple[torch.Tensor, torch.Tensor]` output: `(delta, residual)`
+- Steering materializes full hidden state as `residual + delta`, applies transformations, then re-expresses as new delta
+- Same patching mechanism works for both architectures due to shared `model.model.layers` structure
+- Supports all steering features: additive vectors, projection capping, ablation scaling, hidden state capture, multi-layer steering
+
+**Supported Models:**
+- Llama: 3.2 (1B, 3B), 3.3 (70B), 4, EAGLE variants
+- Qwen: 2, 2-MoE, 2-VL, 3, 3-MoE, 3-Next, 3-VL (existing)
+
+**Files Modified:**
+- `chatspace/vllm_steering/runtime.py` - Added Llama patches
+- `chatspace/steering/model.py` - Renamed to TransformerSteerModel
+- `chatspace/steering/__init__.py` - Export new name
+- `chatspace/generation/vllm_steer_model.py` - Updated docs
+- `tests/test_llama_vllm_steering.py` - New test suite
+- `scripts/test_llama_steering.py` - New smoke test
+
+**Verification:**
+```bash
+# Verify patches
+uv run python -c "from chatspace.vllm_steering import runtime; runtime.ensure_layer_patch_installed(); print(len(runtime._PATCHED_CLASSES))"  # 9 classes
+
+# Run tests
+uv run pytest tests/test_vllm_steering*.py  # 6 passed (Qwen tests, no regressions)
+uv run pytest tests/test_llama_vllm_steering.py  # 4 skipped (model not downloaded)
+```
+
+**Backward Compatibility:** All changes fully backward compatible - `QwenSteerModel` preserved as alias, no public API changes.
+
 ## 2025-10-03
 - Updated `chatspace/steering/train.py` to expose knob for gradient checkpointing, device mapping, epochs, and to print dataset/token counts before training. Trainer now skips Hugging Face model card writes and persists only the learnable steering vector plus config via `QwenSteerModel.save_pretrained`.
 - Added lightweight serialization helpers to `chatspace/steering/model.py` (`save_pretrained`/`from_pretrained`) so checkpoints store just `steering_vector.pt` and `steering_config.json` instead of the full 32B model weights.

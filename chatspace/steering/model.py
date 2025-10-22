@@ -1,4 +1,4 @@
-"""Trainable steering vector module for Qwen models."""
+"""Trainable steering vector module for transformer models."""
 
 from __future__ import annotations
 
@@ -36,11 +36,12 @@ class SteeringVectorConfig:
     init_scale: float = 0.0
 
 
-class QwenSteerModel(nn.Module, SteerableModel):
-    """Wrap a Qwen causal LM with an additive steering vector at a residual layer.
+class TransformerSteerModel(nn.Module, SteerableModel):
+    """Wrap a transformer causal LM with an additive steering vector at a residual layer.
 
     This class implements the SteerableModel interface for HuggingFace transformers
-    models, providing steering vector injection via PyTorch forward hooks.
+    models, providing steering vector injection via PyTorch forward hooks. Supports
+    Qwen, Llama, and other decoder-only models with standard layer structures.
     """
 
     def __init__(self, cfg: SteeringVectorConfig, **model_kwargs) -> None:
@@ -140,7 +141,7 @@ class QwenSteerModel(nn.Module, SteerableModel):
             json.dump(asdict(self.cfg), fh, indent=2)
 
     @classmethod
-    def from_pretrained(cls, save_directory: str | Path, **model_kwargs) -> "QwenSteerModel":
+    def from_pretrained(cls, save_directory: str | Path, **model_kwargs) -> "TransformerSteerModel":
         path = Path(save_directory)
         config_path = path / "steering_config.json"
         if not config_path.exists():
@@ -160,3 +161,7 @@ class QwenSteerModel(nn.Module, SteerableModel):
             model.steering.vector.data.copy_(tensor)
 
         return model
+
+
+# Backward compatibility alias
+QwenSteerModel = TransformerSteerModel

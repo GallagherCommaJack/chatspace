@@ -1,7 +1,7 @@
 """Steering helpers for coordinating vLLM worker state with chatspace.
 
 The helpers in this module wrap ``vllm.LLM`` so steering vectors can be injected
-into Qwen-style decoder layers without breaking CUDA graph capture.  The primary
+into Qwen and Llama decoder layers without breaking CUDA graph capture.  The primary
 entry point is :class:`VLLMSteerModel`, which mirrors the
 ``SteerableModel`` interface used by the HuggingFace implementation:
 
@@ -194,7 +194,7 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
 
 
 class VLLMSteerModel(SteerableModel):
-    """Steerable wrapper around ``vllm.LLM`` for Qwen-family models.
+    """Steerable wrapper around ``vllm.LLM`` for Qwen and Llama models.
 
     The wrapper keeps a small cache of per-layer steering metadata and mirrors
     the :class:`chatspace.generation.base.SteerableModel` contract so higher
