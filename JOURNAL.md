@@ -2,6 +2,76 @@
 
 ## 2025-10-22
 
+### Tensor Parallelism Support for Steering (Investigation & Verification)
+
+**Timestamp:** 2025-10-22 22:40 UTC
+
+Investigated tensor parallelism (TP) compatibility for vLLM steering and confirmed that **the current implementation already works correctly with TP without any modifications**.
+
+**Key Architectural Insight:**
+- vLLM's `RowParallelLinear` layers perform `tensor_model_parallel_all_reduce()` before returning
+- At decoder layer boundaries, hidden states are **full-size and replicated** across all TP ranks
+- The `(delta, residual)` tuples contain complete tensors on every rank after allreduce
+- No sharding occurs at the layer interface where steering is applied
+
+**Steering Operations in TP Mode:**
+1. **Additive steering**: Each rank independently adds the same full-size vector → naturally consistent
+2. **Projection capping**: Each rank computes dot product on full-size hidden state → identical results without distributed reductions
+3. **Ablation**: Component scaling operates on full-size states → consistent results
+
+**Implementation Requirements:**
+- ✓ No distributed operations needed in steering code
+- ✓ No vector sharding required
+- ✓ Store full-size steering vectors on each rank
+- ✓ Memory cost: `O(hidden_size)` per rank (not `O(hidden_size / tp_size)`)
+- ✓ Current implementation works unchanged for TP=1, TP=2, TP=4, etc.
+
+**Verification:**
+- Created `scripts/verify_tp_architecture.py` to analyze vLLM's TP implementation
+- Confirmed `RowParallelLinear` uses `reduce_results=True` by default
+- Confirmed attention `o_proj` and MLP `down_proj` both use `RowParallelLinear`
+- Created parity tests in `tests/test_tp_steering_parity.py` (requires 2+ GPUs)
+- Created `scripts/verify_tp_broadcast.py` to verify RPC broadcasting
+- **Verified `collective_rpc` broadcasts to all workers:** Inspected `vllm.v1.executor.multiproc_executor.MultiprocessingGPUExecutor.collective_rpc` and confirmed it uses `rpc_broadcast_mq` to send method calls to all workers, then collects responses from each
+
+**Documentation Updates:**
+- Added "Tensor Parallelism Support" section to `chatspace/vllm_steering/runtime.py` module docstring
+- Explained why no distributed operations are needed
+- Clarified memory cost model
+
+**Files Modified/Created:**
+- `chatspace/vllm_steering/runtime.py` - Added TP documentation to module docstring
+- `tests/test_tp_steering_parity.py` - New parity tests (requires multi-GPU)
+- `scripts/verify_tp_architecture.py` - Architecture analysis tool
+- `scripts/verify_tp_broadcast.py` - RPC broadcasting verification tool
+
+**Conclusion:**
+Steering with TP "just works" because vLLM's architecture ensures hidden states are full-size at layer boundaries. No code changes needed - only documentation to explain the behavior.
+
+**Detailed Verification Summary:**
+
+1. **Hidden States Are Full-Size:** Verified via vLLM source code inspection that `RowParallelLinear.forward` performs `tensor_model_parallel_all_reduce()` before returning, ensuring `(delta, residual)` tuples are full-size on every rank.
+
+2. **RPC Broadcasting Confirmed:** Inspected `MultiprocessingGPUExecutor.collective_rpc` source code and confirmed it uses `rpc_broadcast_mq.enqueue()` to send method calls to all workers, then collects responses from each. When we call `set_layer_vector()`, the vector is sent to ALL workers.
+
+3. **Steering Operations Are Rank-Independent:** All three operations produce identical results when applied independently (mathematically guaranteed):
+   - Additive: `hidden + vector` (same inputs → same output)
+   - Projection capping: `dot(hidden, direction)` (same inputs → same projection)
+   - Ablation: `hidden + scale * component` (same inputs → same result)
+
+4. **Memory Cost:** `O(hidden_size)` per rank (not sharded). For Llama 70B with `hidden_size=8192`, that's ~32KB per vector per rank - acceptable.
+
+5. **Single-GPU Testing:** Confirmed TP=1 works correctly with all steering operations.
+
+**CAVEAT:** Multi-GPU testing (TP≥2) was **not** performed due to hardware limitations (only 1 GPU available). While the architectural analysis strongly indicates correctness, the following remain unverified:
+- Actual vector placement on multiple GPUs
+- Hidden state replication across physical TP ranks
+- Logprob parity between TP=1 and TP=2+ configurations
+
+**TODO:** Run `tests/test_tp_steering_parity.py` on hardware with 2+ GPUs to confirm empirical parity.
+
+---
+
 ### Llama Steering Support Implementation
 
 **Timestamp:** 2025-10-22 22:31 UTC

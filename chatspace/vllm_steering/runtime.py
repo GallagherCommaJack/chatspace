@@ -4,6 +4,33 @@ These helpers are executed inside vLLM worker processes via collective RPCs.
 They patch decoder layers in Qwen and Llama models so steering vectors participate
 in CUDA-graph captures, and provide APIs to update vectors or retarget layers
 at runtime.
+
+Tensor Parallelism Support
+---------------------------
+Steering operations are designed to work transparently with vLLM's tensor parallelism
+(TP). At decoder layer boundaries, vLLM's ``RowParallelLinear`` layers perform
+allreduce operations, ensuring hidden states are full-size (replicated) across all TP
+ranks (verified via source code inspection).
+
+**Broadcasting:** The ``collective_rpc`` mechanism broadcasts steering vectors to all
+TP workers via a shared message queue (``rpc_broadcast_mq``). Each worker receives the
+identical full-size vector and applies it independently.
+
+**Steering Semantics:**
+- **Additive steering**: Each rank independently adds the same full-size vector,
+  maintaining consistency across ranks without coordination.
+- **Projection capping**: Each rank computes dot products on full-size hidden
+  states, yielding identical projections without requiring distributed reductions.
+- **Ablation**: Component scaling operates on full-size states independently with
+  consistent results.
+
+**Implementation:** No distributed operations or vector sharding are needed in the
+steering code. The implementation stores full-size steering vectors on each rank,
+with memory cost ``O(hidden_size)`` per rank rather than ``O(hidden_size / tp_size)``.
+
+**Note:** Single-GPU (TP=1) behavior has been empirically verified. Multi-GPU (TP≥2)
+correctness is expected based on architectural analysis but requires hardware testing
+to confirm.
 """
 
 from __future__ import annotations
