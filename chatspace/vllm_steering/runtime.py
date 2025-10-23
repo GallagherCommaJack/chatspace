@@ -1,9 +1,9 @@
 """Worker-side utilities for steering vector control inside vLLM workers.
 
 These helpers are executed inside vLLM worker processes via collective RPCs.
-They patch decoder layers in Qwen and Llama models so steering vectors participate
-in CUDA-graph captures, and provide APIs to update vectors or retarget layers
-at runtime.
+They patch decoder layers in Qwen, Llama, and Gemma models so steering vectors
+participate in CUDA-graph captures, and provide APIs to update vectors or
+retarget layers at runtime.
 
 Tensor Parallelism Support
 ---------------------------
@@ -165,6 +165,10 @@ _PATCH_TARGETS: Sequence[tuple[str, str]] = (
     ("vllm.model_executor.models.llama_eagle", "LlamaDecoderLayer"),
     ("vllm.model_executor.models.llama_eagle3", "LlamaDecoderLayer"),
     ("vllm.model_executor.models.llama4_eagle", "Llama4DecoderLayer"),
+    # Gemma models
+    ("vllm.model_executor.models.gemma", "GemmaDecoderLayer"),
+    ("vllm.model_executor.models.gemma2", "Gemma2DecoderLayer"),
+    ("vllm.model_executor.models.gemma3", "Gemma3DecoderLayer"),
 )
 
 _PATCHED_CLASSES: set[type] = set()
@@ -455,7 +459,7 @@ def _apply_ablation(hidden: torch.Tensor, config: _AblationConfig) -> torch.Tens
     if config.scale == 1.0:
         return hidden
     flat = _reshape_for_component_ops(hidden, config.unit_vector.shape[0])
-    unit = config.unit_vector
+    unit = config.unit_vector.to(dtype=flat.dtype)  # Match hidden state dtype
     projection = flat @ unit
     component = projection.unsqueeze(-1) * unit
     flat = flat + (config.scale - 1.0) * component
@@ -633,7 +637,14 @@ def ensure_layer_patch_installed() -> None:
 
 
 def _resolve_layers(model: Any) -> list[LayerLike]:
-    """Return the list of transformer layers for Qwen and Llama architectures."""
+    """Return the list of transformer layers for Qwen, Llama, and Gemma architectures."""
+    # Multimodal models (e.g., Gemma3ForConditionalGeneration)
+    if hasattr(model, "language_model"):
+        if hasattr(model.language_model, "model") and hasattr(model.language_model.model, "layers"):
+            return list(model.language_model.model.layers)
+        if hasattr(model.language_model, "layers"):
+            return list(model.language_model.layers)
+    # Standard text-only models
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return list(model.model.layers)
     if hasattr(model, "layers"):
@@ -749,7 +760,15 @@ def initialize_worker_state(
     model = worker.model_runner.model
     layers = _resolve_layers(model)
 
-    hidden_size = model.config.hidden_size
+    # Handle multimodal models (e.g., Gemma3) where config is nested
+    config = model.config
+    if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
+        hidden_size = config.text_config.hidden_size
+    elif hasattr(config, "hidden_size"):
+        hidden_size = config.hidden_size
+    else:
+        raise RuntimeError(f"Could not resolve hidden_size from config of type {type(config)}")
+
     first_param = next(model.parameters(), None)
     if first_param is None:
         raise RuntimeError("Model has no parameters to infer device/dtype.")

@@ -41,7 +41,7 @@ class TransformerSteerModel(nn.Module, SteerableModel):
 
     This class implements the SteerableModel interface for HuggingFace transformers
     models, providing steering vector injection via PyTorch forward hooks. Supports
-    Qwen, Llama, and other decoder-only models with standard layer structures.
+    Qwen, Llama, Gemma, and other decoder-only models with standard layer structures.
     """
 
     def __init__(self, cfg: SteeringVectorConfig, **model_kwargs) -> None:
