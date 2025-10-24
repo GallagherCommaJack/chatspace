@@ -1,5 +1,84 @@
 # Engineering Journal
 
+## 2025-10-24
+
+### vLLM Activation Capture for Qwen3-32B Personas
+
+**Timestamp:** 2025-10-24 00:02 UTC
+
+Successfully set up and launched vLLM-native activation capture pipeline to re-gather steering vectors with improved accuracy for 241 personas (traits_240 + roles_240).
+
+**Motivation:**
+- Steering vectors captured from HuggingFace Transformers perform slightly worse when applied in vLLM inference
+- Suspected cause: Execution path differences, precision handling, and layer fusion between HF and vLLM
+- Solution: Capture activations directly in vLLM using the same runtime where vectors will be applied
+
+**Implementation:**
+
+Created comprehensive capture infrastructure in `/root/persona-subspace/roleplay/`:
+- `2_activations_vllm.py` - Main capture script using VLLMSteerModel with capture hooks
+- `run_vllm_captures.sh` - Multi-GPU job scheduler using task-spooler
+- `run_gpu0_only.sh` / `run_gpu1_only.sh` - Single-GPU job submission scripts
+- `check_queues.sh` / `watch_queues.sh` - Queue monitoring utilities
+- `fresh_restart.sh` - Clean restart with GPU memory clearing
+
+**Key Technical Details:**
+- Model: `Qwen/Qwen3-32B` with dtype variants (bfloat16, float16, float32)
+- Datasets: 241 personas × 2400 samples each (traits_240 + roles_240)
+- Batch size: 200 prompts per batch (optimized from initial 4 → 50 → 200)
+- Processing: ~1-2 minutes per persona
+- Capture method: `enable_hidden_state_capture()` + `fetch_hidden_states()` from vLLM steering runtime
+- Output: Per-persona `.pt` files with activations, contrast vectors, and metadata
+
+**Challenges Solved:**
+1. **CUDA memory leaks**: Killed processes left persistent GPU allocations (129GB) that prevented new jobs
+   - Solution: Used `lsof | grep nvidia` to find all PIDs holding NVIDIA resources and kill them
+   - Required killing both main Python processes and VLLM::EngineCore subprocesses
+
+2. **Batch size optimization**: Initial MAX_SAMPLES=50 only used 2.08% of available data (50/2400)
+   - Increased to MAX_SAMPLES=2400 to use all samples per persona
+   - Increased BATCH_SIZE from 4 → 50 → 200 for throughput
+   - Note: Batch size doesn't affect VRAM (static allocation), only compute speed
+
+3. **Job distribution**: Round-robin distribution across 2 GPUs for parallel processing
+   - GPU 0: traits_240 float16/float32, roles_240 bfloat16 (3 jobs)
+   - GPU 1: traits_240 bfloat16, roles_240 float16/float32 (3 jobs)
+   - Estimated completion: ~18 hours total (3 jobs × 6 hours per GPU in parallel)
+
+**Completion Status (2025-10-24 10:00 UTC):**
+
+All jobs completed overnight. **4 out of 6 precision variants succeeded**, collecting 1,036 activation vector files.
+
+**Successful Captures:**
+- `traits_240/vectors_vllm_bfloat16/`: 241 personas (4.6 hours processing time)
+- `traits_240/vectors_vllm_float16/`: 241 personas (4.6 hours processing time)
+- `roles_240/vectors_vllm_bfloat16/`: 277 personas (2.8 hours processing time)
+- `roles_240/vectors_vllm_float16/`: 277 personas (similar timing)
+
+**Failed Captures (OOM):**
+- `traits_240/vectors_vllm_float32/`: 0 files - Out of memory during KV cache allocation
+- `roles_240/vectors_vllm_float32/`: 0 files - Out of memory during KV cache allocation
+- Root cause: Float32 requires 2× memory for model weights + KV cache, exceeded 139GB with gpu_memory_utilization=0.9
+- Decision: Skip float32 variants since bfloat16/float16 provide sufficient precision diversity
+
+**Data Summary:**
+- Total captured: 1,036 persona vector files across 4 precision variants
+- Storage location: `/workspace/persona-data/qwen-3-32b/{traits|roles}_240/vectors_vllm_{bfloat16|float16}/`
+- Each file contains: 64 layers × hidden_size activations, contrast vectors (persona - control), metadata
+- File format: PyTorch `.pt` with keys: `activations`, `contrast`, `metadata`
+- Total dataset size: ~2.7 MB (all files combined)
+
+**Key Findings:**
+- roles_240 contains 277 personas (not 241 as initially assumed)
+- Processing rate: ~1.5-2 minutes per persona with batch_size=200, max_samples=2400
+- GPU utilization during processing: 23-28% (KV cache bound, not compute bound)
+- Memory allocation stable: ~130GB per GPU for model + KV cache in float16/bfloat16
+
+**Next Steps:**
+- Compare vLLM-captured vs HF-captured steering vectors (cosine similarity, norm differences)
+- Retrain steering models using vLLM activations for improved vLLM inference performance
+- Evaluate whether bfloat16 vs float16 precision affects steering vector quality
+
 ## 2025-10-23
 
 ### Gemma Steering Support Implementation
