@@ -15,9 +15,6 @@ from vllm import SamplingParams
 
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
-# vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 def test_comprehensive_hidden_state_diagnostics():

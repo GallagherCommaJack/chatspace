@@ -244,14 +244,44 @@ class VLLMSteerModel(SteerableModel):
         if cfg.max_model_len is not None:
             llm_kwargs["max_model_len"] = cfg.max_model_len
         llm_kwargs.update(vllm_kwargs)
+        llm_kwargs.setdefault(
+            "worker_extension_cls", steering_runtime.STEERING_WORKER_EXTENSION
+        )
 
         steering_runtime.ensure_layer_patch_installed()
-        self.llm = LLM(model=cfg.model_name, **llm_kwargs)
+        attempt = 0
+        while True:
+            try:
+                self.llm = LLM(model=cfg.model_name, **llm_kwargs)
+                break
+            except Exception as exc:
+                attempt += 1
+                msg = str(exc)
+                memory_hint = "No available memory for the cache blocks" in msg
+                engine_failed = "Engine core initialization failed" in msg
+                if not (memory_hint or engine_failed):
+                    raise
+                current_util = float(llm_kwargs.get("gpu_memory_utilization", cfg.gpu_memory_utilization))
+                fallback_util = min(
+                    0.95,
+                    max(0.1, current_util + 0.05, current_util * 1.8),
+                )
+                if fallback_util <= current_util + 1e-6 or attempt >= 6:
+                    raise
+                logger.warning(
+                    "vLLM engine reported insufficient KV cache memory at gpu_memory_utilization=%.3f; "
+                    "retrying with %.3f to complete steering setup.",
+                    current_util,
+                    fallback_util,
+                )
+                llm_kwargs["gpu_memory_utilization"] = fallback_util
+                self.cfg.gpu_memory_utilization = fallback_util
         if not enforce_eager:
             logger.warning(
                 "vLLM steering currently requires enforce_eager=True to apply layer hooks."
             )
         self._engine_client = self.llm.llm_engine.engine_core
+        steering_runtime.ensure_collective_rpc_gateway_installed()
 
         init_layers: tuple[int, ...]
         if bootstrap_layers is not None:
@@ -259,10 +289,7 @@ class VLLMSteerModel(SteerableModel):
         else:
             init_layers = tuple(int(idx) for idx in cfg.bootstrap_layers)
 
-        setup_info = self._engine_client.collective_rpc(
-            steering_runtime.initialize_worker_state,
-            args=(init_layers,),
-        )
+        setup_info = self._collective_rpc("initialize_worker_state", init_layers)
         if not setup_info:
             raise RuntimeError("Failed to initialize steering state on workers.")
 
@@ -305,6 +332,21 @@ class VLLMSteerModel(SteerableModel):
         if spec.is_empty():
             self._layer_specs.pop(idx, None)
 
+    def _collective_rpc(
+        self,
+        op: str,
+        *args: Any,
+        timeout: float | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        rpc_kwargs = kwargs if kwargs else None
+        return self._engine_client.collective_rpc(
+            steering_runtime.STEERING_RPC_METHOD,
+            timeout=timeout,
+            args=steering_runtime.rpc_args(op, *args),
+            kwargs=rpc_kwargs,
+        )
+
     def _prepare_layer_vector(
         self, vector: torch.Tensor, *, context: str
     ) -> torch.Tensor:
@@ -337,10 +379,7 @@ class VLLMSteerModel(SteerableModel):
         payload = steering_runtime.serialize_tensor(
             add_spec.materialize().to(dtype=self._vector_dtype)
         )
-        self._engine_client.collective_rpc(
-            steering_runtime.set_worker_vector,
-            args=(int(layer_idx), payload),
-        )
+        self._collective_rpc("set_worker_vector", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.add = add_spec.clone()
 
@@ -354,10 +393,7 @@ class VLLMSteerModel(SteerableModel):
             "min": spec.min,
             "max": spec.max,
         }
-        self._engine_client.collective_rpc(
-            steering_runtime.set_worker_projection_cap,
-            args=(int(layer_idx), payload),
-        )
+        self._collective_rpc("set_worker_projection_cap", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.projection_cap = spec.clone()
 
@@ -368,32 +404,21 @@ class VLLMSteerModel(SteerableModel):
             ),
             "scale": float(spec.scale),
         }
-        self._engine_client.collective_rpc(
-            steering_runtime.set_worker_ablation,
-            args=(int(layer_idx), payload),
-        )
+        self._collective_rpc("set_worker_ablation", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.ablation = spec.clone()
 
     def _broadcast_clear(self, layer_idx: int | None = None) -> None:
         if layer_idx is None:
-            self._engine_client.collective_rpc(steering_runtime.clear_worker_vector)
-            self._engine_client.collective_rpc(
-                steering_runtime.clear_worker_projection_cap
-            )
-            self._engine_client.collective_rpc(steering_runtime.clear_worker_ablation)
+            self._collective_rpc("clear_worker_vector")
+            self._collective_rpc("clear_worker_projection_cap")
+            self._collective_rpc("clear_worker_ablation")
             self._layer_specs.clear()
         else:
             target = int(layer_idx)
-            self._engine_client.collective_rpc(
-                steering_runtime.clear_worker_vector, args=(target,)
-            )
-            self._engine_client.collective_rpc(
-                steering_runtime.clear_worker_projection_cap, args=(target,)
-            )
-            self._engine_client.collective_rpc(
-                steering_runtime.clear_worker_ablation, args=(target,)
-            )
+            self._collective_rpc("clear_worker_vector", target)
+            self._collective_rpc("clear_worker_projection_cap", target)
+            self._collective_rpc("clear_worker_ablation", target)
             layer_spec = self._layer_specs.get(target)
             if layer_spec is not None:
                 layer_spec.add = None
@@ -454,9 +479,7 @@ class VLLMSteerModel(SteerableModel):
 
     def clear_layer_projection_cap(self, layer_idx: int) -> None:
         target = int(layer_idx)
-        self._engine_client.collective_rpc(
-            steering_runtime.clear_worker_projection_cap, args=(target,)
-        )
+        self._collective_rpc("clear_worker_projection_cap", target)
         layer_spec = self._layer_specs.get(target)
         if layer_spec is not None:
             layer_spec.projection_cap = None
@@ -480,9 +503,7 @@ class VLLMSteerModel(SteerableModel):
             dtype_name = dtype.removeprefix("torch.")
         else:
             raise TypeError("dtype must be a torch.dtype, string, or None.")
-        self._engine_client.collective_rpc(
-            steering_runtime.set_projection_cap_precision, args=(dtype_name,)
-        )
+        self._collective_rpc("set_projection_cap_precision", dtype_name)
 
     def set_layer_ablation(
         self,
@@ -503,9 +524,7 @@ class VLLMSteerModel(SteerableModel):
 
     def clear_layer_ablation(self, layer_idx: int) -> None:
         target = int(layer_idx)
-        self._engine_client.collective_rpc(
-            steering_runtime.clear_worker_ablation, args=(target,)
-        )
+        self._collective_rpc("clear_worker_ablation", target)
         layer_spec = self._layer_specs.get(target)
         if layer_spec is not None:
             layer_spec.ablation = None
@@ -862,16 +881,17 @@ class VLLMSteerModel(SteerableModel):
 
     def _fetch_worker_vectors(self) -> list[dict[int, torch.Tensor]]:
         """Retrieve current worker vectors for validation."""
-        payloads = self._engine_client.collective_rpc(
-            steering_runtime.fetch_worker_vectors
-        )
+        payloads = self._collective_rpc("fetch_worker_vectors")
         worker_vectors: list[dict[int, torch.Tensor]] = []
         for payload in payloads:
             worker_map: dict[int, torch.Tensor] = {}
-            for layer_idx, tensor in payload.items():
-                worker_map[int(layer_idx)] = (
-                    tensor.detach().to(dtype=self._vector_dtype).cpu().clone()
-                )
+            for layer_idx, tensor_payload in payload.items():
+                tensor = steering_runtime.deserialize_tensor(
+                    tensor_payload,
+                    device=torch.device("cpu"),
+                    dtype=self._vector_dtype,
+                ).clone()
+                worker_map[int(layer_idx)] = tensor
             worker_vectors.append(worker_map)
         return worker_vectors
 
@@ -917,9 +937,9 @@ class VLLMSteerModel(SteerableModel):
                 raise ValueError(
                     f"Layer index {idx} out of range for model with {self.layer_count} layers"
                 )
-            self._engine_client.collective_rpc(
-                steering_runtime.enable_hidden_state_capture,
-                args=(idx,),
+            self._collective_rpc(
+                "enable_hidden_state_capture",
+                idx,
                 kwargs={
                     "capture_before": capture_before,
                     "capture_after": capture_after,
@@ -940,17 +960,13 @@ class VLLMSteerModel(SteerableModel):
             Layer index, sequence of indices, or ``None`` to disable all layers.
         """
         if layer_idx is None:
-            self._engine_client.collective_rpc(
-                steering_runtime.disable_hidden_state_capture, args=(None,)
-            )
+            self._collective_rpc("disable_hidden_state_capture", None)
         else:
             indices = (
                 [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
             )
             for idx in indices:
-                self._engine_client.collective_rpc(
-                    steering_runtime.disable_hidden_state_capture, args=(idx,)
-                )
+                self._collective_rpc("disable_hidden_state_capture", idx)
 
     def fetch_hidden_states(
         self, layer_idx: int | Sequence[int] | None = None
@@ -991,11 +1007,38 @@ class VLLMSteerModel(SteerableModel):
         else:
             rpc_args = (int(layer_idx),)
 
-        payloads = self._engine_client.collective_rpc(
-            steering_runtime.fetch_captured_hidden_states,
-            args=rpc_args,
+        payloads = self._collective_rpc(
+            "fetch_captured_hidden_states", *rpc_args
         )
-        return cast(list[dict[int, list[dict[str, Any]]]], payloads)
+        def _is_tensor_payload(value: Any) -> bool:
+            return (
+                isinstance(value, dict)
+                and "dtype" in value
+                and "shape" in value
+                and "data" in value
+            )
+
+        decoded: list[dict[int, list[dict[str, Any]]]] = []
+        for payload in payloads:
+            layer_map: dict[int, list[dict[str, Any]]] = {}
+            for layer_idx, entries in payload.items():
+                decoded_entries: list[dict[str, Any]] = []
+                for entry in entries:
+                    decoded_entry: dict[str, Any] = {}
+                    for key, value in entry.items():
+                        if _is_tensor_payload(value):
+                            decoded_entry[key] = steering_runtime.deserialize_tensor(
+                                value,
+                                device=torch.device("cpu"),
+                            )
+                        elif isinstance(value, dict):
+                            decoded_entry[key] = dict(value)
+                        else:
+                            decoded_entry[key] = value
+                    decoded_entries.append(decoded_entry)
+                layer_map[int(layer_idx)] = decoded_entries
+            decoded.append(layer_map)
+        return decoded
 
     def clear_hidden_states(self, layer_idx: int | None = None) -> None:
         """Clear captured hidden states without disabling capture.
@@ -1007,7 +1050,7 @@ class VLLMSteerModel(SteerableModel):
         layer_idx :
             Layer index to clear, or ``None`` to clear all layers.
         """
-        self._engine_client.collective_rpc(
-            steering_runtime.clear_captured_hidden_states,
-            args=(layer_idx,) if layer_idx is not None else (),
-        )
+        if layer_idx is None:
+            self._collective_rpc("clear_captured_hidden_states")
+        else:
+            self._collective_rpc("clear_captured_hidden_states", layer_idx)

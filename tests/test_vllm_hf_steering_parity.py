@@ -14,9 +14,6 @@ from vllm import SamplingParams
 
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
-# vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 
 @dataclass
 class ProjectionCapParams:

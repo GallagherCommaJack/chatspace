@@ -195,6 +195,53 @@ _PATCHED_CLASSES: set[type] = set()
 _PATCH_INSTALLED = False
 _SEEN_OUTPUT_TYPES: set[str] = set()
 
+STEERING_RPC_METHOD = "_chatspace_steering_rpc"
+STEERING_WORKER_EXTENSION = "chatspace.vllm_steering.runtime.SteeringWorkerExtension"
+_RPC_HANDLERS: dict[str, Callable[..., Any]] = {}
+_RPC_GATEWAY_INSTALLED = False
+
+
+def rpc_args(op: str, *args: Any) -> tuple[Any, ...]:
+    return (op, *args)
+
+
+def _register_rpc(name: str, func: Callable[..., Any]) -> None:
+    _RPC_HANDLERS[name] = func
+
+
+def ensure_collective_rpc_gateway_installed() -> None:
+    """Expose steering RPC handlers via vLLM's msgpack-safe interface."""
+    global _RPC_GATEWAY_INSTALLED
+    if _RPC_GATEWAY_INSTALLED:
+        return
+    try:
+        from vllm.worker.worker_base import WorkerWrapperBase
+    except Exception:  # pragma: no cover - vLLM not available
+        return
+    if hasattr(WorkerWrapperBase, STEERING_RPC_METHOD):
+        _RPC_GATEWAY_INSTALLED = True
+        return
+
+    def _dispatch(self: Any, op: str, *args: Any, **kwargs: Any) -> Any:
+        handler = _RPC_HANDLERS.get(op)
+        if handler is None:
+            raise ValueError(f"Unknown chatspace steering RPC: {op}")
+        target = getattr(self, "worker", self)
+        return handler(target, *args, **kwargs)
+
+    setattr(WorkerWrapperBase, STEERING_RPC_METHOD, _dispatch)
+    _RPC_GATEWAY_INSTALLED = True
+
+
+class SteeringWorkerExtension:
+    """Worker mixin providing msgpack-safe steering RPC handling."""
+
+    def _chatspace_steering_rpc(self, op: str, *args: Any, **kwargs: Any) -> Any:
+        handler = _RPC_HANDLERS.get(op)
+        if handler is None:
+            raise ValueError(f"Unknown chatspace steering RPC: {op}")
+        return handler(self, *args, **kwargs)
+
 
 def _setup_async_capture_infrastructure(state: _SteeringState) -> None:
     """Ensure background capture machinery is initialised for a worker."""
@@ -880,7 +927,30 @@ def deserialize_tensor(
         if target_dtype is None:
             raise TypeError(f"Unsupported tensor dtype payload: {dtype_str}")
         shape_tuple = tuple(int(dim) for dim in shape)
-        tensor = torch.tensor(data, dtype=target_dtype).reshape(shape_tuple)
+        storage_dtype_str = payload.get("storage_dtype")
+        encoding = payload.get("encoding")
+        if encoding == "bytes":
+            if isinstance(data, memoryview):  # type: ignore[name-defined]
+                raw = data.tobytes()
+            elif isinstance(data, (bytes, bytearray)):
+                raw = bytes(data)
+            else:
+                raise TypeError(f"Unsupported tensor data payload for encoding=bytes: {type(data)}")
+            if len(raw) == 0:
+                tensor = torch.empty(shape_tuple, dtype=target_dtype)
+            else:
+                storage_dtype = target_dtype
+                if storage_dtype_str:
+                    storage_dtype = getattr(torch, storage_dtype_str, None)
+                    if not isinstance(storage_dtype, torch.dtype):
+                        raise TypeError(f"Unsupported storage dtype payload: {storage_dtype_str}")
+                tensor = torch.frombuffer(raw, dtype=storage_dtype).clone().reshape(shape_tuple)
+                if storage_dtype != target_dtype:
+                    tensor = tensor.to(dtype=target_dtype)
+        elif encoding in (None, "list"):
+            tensor = torch.tensor(data, dtype=target_dtype).reshape(shape_tuple)
+        else:
+            raise TypeError(f"Unsupported tensor encoding: {encoding}")
     elif (
         isinstance(payload, (list, tuple))
         and len(payload) == 3
@@ -917,11 +987,27 @@ def deserialize_tensor(
 def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
     """Serialize tensor into a JSON-friendly structure for RPC transport."""
     arr = tensor.detach().cpu().contiguous()
-    return {
-        "dtype": str(arr.dtype).removeprefix("torch."),
+    dtype_name = str(arr.dtype).removeprefix("torch.")
+    storage = arr
+    storage_dtype_name = dtype_name
+    if arr.numel() == 0:
+        buffer = b""
+    else:
+        try:
+            buffer = storage.numpy().tobytes()
+        except TypeError:
+            storage = arr.to(dtype=torch.float32)
+            storage_dtype_name = str(storage.dtype).removeprefix("torch.")
+            buffer = storage.numpy().tobytes()
+    payload: dict[str, Any] = {
+        "dtype": dtype_name,
         "shape": list(arr.shape),
-        "data": arr.view(-1).tolist(),
+        "data": buffer,
+        "encoding": "bytes",
     }
+    if storage_dtype_name != dtype_name:
+        payload["storage_dtype"] = storage_dtype_name
+    return payload
 
 
 def initialize_worker_state(
@@ -1146,11 +1232,11 @@ def clear_worker_vector(worker: Any, layer_idx: int | None = None) -> None:
             vec.zero_()
 
 
-def fetch_worker_vectors(worker: Any) -> dict[int, torch.Tensor]:
-    """Return CPU copies of steering vectors keyed by layer index."""
+def fetch_worker_vectors(worker: Any) -> dict[int, dict[str, Any]]:
+    """Return serialized steering vectors keyed by layer index."""
     state = _ensure_state(worker)
     return {
-        layer_idx: vector.detach().cpu().clone()
+        layer_idx: serialize_tensor(vector)
         for layer_idx, vector in state.layer_vectors.items()
     }
 
@@ -1311,7 +1397,7 @@ def disable_hidden_state_capture(
 def fetch_captured_hidden_states(
     worker: Any, layer_idx: int | Sequence[int] | None = None
 ) -> dict[int, list[dict[str, Any]]]:
-    """Retrieve captured hidden states from one or all layers.
+    """Retrieve serialized hidden states from one or all layers.
 
     Parameters
     ----------
@@ -1325,21 +1411,21 @@ def fetch_captured_hidden_states(
     -------
     dict[int, list[dict[str, Any]]]
         Mapping of layer indices to lists of capture entries. Each entry is a dict
-        with ``"before"``/``"after"`` tensors plus optional ``"meta"``, ``"cap_delta"``,
-        and ``"cap_meta"`` diagnostics.
+        with ``"before"``/``"after"`` tensors serialized via :func:`serialize_tensor`
+        plus optional ``"meta"``, ``"cap_delta"``, and ``"cap_meta"`` diagnostics.
     """
     state = _ensure_state(worker)
 
-    def _clone_entry(entry: dict[str, Any]) -> dict[str, Any]:
-        cloned: dict[str, Any] = {}
+    def _serialize_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        serialized: dict[str, Any] = {}
         for key, value in entry.items():
             if isinstance(value, torch.Tensor):
-                cloned[key] = value.detach().cpu().clone()
+                serialized[key] = serialize_tensor(value)
             elif isinstance(value, dict):
-                cloned[key] = dict(value)
+                serialized[key] = dict(value)
             else:
-                cloned[key] = value
-        return cloned
+                serialized[key] = value
+        return serialized
 
     if layer_idx is None:
         indices: Sequence[int] | None = None
@@ -1355,7 +1441,7 @@ def fetch_captured_hidden_states(
     if indices is None:
         return {
             idx: [
-                _clone_entry(entry)
+                _serialize_entry(entry)
                 for entry in captures
             ]
             for idx, captures in state.captured_states.items()
@@ -1367,7 +1453,7 @@ def fetch_captured_hidden_states(
     for target_idx in indices:
         captures = state.captured_states.get(target_idx, [])
         result[target_idx] = [
-            _clone_entry(entry)
+            _serialize_entry(entry)
             for entry in captures
         ]
     return result
@@ -1405,3 +1491,25 @@ def clear_captured_hidden_states(
         counter = state.capture_counters.get(target_idx)
         if counter is not None:
             counter.reset()
+
+
+for _rpc_fn in (
+    initialize_worker_state,
+    set_worker_vector,
+    set_worker_projection_cap,
+    clear_worker_projection_cap,
+    set_projection_cap_precision,
+    set_worker_ablation,
+    clear_worker_ablation,
+    clear_worker_vector,
+    fetch_worker_vectors,
+    fetch_worker_state,
+    inspect_layer_vector,
+    enable_hidden_state_capture,
+    disable_hidden_state_capture,
+    fetch_captured_hidden_states,
+    clear_captured_hidden_states,
+):
+    _register_rpc(_rpc_fn.__name__, _rpc_fn)
+
+ensure_collective_rpc_gateway_installed()
