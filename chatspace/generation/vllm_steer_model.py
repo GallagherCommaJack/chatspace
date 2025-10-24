@@ -249,33 +249,20 @@ class VLLMSteerModel(SteerableModel):
         )
 
         steering_runtime.ensure_layer_patch_installed()
-        attempt = 0
-        while True:
-            try:
-                self.llm = LLM(model=cfg.model_name, **llm_kwargs)
-                break
-            except Exception as exc:
-                attempt += 1
-                msg = str(exc)
-                memory_hint = "No available memory for the cache blocks" in msg
-                engine_failed = "Engine core initialization failed" in msg
-                if not (memory_hint or engine_failed):
-                    raise
-                current_util = float(llm_kwargs.get("gpu_memory_utilization", cfg.gpu_memory_utilization))
-                fallback_util = min(
-                    0.95,
-                    max(0.1, current_util + 0.05, current_util * 1.8),
-                )
-                if fallback_util <= current_util + 1e-6 or attempt >= 6:
-                    raise
-                logger.warning(
-                    "vLLM engine reported insufficient KV cache memory at gpu_memory_utilization=%.3f; "
-                    "retrying with %.3f to complete steering setup.",
-                    current_util,
-                    fallback_util,
-                )
-                llm_kwargs["gpu_memory_utilization"] = fallback_util
-                self.cfg.gpu_memory_utilization = fallback_util
+        try:
+            self.llm = LLM(model=cfg.model_name, **llm_kwargs)
+        except Exception as exc:
+            msg = str(exc)
+            memory_hint = "No available memory for the cache blocks" in msg
+            engine_failed = "Engine core initialization failed" in msg
+            if memory_hint or engine_failed:
+                requested_util = float(llm_kwargs.get("gpu_memory_utilization", cfg.gpu_memory_utilization))
+                raise RuntimeError(
+                    "vLLM steering initialization failed: gpu_memory_utilization="
+                    f"{requested_util:.3f} did not leave enough room for the KV cache. "
+                    "Please rerun with a higher gpu_memory_utilization."
+                ) from exc
+            raise
         if not enforce_eager:
             logger.warning(
                 "vLLM steering currently requires enforce_eager=True to apply layer hooks."
