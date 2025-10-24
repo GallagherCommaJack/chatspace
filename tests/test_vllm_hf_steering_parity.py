@@ -14,9 +14,6 @@ from vllm import SamplingParams
 
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
-# vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 
 @dataclass
 class ProjectionCapParams:
@@ -1361,8 +1358,11 @@ def test_delta_vs_residual_instrumented():
 
         try:
             vllm_cfg = VLLMSteeringConfig(
-                model_name=model_name, tensor_parallel_size=1, gpu_memory_utilization=0.05,
-                max_model_len=inputs.input_ids.shape[1] + 16, dtype="float32"
+                model_name=model_name,
+                tensor_parallel_size=1,
+                gpu_memory_utilization=0.2,
+                max_model_len=inputs.input_ids.shape[1] + 16,
+                dtype="float32",
             )
             vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
             vllm_model.set_layer_vector(target_layer, steering_vector)

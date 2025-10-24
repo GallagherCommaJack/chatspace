@@ -690,3 +690,9 @@ User can now:
 - Must carefully track whether operations work on deltas vs full states
 - Hidden state capture must materialize the same representation that downstream code expects
 - Decode vs prefill phases have different tensor shapes/magnitudes (both correct)
+2025-10-24T02:16:39Z
+- vLLM capture fetch now accepts multiple layer indices per RPC; worker runtimes assemble all requested layers in a single response so multi-layer feature extraction only incurs one roundtrip per forward.
+- Added GPU regression `test_hidden_state_capture_fetch_multiple_layers_subset` to lock the behaviour down (`uv run pytest tests/test_vllm_hidden_state_capture.py -k fetch_multiple_layers_subset -q`).
+- Benchmark (Qwen3-0.6B, layers [1,3,5,7]): sequential per-layer fetch averaged 1.79 ms, batched fetch averaged 1.01 ms → 1.77× speedup on raw RPC time (`uv run python /tmp/bench_fetch.py` run and cleaned up).
+- Hidden-state capture now launches GPU→CPU transfers on a dedicated stream and flushes them from a background worker thread, so decoder layers no longer block on `.cpu()` before proceeding.
+- TODO: reuse pinned CPU buffers per (layer, shape) to avoid churn, and make `disable_hidden_state_capture` drain any in-flight async copies before clearing state.

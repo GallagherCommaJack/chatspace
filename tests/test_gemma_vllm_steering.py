@@ -16,9 +16,6 @@ from chatspace.generation import (
 from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
 
-# vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
@@ -75,7 +72,8 @@ def test_gemma_vllm_steering_vector_round_trip(model_name: str):
 
     # Check that patching works (output_types should include tuple)
     inspection = model._engine_client.collective_rpc(
-        steering_runtime.inspect_layer_vector, args=(target_layer,)
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
     assert inspection, "Expected inspection data for target layer."
     layer_info = inspection[0]

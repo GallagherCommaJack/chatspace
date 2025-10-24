@@ -16,9 +16,6 @@ from chatspace.generation import (
 from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
 
-# vLLM >=0.11 requires enabling pickle-based serialization for custom RPCs.
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
@@ -67,7 +64,8 @@ def test_llama_vllm_steering_vector_round_trip(model_name: str):
 
     # Verify projection cap and ablation were set
     inspection = model._engine_client.collective_rpc(
-        steering_runtime.inspect_layer_vector, args=(target_layer,)
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
     assert inspection, "Expected inspection data for target layer."
     layer_info = inspection[0]
@@ -89,7 +87,8 @@ def test_llama_vllm_steering_vector_round_trip(model_name: str):
     model.clear_layer_projection_cap(target_layer)
     model.clear_layer_ablation(target_layer)
     inspection_after_clear = model._engine_client.collective_rpc(
-        steering_runtime.inspect_layer_vector, args=(target_layer,)
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
     assert inspection_after_clear, "Expected inspection after clearing."
     layer_info_after_clear = inspection_after_clear[0]
@@ -97,7 +96,10 @@ def test_llama_vllm_steering_vector_round_trip(model_name: str):
     assert layer_info_after_clear.get("ablation") is None
 
     # Test multi-layer steering
-    worker_state = model._engine_client.collective_rpc(steering_runtime.fetch_worker_state)
+    worker_state = model._engine_client.collective_rpc(
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("fetch_worker_state"),
+    )
     assert worker_state, "Expected worker state info."
     layer_count = int(worker_state[0].get("layer_count", 0) or 0)
     if layer_count > 1:
@@ -163,7 +165,8 @@ def test_llama_vllm_chat_respects_steering(model_name: str):
 
     # Verify steering was applied
     worker_info = model._engine_client.collective_rpc(
-        steering_runtime.inspect_layer_vector, args=(target_layer,)
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
     assert worker_info, "Expected worker diagnostics."
     assert worker_info[0]["has_vector"], "Patched layer missing steering vector."

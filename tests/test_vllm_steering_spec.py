@@ -16,18 +16,31 @@ from chatspace.generation import (
     VLLMSteerModel,
     VLLMSteeringConfig,
 )
+from chatspace.vllm_steering import runtime as steering_runtime
 
 
 class _DummyEngineClient:
     """Record-only stub for the vLLM engine RPC interface."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object] | None]] = []
 
-    def collective_rpc(self, fn, args=()):  # pragma: no cover - simple stub
-        name = getattr(fn, "__name__", repr(fn))
-        self.calls.append((name, args))
-        # vLLM returns a list of worker responses; we only need the shape.
+    def collective_rpc(  # pragma: no cover - simple stub
+        self,
+        method,
+        timeout: float | None = None,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ):
+        if method == steering_runtime.STEERING_RPC_METHOD:
+            if not args:
+                raise AssertionError("RPC opcode missing in stub call.")
+            op = str(args[0])
+            payload = args[1:]
+            self.calls.append((op, payload, kwargs))
+        else:
+            name = getattr(method, "__name__", repr(method))
+            self.calls.append((name, args, kwargs))
         return [{}]
 
 
