@@ -242,6 +242,44 @@ def test_hidden_state_capture_multiple_layers():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_hidden_state_capture_fetch_multiple_layers_subset():
+    """Test fetching hidden states for a subset of layers in a single RPC."""
+    cfg = VLLMSteeringConfig(
+        model_name="Qwen/Qwen3-0.6B",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=128,
+    )
+
+    layers = [1, 2, 3]
+    subset = [layers[0], layers[2]]
+
+    try:
+        model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=layers)
+    except OSError as exc:  # pragma: no cover - allows offline environments
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    model.enable_hidden_state_capture(layers)
+
+    prompt = "Subset fetch test"
+    sampling = SamplingParams(temperature=0.0, max_tokens=2)
+    model.generate([prompt], sampling_params=sampling)
+
+    states = model.fetch_hidden_states(layer_idx=subset)
+    assert len(states) > 0, "Expected at least one worker payload"
+
+    worker_states = states[0]
+    assert set(worker_states.keys()) == set(subset), "Fetch should only include requested layers"
+
+    for layer_idx in subset:
+        captures = worker_states[layer_idx]
+        assert len(captures) > 0, f"Layer {layer_idx} should include captures"
+
+    model.disable_hidden_state_capture(layers)
+    del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 def test_hidden_state_capture_only_before():
     """Test capturing only before states."""
     cfg = VLLMSteeringConfig(

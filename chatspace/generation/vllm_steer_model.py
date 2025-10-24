@@ -953,7 +953,7 @@ class VLLMSteerModel(SteerableModel):
                 )
 
     def fetch_hidden_states(
-        self, layer_idx: int | None = None
+        self, layer_idx: int | Sequence[int] | None = None
     ) -> list[dict[int, list[dict[str, Any]]]]:
         """Retrieve captured hidden states from workers.
 
@@ -965,7 +965,7 @@ class VLLMSteerModel(SteerableModel):
         Parameters
         ----------
         layer_idx :
-            Layer index to fetch, or ``None`` to fetch all layers.
+            Layer index, iterable of indices, or ``None`` to fetch all layers.
 
         Returns
         -------
@@ -984,9 +984,16 @@ class VLLMSteerModel(SteerableModel):
         >>> after_steering = first_capture["after"]
         >>> step_meta = first_capture["meta"]  # {'phase': 'prefill', 'step': 0, ...}
         """
+        if layer_idx is None:
+            rpc_args: tuple[Any, ...] = ()
+        elif isinstance(layer_idx, Sequence) and not isinstance(layer_idx, (str, bytes, bytearray)):
+            rpc_args = (tuple(int(idx) for idx in layer_idx),)
+        else:
+            rpc_args = (int(layer_idx),)
+
         payloads = self._engine_client.collective_rpc(
             steering_runtime.fetch_captured_hidden_states,
-            args=(layer_idx,) if layer_idx is not None else (),
+            args=rpc_args,
         )
         return cast(list[dict[int, list[dict[str, Any]]]], payloads)
 
