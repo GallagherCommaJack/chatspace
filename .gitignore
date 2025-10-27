@@ -18,6 +18,7 @@ wheels/
 workspace
 persona-subspace
 TEMP_JOURNAL.md
+TEMP_*.md
 
 .uv_cache/
 .ruff_cache/
