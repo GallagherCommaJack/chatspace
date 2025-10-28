@@ -14,7 +14,9 @@ from chatspace.vllm_steering import runtime as steering_runtime
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_basic():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_basic():
     """Test basic hidden state capture enable/disable/fetch."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -31,15 +33,15 @@ def test_hidden_state_capture_basic():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture
-    model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True)
+    await model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True)
 
     # Generate with capture enabled
     prompt = "The quick brown fox"
     sampling = SamplingParams(temperature=0.0, max_tokens=2)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch captured states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     assert len(states) > 0, "Expected at least one worker"
     worker_states = states[0]
     assert target_layer in worker_states, f"Layer {target_layer} not in captured states"
@@ -65,12 +67,12 @@ def test_hidden_state_capture_basic():
 
     # Clear captured states
     model.clear_hidden_states(target_layer)
-    cleared_states = model.fetch_hidden_states(layer_idx=target_layer)
+    cleared_states = await model.fetch_hidden_states(layer_idx=target_layer)
     assert len(cleared_states[0][target_layer]) == 0, "States should be cleared"
 
     # Generate again to ensure counters reset after clearing
-    model.generate([prompt], sampling_params=sampling)
-    refreshed_states = model.fetch_hidden_states(layer_idx=target_layer)
+    await model.generate([prompt], sampling_params=sampling)
+    refreshed_states = await model.fetch_hidden_states(layer_idx=target_layer)
     refreshed_capture = refreshed_states[0][target_layer][0]
     assert refreshed_capture["meta"]["step"] == 0, "Counters should reset after clearing"
 
@@ -79,21 +81,23 @@ def test_hidden_state_capture_basic():
     unit[0] = 1.0
     model.set_layer_projection_cap(target_layer, unit, max=0.0)
     model.clear_hidden_states(target_layer)
-    model.generate([prompt], sampling_params=sampling)
-    capped_states = model.fetch_hidden_states(layer_idx=target_layer)
+    await model.generate([prompt], sampling_params=sampling)
+    capped_states = await model.fetch_hidden_states(layer_idx=target_layer)
     capped_capture = capped_states[0][target_layer][0]
     assert "cap_delta" in capped_capture, "Expected projection delta in capture entry"
     assert "cap_meta" in capped_capture, "Expected projection delta metadata"
     model.clear_layer_projection_cap(target_layer)
 
     # Disable capture
-    model.disable_hidden_state_capture(target_layer)
+    await model.disable_hidden_state_capture(target_layer)
 
     del model
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_verifies_steering():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_verifies_steering():
     """Test that captured states verify steering is actually applied."""
     torch.manual_seed(42)
 
@@ -113,18 +117,18 @@ def test_hidden_state_capture_verifies_steering():
 
     # Set a steering vector
     steering_vector = torch.randn(model.hidden_size, dtype=torch.float32) * 10.0
-    model.set_layer_vector(target_layer, steering_vector)
+    await model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture
-    model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True)
+    await model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True)
 
     # Generate
     prompt = "The capital of France is"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     layer_captures = states[0][target_layer]
     assert len(layer_captures) > 0, "Expected captures"
 
@@ -157,12 +161,14 @@ def test_hidden_state_capture_verifies_steering():
     # Allow for some variation due to model dynamics
     assert cos_sim > 0.5, f"Cosine similarity {cos_sim} should indicate steering was applied"
 
-    model.clear_all_vectors()
+    await model.clear_all_vectors()
     del model
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_max_captures():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_max_captures():
     """Test that max_captures limit is respected."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -179,17 +185,17 @@ def test_hidden_state_capture_max_captures():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture with max_captures=2
-    model.enable_hidden_state_capture(target_layer, max_captures=2)
+    await model.enable_hidden_state_capture(target_layer, max_captures=2)
 
     # Generate multiple times
     prompt = "Test"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
 
     for _ in range(5):
-        model.generate([prompt], sampling_params=sampling)
+        await model.generate([prompt], sampling_params=sampling)
 
     # Fetch states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     layer_captures = states[0][target_layer]
 
     # Should have at most 2 captures
@@ -199,7 +205,9 @@ def test_hidden_state_capture_max_captures():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_multiple_layers():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_multiple_layers():
     """Test capturing from multiple layers simultaneously."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -216,15 +224,15 @@ def test_hidden_state_capture_multiple_layers():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture on multiple layers
-    model.enable_hidden_state_capture(layers)
+    await model.enable_hidden_state_capture(layers)
 
     # Generate
     prompt = "Hello world"
     sampling = SamplingParams(temperature=0.0, max_tokens=2)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch all states
-    states = model.fetch_hidden_states()
+    states = await model.fetch_hidden_states()
     worker_states = states[0]
 
     # Check all layers captured
@@ -233,13 +241,15 @@ def test_hidden_state_capture_multiple_layers():
         assert len(worker_states[layer_idx]) > 0, f"Layer {layer_idx} should have at least one capture"
 
     # Disable all layers
-    model.disable_hidden_state_capture(layers)
+    await model.disable_hidden_state_capture(layers)
 
     del model
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_fetch_multiple_layers_subset():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_fetch_multiple_layers_subset():
     """Test fetching hidden states for a subset of layers in a single RPC."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -256,13 +266,13 @@ def test_hidden_state_capture_fetch_multiple_layers_subset():
     except OSError as exc:  # pragma: no cover - allows offline environments
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
-    model.enable_hidden_state_capture(layers)
+    await model.enable_hidden_state_capture(layers)
 
     prompt = "Subset fetch test"
     sampling = SamplingParams(temperature=0.0, max_tokens=2)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
-    states = model.fetch_hidden_states(layer_idx=subset)
+    states = await model.fetch_hidden_states(layer_idx=subset)
     assert len(states) > 0, "Expected at least one worker payload"
 
     worker_states = states[0]
@@ -272,12 +282,14 @@ def test_hidden_state_capture_fetch_multiple_layers_subset():
         captures = worker_states[layer_idx]
         assert len(captures) > 0, f"Layer {layer_idx} should include captures"
 
-    model.disable_hidden_state_capture(layers)
+    await model.disable_hidden_state_capture(layers)
     del model
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_only_before():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_only_before():
     """Test capturing only before states."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -294,15 +306,15 @@ def test_hidden_state_capture_only_before():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture only for before states
-    model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
+    await model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
 
     # Generate
     prompt = "Test prompt"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     layer_captures = states[0][target_layer]
 
     assert len(layer_captures) > 0, "Expected captures"
@@ -315,7 +327,9 @@ def test_hidden_state_capture_only_before():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_only_after():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_only_after():
     """Test capturing only after states."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -332,15 +346,15 @@ def test_hidden_state_capture_only_after():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture only for after states
-    model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
+    await model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
 
     # Generate
     prompt = "Test prompt"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     layer_captures = states[0][target_layer]
 
     assert len(layer_captures) > 0, "Expected captures"
@@ -353,7 +367,9 @@ def test_hidden_state_capture_only_after():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_state_capture_disable_all():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_state_capture_disable_all():
     """Test disabling capture for all layers at once."""
     cfg = VLLMSteeringConfig(
         model_name="Qwen/Qwen3-0.6B",
@@ -370,25 +386,25 @@ def test_hidden_state_capture_disable_all():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture on multiple layers
-    model.enable_hidden_state_capture(layers)
+    await model.enable_hidden_state_capture(layers)
 
     # Generate to create some captures
     prompt = "Test"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Verify captures exist
-    states = model.fetch_hidden_states()
+    states = await model.fetch_hidden_states()
     assert len(states[0]) > 0, "Should have some captures"
 
     # Disable all at once
-    model.disable_hidden_state_capture(None)
+    await model.disable_hidden_state_capture(None)
 
     # Generate again
-    model.generate([prompt], sampling_params=sampling)
+    await model.generate([prompt], sampling_params=sampling)
 
     # Fetch states - should be empty after disable
-    states_after = model.fetch_hidden_states()
+    states_after = await model.fetch_hidden_states()
     worker_states = states_after[0]
 
     # All layers should either be missing or have empty capture lists
@@ -400,7 +416,9 @@ def test_hidden_state_capture_disable_all():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_states_match_hf():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_states_match_hf():
     """Test that captured hidden states match between HuggingFace and vLLM.
 
     This test compares the prefill hidden states from both implementations
@@ -475,14 +493,14 @@ def test_hidden_states_match_hf():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture for vLLM (capture before steering, no steering applied)
-    vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
+    await vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
 
     # Generate with vLLM using the same prompt
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    vllm_model.generate([prompt], sampling_params=sampling)
+    await vllm_model.generate([prompt], sampling_params=sampling)
 
     # Fetch captured states
-    vllm_states = vllm_model.fetch_hidden_states(layer_idx=target_layer)
+    vllm_states = await vllm_model.fetch_hidden_states(layer_idx=target_layer)
     vllm_captures = vllm_states[0][target_layer]
 
     assert len(vllm_captures) > 0, "Should have captured at least one hidden state from vLLM"
@@ -539,14 +557,16 @@ def test_hidden_states_match_hf():
     # This indicates the models are producing similar hidden representations
 
     # Clean up
-    vllm_model.clear_all_vectors()
+    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_hidden_states_match_hf_decode_phase():
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_hidden_states_match_hf_decode_phase():
     """Test that captured hidden states match between HuggingFace and vLLM during decode phase.
 
     This test validates that the hidden state capture fix works correctly during
@@ -642,14 +662,14 @@ def test_hidden_states_match_hf_decode_phase():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture for vLLM (capture before steering)
-    vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
+    await vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
 
     # Generate with vLLM using the same prompt (ignore EOS to ensure we generate the requested number)
     sampling = SamplingParams(temperature=0.0, max_tokens=num_decode_tokens, logprobs=0, ignore_eos=True)
-    vllm_model.generate([prompt], sampling_params=sampling)
+    await vllm_model.generate([prompt], sampling_params=sampling)
 
     # Fetch captured states
-    vllm_states = vllm_model.fetch_hidden_states(layer_idx=target_layer)
+    vllm_states = await vllm_model.fetch_hidden_states(layer_idx=target_layer)
     vllm_captures = vllm_states[0][target_layer]
 
     # vLLM captures: [0] = prefill, [1:] = decode steps
@@ -734,7 +754,7 @@ def test_hidden_states_match_hf_decode_phase():
     print(f"\n✓ All {num_tokens_to_compare} decode steps match between HF and vLLM")
 
     # Clean up
-    vllm_model.clear_all_vectors()
+    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()

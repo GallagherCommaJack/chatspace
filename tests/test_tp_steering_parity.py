@@ -20,9 +20,23 @@ from vllm import SamplingParams
 from chatspace.generation.vllm_steer_model import VLLMSteerModel, VLLMSteeringConfig
 
 
+async def _get_final_output(model, prompt, sampling_params):
+    """Helper to get final output from async generator."""
+    import uuid
+    # Ensure engine is initialized before accessing model.llm
+    await model._ensure_engine_initialized()
+    final_output = None
+    request_id = f"test_{uuid.uuid4().hex}"
+    async for output in model.llm.generate(prompt, sampling_params, request_id=request_id):
+        final_output = output
+    return final_output
+
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
-def test_tp_additive_steering_matches_single_gpu():
+@pytest.mark.asyncio
+async def test_tp_additive_steering_matches_single_gpu():
     """Test that TP=2 additive steering produces same logprobs as single GPU."""
     torch.manual_seed(42)
     model_name = "Qwen/Qwen3-0.6B"
@@ -35,6 +49,7 @@ def test_tp_additive_steering_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -43,14 +58,14 @@ def test_tp_additive_steering_matches_single_gpu():
     # Single GPU baseline and steered
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=10)
 
-    baseline_single = model_single.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    baseline_single = await _get_final_output(model_single, prompt, sampling)
     baseline_logprobs_single = {
         tok: data.logprob
         for tok, data in baseline_single.outputs[0].logprobs[0].items()
     }
 
-    model_single.set_layer_vector(target_layer, steering_vec)
-    steered_single = model_single.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_single.set_layer_vector(target_layer, steering_vec)
+    steered_single = await _get_final_output(model_single, prompt, sampling)
     steered_logprobs_single = {
         tok: data.logprob
         for tok, data in steered_single.outputs[0].logprobs[0].items()
@@ -65,17 +80,18 @@ def test_tp_additive_steering_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    baseline_tp = model_tp.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    baseline_tp = await _get_final_output(model_tp, prompt, sampling)
     baseline_logprobs_tp = {
         tok: data.logprob
         for tok, data in baseline_tp.outputs[0].logprobs[0].items()
     }
 
-    model_tp.set_layer_vector(target_layer, steering_vec)
-    steered_tp = model_tp.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_tp.set_layer_vector(target_layer, steering_vec)
+    steered_tp = await _get_final_output(model_tp, prompt, sampling)
     steered_logprobs_tp = {
         tok: data.logprob
         for tok, data in steered_tp.outputs[0].logprobs[0].items()
@@ -107,7 +123,8 @@ def test_tp_additive_steering_matches_single_gpu():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
-def test_tp_projection_cap_matches_single_gpu():
+@pytest.mark.asyncio
+async def test_tp_projection_cap_matches_single_gpu():
     """Test that TP=2 projection capping produces same logprobs as single GPU."""
     torch.manual_seed(43)
     model_name = "Qwen/Qwen3-0.6B"
@@ -120,6 +137,7 @@ def test_tp_projection_cap_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -130,8 +148,8 @@ def test_tp_projection_cap_matches_single_gpu():
     # Single GPU with projection cap
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=10)
 
-    model_single.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
-    capped_single = model_single.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_single.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
+    capped_single = await _get_final_output(model_single, prompt, sampling)
     capped_logprobs_single = {
         tok: data.logprob
         for tok, data in capped_single.outputs[0].logprobs[0].items()
@@ -146,11 +164,12 @@ def test_tp_projection_cap_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    model_tp.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
-    capped_tp = model_tp.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_tp.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
+    capped_tp = await _get_final_output(model_tp, prompt, sampling)
     capped_logprobs_tp = {
         tok: data.logprob
         for tok, data in capped_tp.outputs[0].logprobs[0].items()
@@ -172,7 +191,8 @@ def test_tp_projection_cap_matches_single_gpu():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
-def test_tp_ablation_matches_single_gpu():
+@pytest.mark.asyncio
+async def test_tp_ablation_matches_single_gpu():
     """Test that TP=2 ablation produces same logprobs as single GPU."""
     torch.manual_seed(44)
     model_name = "Qwen/Qwen3-0.6B"
@@ -185,6 +205,7 @@ def test_tp_ablation_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -195,8 +216,8 @@ def test_tp_ablation_matches_single_gpu():
     # Single GPU with ablation
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=10)
 
-    model_single.set_layer_ablation(target_layer, direction, scale=scale)
-    ablated_single = model_single.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_single.set_layer_ablation(target_layer, direction, scale=scale)
+    ablated_single = await _get_final_output(model_single, prompt, sampling)
     ablated_logprobs_single = {
         tok: data.logprob
         for tok, data in ablated_single.outputs[0].logprobs[0].items()
@@ -211,11 +232,12 @@ def test_tp_ablation_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        dtype="float16",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    model_tp.set_layer_ablation(target_layer, direction, scale=scale)
-    ablated_tp = model_tp.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
+    await model_tp.set_layer_ablation(target_layer, direction, scale=scale)
+    ablated_tp = await _get_final_output(model_tp, prompt, sampling)
     ablated_logprobs_tp = {
         tok: data.logprob
         for tok, data in ablated_tp.outputs[0].logprobs[0].items()

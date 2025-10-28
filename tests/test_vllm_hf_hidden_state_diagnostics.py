@@ -17,7 +17,8 @@ from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_comprehensive_hidden_state_diagnostics():
+@pytest.mark.asyncio
+async def test_comprehensive_hidden_state_diagnostics():
     """Comprehensive analysis of differences between HF and vLLM hidden states."""
     torch.manual_seed(42)
 
@@ -86,14 +87,14 @@ def test_comprehensive_hidden_state_diagnostics():
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
 
     # Enable capture for vLLM
-    vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
+    await vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
 
     # Generate with vLLM
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    vllm_model.generate([prompt], sampling_params=sampling)
+    await vllm_model.generate([prompt], sampling_params=sampling)
 
     # Fetch captured states
-    vllm_states = vllm_model.fetch_hidden_states(layer_idx=target_layer)
+    vllm_states = await vllm_model.fetch_hidden_states(layer_idx=target_layer)
     vllm_captures = vllm_states[0][target_layer]
 
     assert len(vllm_captures) > 0
@@ -352,7 +353,7 @@ def test_comprehensive_hidden_state_diagnostics():
     print(f"  - Cosine similarity:         {cos_sim:.6f}")
 
     # Clean up
-    vllm_model.clear_all_vectors()
+    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()

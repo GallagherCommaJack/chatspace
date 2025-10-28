@@ -22,10 +22,10 @@ from __future__ import annotations
 
 import json
 import math
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Iterator, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast, overload
 import logging
 
 import torch
@@ -277,10 +277,12 @@ class VLLMSteerModel(SteerableModel):
         else:
             self._init_layers = tuple(int(idx) for idx in cfg.bootstrap_layers)
 
-        # Defer worker initialization until first use
-        self.hidden_size: int | None = None
+        # Load model config to get dimensions before engine init
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
+        self.hidden_size: int = model_config.hidden_size
+        self.layer_count: int = model_config.num_hidden_layers
         self._vector_dtype: torch.dtype | None = None
-        self.layer_count: int | None = None
         self._layer_specs: dict[int, LayerSteeringSpec] = {}
         self._steering_stack: list[SteeringSpec] = []
         self._active_layer: int | None = None
@@ -288,9 +290,6 @@ class VLLMSteerModel(SteerableModel):
         # Track prompt token lengths for capture reconstruction
         self._last_prompt_lengths: list[int] | None = None
         self._tokenizer = None
-
-        # Capture lock for serializing per-request captures
-        self._capture_lock = asyncio.Lock()
 
     @property
     def tokenizer(self):
@@ -300,10 +299,24 @@ class VLLMSteerModel(SteerableModel):
             self._tokenizer = AutoTokenizer.from_pretrained(self.cfg.model_name)
         return self._tokenizer
 
+    @property
+    def llm(self):
+        """Access the underlying AsyncLLMEngine for raw generation (tests only)."""
+        return self._engine
+
+    @llm.setter
+    def llm(self, value):
+        """Set the underlying AsyncLLMEngine (for test mocking only)."""
+        self._engine = value
+
     async def _ensure_engine_initialized(self) -> None:
         """Initialize AsyncLLMEngine and workers on first use."""
         async with self._engine_init_lock:
             if self._engine is not None:
+                return
+
+            # Skip initialization if _engine_args doesn't exist (e.g., dummy test models)
+            if not hasattr(self, "_engine_args"):
                 return
 
             from vllm import AsyncLLMEngine
@@ -318,10 +331,19 @@ class VLLMSteerModel(SteerableModel):
                 raise RuntimeError("Failed to initialize steering state on workers.")
 
             first = setup_info[0]
-            self.hidden_size = int(first["hidden_size"])
+            # Verify dimensions match what we loaded from config
+            worker_hidden_size = int(first["hidden_size"])
+            worker_layer_count = int(first["layer_count"])
+            if worker_hidden_size != self.hidden_size:
+                raise RuntimeError(
+                    f"Worker hidden_size {worker_hidden_size} doesn't match config {self.hidden_size}"
+                )
+            if worker_layer_count != self.layer_count:
+                raise RuntimeError(
+                    f"Worker layer_count {worker_layer_count} doesn't match config {self.layer_count}"
+                )
             self._vector_dtype = _parse_dtype(first["dtype"])
-            layer_count = int(first["layer_count"])
-            self.layer_count = layer_count
+            layer_count = self.layer_count
 
             for idx in self._init_layers:
                 if idx < 0 or idx >= layer_count:
@@ -337,8 +359,6 @@ class VLLMSteerModel(SteerableModel):
 
     def _ensure_layer_spec(self, layer_idx: int) -> LayerSteeringSpec:
         idx = int(layer_idx)
-        if self.layer_count is None:
-            raise RuntimeError("Engine not initialized. Call an async method first.")
         if idx < 0 or idx >= self.layer_count:
             raise ValueError(
                 f"Layer index {idx} out of range for model with {self.layer_count} layers"
@@ -453,10 +473,11 @@ class VLLMSteerModel(SteerableModel):
                 layer_spec.ablation = None
             self._prune_layer_entry(target)
 
-    def set_layer_vector(self, layer_idx: int, vector: torch.Tensor | None) -> None:
+    async def set_layer_vector(self, layer_idx: int, vector: torch.Tensor | None) -> None:
+        await self._ensure_engine_initialized()
         target = int(layer_idx)
         if vector is None:
-            self._broadcast_clear(target)
+            await self._broadcast_clear(target)
             return
 
         prepared = self._prepare_layer_vector(
@@ -464,17 +485,17 @@ class VLLMSteerModel(SteerableModel):
         )
         magnitude = float(prepared.norm().item())
         if not math.isfinite(magnitude) or magnitude <= 0.0:
-            self._broadcast_clear(target)
+            await self._broadcast_clear(target)
             return
         unit = (prepared / magnitude).contiguous()
         add_spec = AddSpec(vector=unit, scale=magnitude)
-        self._broadcast_add(target, add_spec)
+        await self._broadcast_add(target, add_spec)
 
-    def set_vector(self, vector: torch.Tensor | None) -> None:
+    async def set_vector(self, vector: torch.Tensor | None) -> None:
         """Set the steering vector for the active layer."""
         if self._active_layer is None:
             raise ValueError("Target layer not set. Call set_target_layer first.")
-        self.set_layer_vector(self._active_layer, vector)
+        await self.set_layer_vector(self._active_layer, vector)
 
     def set_target_layer(self, layer_idx: int) -> None:
         """Select which layer receives ``set_vector`` updates."""
@@ -482,7 +503,7 @@ class VLLMSteerModel(SteerableModel):
         self._ensure_layer_spec(idx)
         self._active_layer = idx
 
-    def set_layer_projection_cap(
+    async def set_layer_projection_cap(
         self,
         layer_idx: int,
         vector: torch.Tensor,
@@ -490,6 +511,7 @@ class VLLMSteerModel(SteerableModel):
         min: float | None = None,
         max: float | None = None,
     ) -> None:
+        await self._ensure_engine_initialized()
         target = int(layer_idx)
         self._ensure_layer_spec(target)
         if min is None and max is None:
@@ -502,11 +524,12 @@ class VLLMSteerModel(SteerableModel):
             vector, context="Projection cap vector"
         )
         spec = ProjectionCapSpec(vector=prepared, min=lower, max=upper)
-        self._broadcast_projection_cap(target, spec)
+        await self._broadcast_projection_cap(target, spec)
 
-    def clear_layer_projection_cap(self, layer_idx: int) -> None:
+    async def clear_layer_projection_cap(self, layer_idx: int) -> None:
+        await self._ensure_engine_initialized()
         target = int(layer_idx)
-        self._collective_rpc("clear_worker_projection_cap", target)
+        await self._collective_rpc("clear_worker_projection_cap", target)
         layer_spec = self._layer_specs.get(target)
         if layer_spec is not None:
             layer_spec.projection_cap = None
@@ -518,10 +541,11 @@ class VLLMSteerModel(SteerableModel):
             return None
         return layer_spec.projection_cap.clone()
 
-    def set_projection_cap_precision(
+    async def set_projection_cap_precision(
         self, dtype: torch.dtype | str | None
     ) -> None:
         """Override the working precision used for projection cap math."""
+        await self._ensure_engine_initialized()
         if dtype is None:
             dtype_name: str | None = None
         elif isinstance(dtype, torch.dtype):
@@ -530,14 +554,15 @@ class VLLMSteerModel(SteerableModel):
             dtype_name = dtype.removeprefix("torch.")
         else:
             raise TypeError("dtype must be a torch.dtype, string, or None.")
-        self._collective_rpc("set_projection_cap_precision", dtype_name)
+        await self._collective_rpc("set_projection_cap_precision", dtype_name)
 
-    def set_layer_ablation(
+    async def set_layer_ablation(
         self,
         layer_idx: int,
         vector: torch.Tensor,
         scale: float,
     ) -> None:
+        await self._ensure_engine_initialized()
         target = int(layer_idx)
         self._ensure_layer_spec(target)
         if not isinstance(scale, (int, float)):
@@ -547,11 +572,12 @@ class VLLMSteerModel(SteerableModel):
             raise ValueError("Ablation scale must be finite.")
         prepared = self._prepare_direction_vector(vector, context="Ablation vector")
         spec = AblationSpec(vector=prepared, scale=scale_value)
-        self._broadcast_ablation(target, spec)
+        await self._broadcast_ablation(target, spec)
 
-    def clear_layer_ablation(self, layer_idx: int) -> None:
+    async def clear_layer_ablation(self, layer_idx: int) -> None:
+        await self._ensure_engine_initialized()
         target = int(layer_idx)
-        self._collective_rpc("clear_worker_ablation", target)
+        await self._collective_rpc("clear_worker_ablation", target)
         layer_spec = self._layer_specs.get(target)
         if layer_spec is not None:
             layer_spec.ablation = None
@@ -573,7 +599,7 @@ class VLLMSteerModel(SteerableModel):
             layers[int(layer_idx)] = cloned
         return SteeringSpec(layers=layers)
 
-    def apply_steering_spec(
+    async def apply_steering_spec(
         self, spec: SteeringSpec, *, clear_missing: bool = True
     ) -> None:
         """Apply a previously captured steering specification.
@@ -584,66 +610,72 @@ class VLLMSteerModel(SteerableModel):
         vector the helper clears any existing steering state before applying
         projection caps or ablations present in the spec.
         """
+        await self._ensure_engine_initialized()
         target_layers = {int(idx) for idx in spec.layers.keys()}
         if clear_missing:
             existing_layers = set(self._layer_specs.keys())
             for layer_idx in sorted(existing_layers - target_layers):
-                self.clear_layer_vector(layer_idx)
+                await self.clear_layer_vector(layer_idx)
 
         for layer_idx_raw, layer_spec in spec.layers.items():
             layer_idx = int(layer_idx_raw)
             add_spec = layer_spec.add
             cleared = add_spec is None
             if cleared:
-                self.clear_layer_vector(layer_idx)
+                await self.clear_layer_vector(layer_idx)
             else:
-                self._broadcast_add(layer_idx, add_spec)
+                await self._broadcast_add(layer_idx, add_spec)
 
             projection_spec = layer_spec.projection_cap
             if projection_spec is not None:
-                self.set_layer_projection_cap(
+                await self.set_layer_projection_cap(
                     layer_idx,
                     projection_spec.vector,
                     min=projection_spec.min,
                     max=projection_spec.max,
                 )
             elif not cleared:
-                self.clear_layer_projection_cap(layer_idx)
+                await self.clear_layer_projection_cap(layer_idx)
 
             ablation_spec = layer_spec.ablation
             if ablation_spec is not None:
-                self.set_layer_ablation(
+                await self.set_layer_ablation(
                     layer_idx, ablation_spec.vector, ablation_spec.scale
                 )
             elif not cleared:
-                self.clear_layer_ablation(layer_idx)
+                await self.clear_layer_ablation(layer_idx)
 
-    def push_steering_spec(
+    async def push_steering_spec(
         self, spec: SteeringSpec, *, clear_missing: bool = True
     ) -> None:
         """Push current steering onto a stack and apply ``spec``."""
         baseline = self.export_steering_spec().clone()
         self._steering_stack.append(baseline)
-        self.apply_steering_spec(spec, clear_missing=clear_missing)
+        await self.apply_steering_spec(spec, clear_missing=clear_missing)
 
-    def pop_steering_spec(self) -> SteeringSpec:
+    async def pop_steering_spec(self) -> SteeringSpec:
         """Restore the most recently pushed steering spec."""
         if not self._steering_stack:
             raise RuntimeError("No steering spec to pop.")
         baseline = self._steering_stack.pop()
-        self.apply_steering_spec(baseline, clear_missing=True)
+        await self.apply_steering_spec(baseline, clear_missing=True)
         return baseline
 
-    @contextmanager
-    def steering(
+    @asynccontextmanager
+    async def steering(
         self, spec: SteeringSpec, *, clear_missing: bool = True
-    ) -> Iterator[None]:
-        """Context manager that reapplies previous steering on exit."""
-        self.push_steering_spec(spec, clear_missing=clear_missing)
+    ):
+        """Async context manager that reapplies previous steering on exit.
+
+        Usage:
+            async with model.steering(spec):
+                await model.generate(...)
+        """
+        await self.push_steering_spec(spec, clear_missing=clear_missing)
         try:
             yield
         finally:
-            self.pop_steering_spec()
+            await self.pop_steering_spec()
 
     def current_vector(self, layer_idx: int | None = None) -> torch.Tensor:
         """Return a CPU copy of the last vector broadcast to workers."""
@@ -661,18 +693,38 @@ class VLLMSteerModel(SteerableModel):
         vector = spec.add.materialize().to(dtype=self._vector_dtype)
         return vector.clone()
 
-    def clear_layer_vector(self, layer_idx: int) -> None:
-        self.set_layer_vector(layer_idx, None)
+    async def clear_layer_vector(self, layer_idx: int) -> None:
+        await self.set_layer_vector(layer_idx, None)
 
-    def clear_all_vectors(self) -> None:
-        self._broadcast_clear()
+    async def clear_all_vectors(self) -> None:
+        await self._ensure_engine_initialized()
+        await self._broadcast_clear()
+
+    @overload
+    async def generate(
+        self,
+        prompts: list[str] | str,
+        sampling_params: SamplingParams | None = None,
+        raw_output: Literal[False] = False,
+        **kwargs: Any,
+    ) -> list[str]: ...
+
+    @overload
+    async def generate(
+        self,
+        prompts: list[str] | str,
+        sampling_params: SamplingParams | None = None,
+        raw_output: Literal[True] = True,
+        **kwargs: Any,
+    ) -> list[Any]: ...  # RequestOutput not imported, use Any
 
     async def generate(
         self,
         prompts: list[str] | str,
         sampling_params: SamplingParams | None = None,
+        raw_output: bool = False,
         **kwargs: Any,
-    ) -> list[str]:
+    ) -> list[str] | list[Any]:
         """Generate text for a list of prompts asynchronously.
 
         Parameters
@@ -681,13 +733,16 @@ class VLLMSteerModel(SteerableModel):
             Prompt or list of prompts to generate from.
         sampling_params : SamplingParams | None
             Sampling parameters for generation.
+        raw_output : bool
+            If True, return full RequestOutput objects with token IDs and logprobs.
+            If False (default), return just the generated text strings.
         **kwargs : Any
             Additional sampling parameters (used if sampling_params is None).
 
         Returns
         -------
-        list[str]
-            Generated texts, one per prompt.
+        list[str] | list[RequestOutput]
+            Generated texts (or RequestOutput objects if raw_output=True), one per prompt.
         """
         import uuid
         await self._ensure_engine_initialized()
@@ -713,9 +768,38 @@ class VLLMSteerModel(SteerableModel):
             if final_output is None:
                 raise RuntimeError(f"No output for prompt: {prompt}")
 
-            results.append(final_output.outputs[0].text)
+            if raw_output:
+                results.append(final_output)
+            else:
+                results.append(final_output.outputs[0].text)
 
         return results
+
+    @overload
+    async def chat(
+        self,
+        messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        use_tqdm: bool = False,
+        chat_options: dict[str, Any] | None = None,
+        prefill_assistant: str | bool | None = None,
+        raw_output: Literal[False] = False,
+        **sampling_kwargs: Any,
+    ) -> list[str]: ...
+
+    @overload
+    async def chat(
+        self,
+        messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        use_tqdm: bool = False,
+        chat_options: dict[str, Any] | None = None,
+        prefill_assistant: str | bool | None = None,
+        raw_output: Literal[True] = True,
+        **sampling_kwargs: Any,
+    ) -> list[Any]: ...  # RequestOutput not imported, use Any
 
     async def chat(
         self,
@@ -725,8 +809,9 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
+        raw_output: bool = False,
         **sampling_kwargs: Any,
-    ) -> list[str]:
+    ) -> list[str] | list[Any]:
         """Execute chat-style generation with optional sampling overrides.
 
         Parameters
@@ -751,6 +836,9 @@ class VLLMSteerModel(SteerableModel):
             are normalized to match template formatting. The helper automatically
             strips the prefix (including the sentinel) from returned outputs. Set
             to ``None`` or ``False`` to disable prefilling.
+        raw_output : bool
+            If True, return full RequestOutput objects with token IDs and logprobs.
+            If False (default), return just the generated text strings.
         **sampling_kwargs : Any
             Keyword arguments used to build a ``SamplingParams`` instance when
             ``sampling_params`` is not supplied.
@@ -823,31 +911,41 @@ class VLLMSteerModel(SteerableModel):
 
         await self._ensure_engine_initialized()
 
-        # Use engine.chat() - AsyncLLMEngine has a chat method
+        # Convert messages to prompts using tokenizer's chat template
         import uuid
-        texts: list[str] = []
+        results: list[str] | list[Any] = []
 
         for messages_conv in prepared_messages:
+            # Apply chat template to convert messages to prompt string
+            prompt = self.tokenizer.apply_chat_template(
+                messages_conv,
+                tokenize=False,
+                **chat_kwargs,
+            )
+
+            # Generate using the formatted prompt
             request_id = f"chat_{uuid.uuid4().hex}"
             final_output = None
 
-            async for output in self._engine.chat(
-                messages_conv,
+            async for output in self._engine.generate(
+                prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
-                **chat_kwargs,
             ):
                 final_output = output
 
             if final_output is None:
                 raise RuntimeError("No output from chat")
 
-            text = final_output.outputs[0].text
-            if trim_prefix and text.startswith(trim_prefix):
-                text = text[len(trim_prefix) :].lstrip()
-            texts.append(text)
+            if raw_output:
+                results.append(final_output)
+            else:
+                text = final_output.outputs[0].text
+                if trim_prefix and text.startswith(trim_prefix):
+                    text = text[len(trim_prefix) :].lstrip()
+                results.append(text)
 
-        return texts
+        return results
 
     async def generate_with_activations(
         self,
@@ -1080,9 +1178,10 @@ class VLLMSteerModel(SteerableModel):
     # Internal debugging helpers (used in tests)
     # ------------------------------------------------------------------
 
-    def _fetch_worker_vectors(self) -> list[dict[int, torch.Tensor]]:
+    async def _fetch_worker_vectors(self) -> list[dict[int, torch.Tensor]]:
         """Retrieve current worker vectors for validation."""
-        payloads = self._collective_rpc("fetch_worker_vectors")
+        await self._ensure_engine_initialized()
+        payloads = await self._collective_rpc("fetch_worker_vectors")
         worker_vectors: list[dict[int, torch.Tensor]] = []
         for payload in payloads:
             worker_map: dict[int, torch.Tensor] = {}
@@ -1096,7 +1195,7 @@ class VLLMSteerModel(SteerableModel):
             worker_vectors.append(worker_map)
         return worker_vectors
 
-    def enable_hidden_state_capture(
+    async def enable_hidden_state_capture(
         self,
         layer_idx: int | Sequence[int],
         *,
@@ -1130,6 +1229,7 @@ class VLLMSteerModel(SteerableModel):
         >>> states = model.fetch_hidden_states()
         >>> print(states[0][2][0]["before"].shape)  # worker 0, layer 2, first capture
         """
+        await self._ensure_engine_initialized()
         indices = (
             [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
         )
@@ -1138,7 +1238,7 @@ class VLLMSteerModel(SteerableModel):
                 raise ValueError(
                     f"Layer index {idx} out of range for model with {self.layer_count} layers"
                 )
-            self._collective_rpc(
+            await self._collective_rpc(
                 "enable_hidden_state_capture",
                 idx,
                 kwargs={
@@ -1148,7 +1248,7 @@ class VLLMSteerModel(SteerableModel):
                 },
             )
 
-    def disable_hidden_state_capture(
+    async def disable_hidden_state_capture(
         self, layer_idx: int | Sequence[int] | None = None
     ) -> None:
         """Disable hidden state capture for one or more layers.
@@ -1160,16 +1260,17 @@ class VLLMSteerModel(SteerableModel):
         layer_idx :
             Layer index, sequence of indices, or ``None`` to disable all layers.
         """
+        await self._ensure_engine_initialized()
         if layer_idx is None:
-            self._collective_rpc("disable_hidden_state_capture", None)
+            await self._collective_rpc("disable_hidden_state_capture", None)
         else:
             indices = (
                 [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
             )
             for idx in indices:
-                self._collective_rpc("disable_hidden_state_capture", idx)
+                await self._collective_rpc("disable_hidden_state_capture", idx)
 
-    def fetch_hidden_states(
+    async def fetch_hidden_states(
         self, layer_idx: int | Sequence[int] | None = None
     ) -> list[dict[int, list[dict[str, Any]]]]:
         """Retrieve captured hidden states from workers.
@@ -1193,14 +1294,15 @@ class VLLMSteerModel(SteerableModel):
         Examples
         --------
         >>> model.enable_hidden_state_capture(2)
-        >>> model.generate(["test"], sampling_params)
-        >>> states = model.fetch_hidden_states(layer_idx=2)
+        >>> await model.generate(["test"], sampling_params)
+        >>> states = await model.fetch_hidden_states(layer_idx=2)
         >>> worker_0_captures = states[0][2]
         >>> first_capture = worker_0_captures[0]
         >>> before_steering = first_capture["before"]  # shape: [batch, seq_len, hidden_size]
         >>> after_steering = first_capture["after"]
         >>> step_meta = first_capture["meta"]  # {'phase': 'prefill', 'step': 0, ...}
         """
+        await self._ensure_engine_initialized()
         if layer_idx is None:
             rpc_args: tuple[Any, ...] = ()
         elif isinstance(layer_idx, Sequence) and not isinstance(layer_idx, (str, bytes, bytearray)):
@@ -1208,7 +1310,7 @@ class VLLMSteerModel(SteerableModel):
         else:
             rpc_args = (int(layer_idx),)
 
-        payloads = self._collective_rpc(
+        payloads = await self._collective_rpc(
             "fetch_captured_hidden_states", *rpc_args
         )
         def _is_tensor_payload(value: Any) -> bool:

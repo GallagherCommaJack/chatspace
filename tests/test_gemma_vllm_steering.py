@@ -17,11 +17,24 @@ from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
 
 
+async def _get_final_output(model, prompt, sampling_params):
+    """Helper to get final output from async generator."""
+    import uuid
+    # Ensure engine is initialized before accessing model.llm
+    await model._ensure_engine_initialized()
+    final_output = None
+    request_id = f"test_{uuid.uuid4().hex}"
+    async for output in model.llm.generate(prompt, sampling_params, request_id=request_id):
+        final_output = output
+    return final_output
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",  # Gemma 1 (Gemma2 requires flash attention with softcapping)
 ])
-def test_gemma_vllm_steering_vector_round_trip(model_name: str):
+@pytest.mark.asyncio
+async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
     """Test basic steering vector operations with Gemma models."""
 
     # Use smaller memory for 2B model
@@ -43,10 +56,10 @@ def test_gemma_vllm_steering_vector_round_trip(model_name: str):
 
     hidden_size = model.hidden_size
     vector = torch.randn(hidden_size, dtype=torch.float32)
-    model.set_layer_vector(target_layer, vector)
+    await model.set_layer_vector(target_layer, vector)
 
     # Verify vector was broadcast to workers
-    worker_maps = model._fetch_worker_vectors()
+    worker_maps = await model._fetch_worker_vectors()
     assert worker_maps, "Expected at least one worker vector."
     for worker_map in worker_maps:
         worker_vec = worker_map[target_layer]
@@ -55,23 +68,23 @@ def test_gemma_vllm_steering_vector_round_trip(model_name: str):
         ), "Broadcast steering vector does not match worker copy."
 
     # Test projection cap (clear additive first)
-    model.clear_layer_vector(target_layer)
+    await model.clear_layer_vector(target_layer)
     cap_vector = torch.randn(hidden_size, dtype=torch.float32)
-    model.set_layer_projection_cap(target_layer, cap_vector, min=-0.5, max=0.75)
+    await model.set_layer_projection_cap(target_layer, cap_vector, min=-0.5, max=0.75)
 
     # Test ablation (clear everything first)
-    model.clear_layer_vector(target_layer)
-    model.clear_layer_projection_cap(target_layer)
+    await model.clear_layer_vector(target_layer)
+    await model.clear_layer_projection_cap(target_layer)
     ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
-    model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
+    await model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
 
     # Run a generation to trigger patched forward method with all operations
     prompt = "Test"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1)
-    model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
 
     # Check that patching works (output_types should include tuple)
-    inspection = model._engine_client.collective_rpc(
+    inspection = await model._engine_client.collective_rpc(
         steering_runtime.STEERING_RPC_METHOD,
         args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
@@ -82,10 +95,10 @@ def test_gemma_vllm_steering_vector_round_trip(model_name: str):
 
     # Test multi-layer steering
     layer_a, layer_b = target_layer - 1, target_layer + 1
-    model.set_layer_vector(layer_a, torch.randn(hidden_size, dtype=torch.float32))
-    model.set_layer_vector(layer_b, torch.randn(hidden_size, dtype=torch.float32))
+    await model.set_layer_vector(layer_a, torch.randn(hidden_size, dtype=torch.float32))
+    await model.set_layer_vector(layer_b, torch.randn(hidden_size, dtype=torch.float32))
 
-    worker_maps = model._fetch_worker_vectors()
+    worker_maps = await model._fetch_worker_vectors()
     for worker_map in worker_maps:
         assert layer_a in worker_map
         assert layer_b in worker_map
@@ -98,7 +111,8 @@ def test_gemma_vllm_steering_vector_round_trip(model_name: str):
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",
 ])
-def test_gemma_vllm_chat_respects_steering(model_name: str):
+@pytest.mark.asyncio
+async def test_gemma_vllm_chat_respects_steering(model_name: str):
     """Verify chat generation is perturbed by steering vectors."""
     torch.manual_seed(42)
     gpu_mem = 0.2
@@ -121,21 +135,21 @@ def test_gemma_vllm_chat_respects_steering(model_name: str):
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
 
     # Baseline generation
-    baseline_result = model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    baseline_result = await _get_final_output(model, prompt, sampling_params)
     baseline_logprobs = {
         tok: data.logprob
-        for tok, data in baseline_result[0].outputs[0].logprobs[0].items()
+        for tok, data in baseline_result.outputs[0].logprobs[0].items()
     }
 
     # Apply strong steering vector
     steering_vec = torch.randn(model.hidden_size, dtype=torch.float32) * 100.0
-    model.set_layer_vector(target_layer, steering_vec)
+    await model.set_layer_vector(target_layer, steering_vec)
 
     # Steered generation
-    steered_result = model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    steered_result = await _get_final_output(model, prompt, sampling_params)
     steered_logprobs = {
         tok: data.logprob
-        for tok, data in steered_result[0].outputs[0].logprobs[0].items()
+        for tok, data in steered_result.outputs[0].logprobs[0].items()
     }
 
     # Verify that logprobs changed significantly for at least some tokens
@@ -150,11 +164,11 @@ def test_gemma_vllm_chat_respects_steering(model_name: str):
     assert max_diff > 0.5, f"Expected significant logprob change, got max diff {max_diff:.3f}"
 
     # Clear steering and verify reset
-    model.clear_layer(target_layer)
-    cleared_result = model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    await model.clear_layer_vector(target_layer)
+    cleared_result = await _get_final_output(model, prompt, sampling_params)
     cleared_logprobs = {
         tok: data.logprob
-        for tok, data in cleared_result[0].outputs[0].logprobs[0].items()
+        for tok, data in cleared_result.outputs[0].logprobs[0].items()
     }
 
     # After clearing, logprobs should be close to baseline
@@ -171,7 +185,8 @@ def test_gemma_vllm_chat_respects_steering(model_name: str):
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",
 ])
-def test_gemma_hidden_state_capture(model_name: str):
+@pytest.mark.asyncio
+async def test_gemma_hidden_state_capture(model_name: str):
     """Test that we can capture hidden states before/after steering."""
     gpu_mem = 0.2
 
@@ -190,14 +205,16 @@ def test_gemma_hidden_state_capture(model_name: str):
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture
-    model.set_layer_capture(target_layer, capture_before=True, capture_after=True, max_captures=2)
+    await model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True, max_captures=2)
 
     prompt = "Hello world"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=2)
-    model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
 
     # Fetch captured states
-    captures = model.fetch_captures()
+    captures_list = await model.fetch_hidden_states(layer_idx=target_layer)
+    assert len(captures_list) > 0, "Expected at least one worker"
+    captures = captures_list[0]  # Get first worker's captures
     assert target_layer in captures, f"Expected captures for layer {target_layer}"
 
     layer_captures = captures[target_layer]
@@ -206,9 +223,9 @@ def test_gemma_hidden_state_capture(model_name: str):
     # Check structure
     first_capture = layer_captures[0]
     assert "before" in first_capture or "after" in first_capture
-    assert "metadata" in first_capture
+    assert "meta" in first_capture
 
-    metadata = first_capture["metadata"]
+    metadata = first_capture["meta"]
     assert "phase" in metadata
     assert "step" in metadata
 
@@ -231,7 +248,8 @@ def test_gemma_hidden_state_capture(model_name: str):
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",
 ])
-def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
+@pytest.mark.asyncio
+async def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
     """Verify that vLLM steering produces similar logprob shifts as HuggingFace baseline."""
     torch.manual_seed(43)
     gpu_mem = 0.2
@@ -257,15 +275,15 @@ def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
 
     # vLLM baseline
-    vllm_baseline = vllm_model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
+    vllm_baseline = await _get_final_output(vllm_model, prompt, sampling_params)
     vllm_baseline_logprobs = {
         tok: data.logprob
         for tok, data in vllm_baseline.outputs[0].logprobs[0].items()
     }
 
     # vLLM steered
-    vllm_model.set_layer_vector(target_layer, steering_vec)
-    vllm_steered = vllm_model.llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
+    await vllm_model.set_layer_vector(target_layer, steering_vec)
+    vllm_steered = await _get_final_output(vllm_model, prompt, sampling_params)
     vllm_steered_logprobs = {
         tok: data.logprob
         for tok, data in vllm_steered.outputs[0].logprobs[0].items()

@@ -68,10 +68,12 @@ dev = [
  "ipywidgets>=8.1.7",
  "matplotlib>=3.10.6",
  "pytest>=8.4.2",
+ "pytest-asyncio>=1.2.0",
  "pytest-mock>=3.15.1",
 ]
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 filterwarnings = [
     "ignore:builtin type [sS]wig.* has no __module__ attribute:DeprecationWarning",
 ]
