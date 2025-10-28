@@ -1046,7 +1046,8 @@ def deserialize_tensor(
                     storage_dtype = getattr(torch, storage_dtype_str, None)
                     if not isinstance(storage_dtype, torch.dtype):
                         raise TypeError(f"Unsupported storage dtype payload: {storage_dtype_str}")
-                tensor = torch.frombuffer(raw, dtype=storage_dtype).clone().reshape(shape_tuple)
+                # Create writable copy to avoid PyTorch warning about non-writable buffers
+                tensor = torch.frombuffer(bytearray(raw), dtype=storage_dtype).clone().reshape(shape_tuple)
                 if storage_dtype != target_dtype:
                     tensor = tensor.to(dtype=target_dtype)
         elif encoding in (None, "list"):
