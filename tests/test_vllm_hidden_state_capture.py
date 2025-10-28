@@ -242,28 +242,52 @@ async def test_hidden_states_match_hf():
     await handles[0].fetch()
     vllm_captures = handles[0].captures[target_layer]
 
-    # Extract last token's hidden state from prefill
+    # Extract hidden states from prefill
     assert len(vllm_captures) > 0, "Expected at least one capture"
     vllm_hidden = vllm_captures[0]["hidden"]  # [seq_len, hidden_size]
+    vllm_hidden_full = vllm_hidden.cpu()
     vllm_last_token = vllm_hidden[-1, :].cpu()
 
     del vllm_model
     torch.cuda.empty_cache()
 
-    # Compare hidden states
-    # For float16, expect tight numerical agreement between implementations
-    cos_sim = torch.nn.functional.cosine_similarity(
+    # Verify shapes match
+    hf_full = hf_hidden[0, :, :].cpu()  # [seq_len, hidden_size]
+    assert hf_full.shape == vllm_hidden_full.shape, (
+        f"Shape mismatch: HF {hf_full.shape} vs vLLM {vllm_hidden_full.shape}"
+    )
+
+    # Compare full hidden state sequence
+    full_cos_sim = torch.nn.functional.cosine_similarity(
+        hf_full.reshape(-1).unsqueeze(0),
+        vllm_hidden_full.reshape(-1).unsqueeze(0)
+    ).item()
+    assert full_cos_sim > 0.999, (
+        f"Full sequence cosine similarity {full_cos_sim:.6f} too low. "
+        f"Expected >0.999 for float16 parity."
+    )
+
+    full_mae = (hf_full - vllm_hidden_full).abs().mean().item()
+    assert full_mae < 1e-3, (
+        f"Full sequence MAE {full_mae:.6f} too large. Expected <1e-3 for float16."
+    )
+
+    # Compare last token specifically (most important for generation)
+    last_cos_sim = torch.nn.functional.cosine_similarity(
         hf_last_token.unsqueeze(0),
         vllm_last_token.unsqueeze(0)
     ).item()
+    assert last_cos_sim > 0.999, (
+        f"Last token cosine similarity {last_cos_sim:.6f} too low. "
+        f"HF and vLLM outputs should match closely."
+    )
 
-    # Cosine similarity should be very high (>0.999)
-    assert cos_sim > 0.999, f"Cosine similarity {cos_sim:.6f} too low. HF and vLLM outputs should match closely."
+    last_mae = (hf_last_token - vllm_last_token).abs().mean().item()
+    assert last_mae < 1e-3, (
+        f"Last token MAE {last_mae:.6f} too large. Expected <1e-3 for float16 parity."
+    )
 
-    # Check mean absolute error (should be ~1e-3 to 1e-4 for float16)
-    mae = (hf_last_token - vllm_last_token).abs().mean().item()
-    assert mae < 1e-3, f"Mean absolute error {mae:.6f} too large. Expected < 1e-3 for float16 parity."
-
-    # Also check RMSE
-    rmse = torch.nn.functional.mse_loss(hf_last_token, vllm_last_token).sqrt().item()
-    assert rmse < 2e-3, f"RMSE {rmse:.6f} too large. Expected < 2e-3 for float16 parity."
+    last_rmse = torch.nn.functional.mse_loss(hf_last_token, vllm_last_token).sqrt().item()
+    assert last_rmse < 2e-3, (
+        f"Last token RMSE {last_rmse:.6f} too large. Expected <2e-3 for float16 parity."
+    )
