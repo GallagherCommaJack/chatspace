@@ -1165,14 +1165,14 @@ class VLLMSteerModel(SteerableModel):
         await self._ensure_engine_initialized()
         payloads = await self._collective_rpc("fetch_request_activations", request_id)
 
-        # Deserialize tensors (same logic as fetch_hidden_states)
+        # Deserialize tensors to CPU for analysis
         decoded: dict[int, list[dict[str, Any]]] = {}
         for worker_payload in payloads:
             for layer_idx_str, tensor_data in worker_payload.items():
                 layer_idx = int(layer_idx_str)
                 tensor = steering_runtime.deserialize_tensor(
                     tensor_data,
-                    device=self.llm.llm_engine.device,
+                    device=torch.device("cpu"),
                     dtype=self._vector_dtype
                 )
                 if layer_idx not in decoded:
@@ -1220,7 +1220,7 @@ class VLLMSteerModel(SteerableModel):
                     layer_idx = int(layer_idx_str)
                     tensor = steering_runtime.deserialize_tensor(
                         tensor_data,
-                        device=self.llm.llm_engine.device,
+                        device=torch.device("cpu"),
                         dtype=self._vector_dtype
                     )
                     if layer_idx not in results_by_request[request_id]:
