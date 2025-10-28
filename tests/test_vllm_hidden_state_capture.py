@@ -172,7 +172,6 @@ async def test_hidden_state_capture_no_capture():
     del model
 
 
-@pytest.mark.skip(reason="TODO: Fix layer indexing - HF and vLLM captures don't match (cos_sim=0.85)")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_states_match_hf():
@@ -181,10 +180,8 @@ async def test_hidden_states_match_hf():
     This test compares the prefill hidden states from both implementations
     to ensure they produce similar representations at the layer level.
 
-    TODO: Current issue - captures show cos_sim=0.85, indicating:
-    - Possible layer index mismatch between HF hidden_states and vLLM capture point
-    - Possible normalization or positional difference
-    - Need to investigate exact capture point in both implementations
+    Note: HuggingFace hidden_states[0] is the embedding output, and hidden_states[i+1]
+    corresponds to decoder layer i's output. This must be accounted for when comparing.
     """
     torch.manual_seed(42)
 
@@ -215,7 +212,8 @@ async def test_hidden_states_match_hf():
     # Capture HF hidden states
     with torch.no_grad():
         hf_outputs = hf_model(**inputs, output_hidden_states=True, use_cache=False)
-        hf_hidden = hf_outputs.hidden_states[target_layer]  # [batch, seq_len, hidden_size]
+        hf_hidden = hf_outputs.hidden_states[target_layer + 1]  # [batch, seq_len, hidden_size]
+        # Note: hidden_states[0] is embedding output, hidden_states[i+1] is layer i output
         # Take last token's hidden state
         hf_last_token = hf_hidden[0, -1, :].cpu()
 
