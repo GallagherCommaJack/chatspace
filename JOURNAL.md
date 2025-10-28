@@ -2,6 +2,45 @@
 
 ## 2025-10-28
 
+### Fixed HF/vLLM Hidden State Parity Test - Off-by-One Indexing Error
+
+**Timestamp:** 2025-10-28 23:50 UTC
+
+Discovered and fixed critical off-by-one indexing error in `test_hidden_states_match_hf` that was causing test to fail with cos_sim=0.85 instead of expected 0.999+.
+
+**Root Cause:**
+HuggingFace's `output_hidden_states` includes embedding layer output as first element:
+- `hidden_states[0]` = embedding layer output
+- `hidden_states[i+1]` = decoder layer `i` output
+
+Test was incorrectly using `hidden_states[target_layer]` which compared vLLM's layer N output against HF's layer N-1 output.
+
+**Investigation Process:**
+1. Interactive debugging in tmux/ipython session
+2. Compared two HF capture methods: `output_hidden_states` vs forward hooks
+3. Found cos_sim=0.854 between the two HF methods (matching test failure!)
+4. Discovered `output_hidden_states` has length 29 for 28-layer model (embedding + 28 layers)
+5. Fixed indexing to `hidden_states[target_layer + 1]`
+6. Verified with corrected indexing: cos_sim=0.999512 ✓
+
+**Key Findings:**
+- HF Qwen layers return single `Tensor` (final hidden state)
+- vLLM Qwen layers return `(delta, residual)` tuple (architectural difference)
+- Both implementations are correct, but indexing must account for embedding offset
+
+**Files Changed:**
+- `/root/chatspace/tests/test_vllm_hidden_state_capture.py` (line 218)
+  - Changed: `hf_hidden = hf_outputs.hidden_states[target_layer]`
+  - To: `hf_hidden = hf_outputs.hidden_states[target_layer + 1]`
+  - Added explanatory comment about embedding offset
+
+**Test Results:**
+- All 5 hidden state capture tests now pass ✓
+- HF parity test passes with proper float16 precision thresholds
+- Commit: `61c2fb2` "Fix off-by-one error in HF/vLLM hidden state parity test"
+
+---
+
 ### Lock-Free Concurrent Batching for vLLM Activation Capture
 
 **Timestamp:** 2025-10-28 02:04 UTC
