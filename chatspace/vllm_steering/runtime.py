@@ -1526,189 +1526,6 @@ def inspect_layer_vector(worker: Any, layer_idx: int | None = None) -> dict[str,
     }
 
 
-def enable_hidden_state_capture(
-    worker: Any,
-    layer_idx: int,
-    *,
-    capture_before: bool = True,
-    capture_after: bool = True,
-    max_captures: int | None = None,
-) -> None:
-    """Enable hidden state capture for a specific layer.
-
-    Parameters
-    ----------
-    worker :
-        The vLLM worker instance.
-    layer_idx :
-        Layer index to enable capture for.
-    capture_before :
-        Whether to capture hidden states before steering is applied.
-    capture_after :
-        Whether to capture hidden states after steering is applied.
-    max_captures :
-        Maximum number of capture entries to store. ``None`` means unlimited.
-    """
-    state = _ensure_state(worker)
-    target_idx = int(layer_idx)
-    _ensure_layer_entry(worker, state, target_idx)
-
-    capture_config = _CaptureConfig(
-        capture_before=bool(capture_before),
-        capture_after=bool(capture_after),
-        max_captures=int(max_captures) if max_captures is not None else None,
-    )
-    state.capture_configs[target_idx] = capture_config
-    state.captured_states[target_idx] = []
-    counter = _CaptureCounters()
-    state.capture_counters[target_idx] = counter
-
-    layers = _resolve_layers(worker.model_runner.model)
-    layer = layers[target_idx]
-    layer._chatspace_capture_config = capture_config  # type: ignore[attr-defined]
-    layer._chatspace_capture_queue = state.captured_states[target_idx]  # type: ignore[attr-defined]
-    layer._chatspace_capture_counter = counter  # type: ignore[attr-defined]
-
-
-def disable_hidden_state_capture(
-    worker: Any, layer_idx: int | None = None
-) -> None:
-    """Disable hidden state capture for one or all layers.
-
-    Parameters
-    ----------
-    worker :
-        The vLLM worker instance.
-    layer_idx :
-        Layer index to disable capture for. If ``None``, disables for all layers.
-    """
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        targets = tuple(state.capture_configs.keys())
-    else:
-        targets = (int(layer_idx),)
-
-    if not targets:
-        return
-
-    layers = _resolve_layers(worker.model_runner.model)
-    for idx in targets:
-        state.capture_configs.pop(idx, None)
-        lock = state.capture_lock
-        context = lock if lock is not None else nullcontext()
-        with context:
-            state.captured_states.pop(idx, None)  # Also clear captured data
-        state.capture_pending.pop(idx, None)
-        state.capture_counters.pop(idx, None)
-        if 0 <= idx < len(layers):
-            layer = layers[idx]
-            if hasattr(layer, "_chatspace_capture_config"):
-                layer._chatspace_capture_config = None  # type: ignore[attr-defined]
-            if hasattr(layer, "_chatspace_capture_queue"):
-                layer._chatspace_capture_queue = None  # type: ignore[attr-defined]
-            if hasattr(layer, "_chatspace_capture_counter"):
-                layer._chatspace_capture_counter = None  # type: ignore[attr-defined]
-
-
-def fetch_captured_hidden_states(
-    worker: Any, layer_idx: int | Sequence[int] | None = None
-) -> dict[int, list[dict[str, Any]]]:
-    """Retrieve serialized hidden states from one or all layers.
-
-    Parameters
-    ----------
-    worker :
-        The vLLM worker instance.
-    layer_idx :
-        Layer index or iterable of indices to fetch captures from. If ``None``,
-        fetches captures from all layers that currently have stored entries.
-
-    Returns
-    -------
-    dict[int, list[dict[str, Any]]]
-        Mapping of layer indices to lists of capture entries. Each entry is a dict
-        with ``"before"``/``"after"`` tensors serialized via :func:`serialize_tensor`
-        plus optional ``"meta"``, ``"cap_delta"``, and ``"cap_meta"`` diagnostics.
-    """
-    state = _ensure_state(worker)
-
-    def _serialize_entry(entry: dict[str, Any]) -> dict[str, Any]:
-        serialized: dict[str, Any] = {}
-        for key, value in entry.items():
-            if isinstance(value, torch.Tensor):
-                serialized[key] = serialize_tensor(value)
-            elif isinstance(value, dict):
-                serialized[key] = dict(value)
-            else:
-                serialized[key] = value
-        return serialized
-
-    if layer_idx is None:
-        indices: Sequence[int] | None = None
-    elif isinstance(layer_idx, Sequence) and not isinstance(layer_idx, (str, bytes, bytearray)):
-        indices = [int(idx) for idx in layer_idx]
-    else:
-        indices = [int(layer_idx)]
-
-    wait_targets = list(state.capture_pending.keys()) if indices is None else list(indices)
-    if wait_targets:
-        _wait_for_pending_captures(state, wait_targets)
-
-    if indices is None:
-        return {
-            idx: [
-                _serialize_entry(entry)
-                for entry in captures
-            ]
-            for idx, captures in state.captured_states.items()
-        }
-
-    indices = list(indices)
-
-    result: dict[int, list[dict[str, Any]]] = {}
-    for target_idx in indices:
-        captures = state.captured_states.get(target_idx, [])
-        result[target_idx] = [
-            _serialize_entry(entry)
-            for entry in captures
-        ]
-    return result
-
-
-def clear_captured_hidden_states(
-    worker: Any, layer_idx: int | None = None
-) -> None:
-    """Clear captured hidden states for one or all layers without disabling capture.
-
-    Parameters
-    ----------
-    worker :
-        The vLLM worker instance.
-    layer_idx :
-        Layer index to clear captures from. If ``None``, clears all layers.
-    """
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        lock = state.capture_lock
-        context = lock if lock is not None else nullcontext()
-        with context:
-            for captures in state.captured_states.values():
-                captures.clear()
-        for counter in state.capture_counters.values():
-            counter.reset()
-    else:
-        target_idx = int(layer_idx)
-        lock = state.capture_lock
-        context = lock if lock is not None else nullcontext()
-        with context:
-            captures = state.captured_states.get(target_idx)
-            if captures is not None:
-                captures.clear()
-        counter = state.capture_counters.get(target_idx)
-        if counter is not None:
-            counter.reset()
-
-
 def _coalesce_prefill_chunks(state: _SteeringState, request_id: str) -> None:
     """Concatenate buffered prefill chunks into final tensor."""
     if request_id not in state.request_prefill_buffers:
@@ -1762,6 +1579,44 @@ def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
     return serialized
 
 
+def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[int, Any]]:
+    """Fetch multiple requests' captures in one RPC call.
+
+    Parameters
+    ----------
+    request_ids : list[str]
+        List of request IDs to fetch captures for.
+
+    Returns
+    -------
+    dict[str, dict[int, Any]]
+        Mapping of request_id to layer captures. Each capture is a serialized tensor.
+    """
+    state = _ensure_state(worker)
+    result: dict[str, dict[int, Any]] = {}
+
+    for req_id in request_ids:
+        # Coalesce any prefill chunks
+        _coalesce_prefill_chunks(state, req_id)
+
+        # Serialize captures
+        captures = state.request_captures.pop(req_id, {})
+        serialized = {
+            layer_idx: serialize_tensor(tensor)
+            for layer_idx, tensor in captures.items()
+        }
+
+        # Cleanup
+        state.active_capture_requests.pop(req_id, None)
+        state.request_prefill_buffers.pop(req_id, None)
+        state.request_last_phase.pop(req_id, None)
+        state.request_token_counts.pop(req_id, None)
+
+        result[req_id] = serialized
+
+    return result
+
+
 def unregister_capture_request(worker: Any, request_id: str) -> None:
     """Clean up aborted or cancelled capture request."""
     state = _ensure_state(worker)
@@ -1784,12 +1639,9 @@ for _rpc_fn in (
     fetch_worker_vectors,
     fetch_worker_state,
     inspect_layer_vector,
-    enable_hidden_state_capture,
-    disable_hidden_state_capture,
-    fetch_captured_hidden_states,
-    clear_captured_hidden_states,
     register_capture_request,
     fetch_request_activations,
+    fetch_batch_captures,
     unregister_capture_request,
 ):
     _register_rpc(_rpc_fn.__name__, _rpc_fn)

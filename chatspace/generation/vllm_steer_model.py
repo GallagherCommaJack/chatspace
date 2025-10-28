@@ -1007,87 +1007,6 @@ class VLLMSteerModel(SteerableModel):
 
         return results
 
-    async def generate_with_activations(
-        self,
-        prompt: str,
-        layers: list[int] | int,
-        sampling_params: SamplingParams | None = None,
-        **sampling_kwargs: Any,
-    ) -> tuple[str, dict[int, torch.Tensor]]:
-        """Generate text and capture activations for this request.
-
-        Parameters
-        ----------
-        prompt : str
-            Input prompt to generate from.
-        layers : list[int] | int
-            Layer index or list of indices to capture activations from.
-        sampling_params : SamplingParams | None
-            Sampling parameters for generation.
-        **sampling_kwargs : Any
-            Alternative way to specify sampling params.
-
-        Returns
-        -------
-        tuple[str, dict[int, torch.Tensor]]
-            Generated text and dict mapping layer_idx to activation tensor.
-            Each tensor has shape [total_tokens, hidden_size] with prefill + decode tokens.
-
-        Examples
-        --------
-        >>> text, acts = await model.generate_with_activations("Hello", layers=[2])
-        >>> acts[2].shape
-        torch.Size([10, 1024])  # 10 tokens total (prefill + decode)
-
-        >>> # Concurrent requests with automatic batching
-        >>> results = await asyncio.gather(
-        ...     model.generate_with_activations("A", layers=[2]),
-        ...     model.generate_with_activations("B", layers=[5]),
-        ... )
-        """
-        import uuid
-
-        await self._ensure_engine_initialized()
-
-        if isinstance(layers, int):
-            layers = [layers]
-
-        if sampling_params is None:
-            sampling_params = SamplingParams(**sampling_kwargs)
-
-        request_id = f"capture_{uuid.uuid4().hex}"
-
-        # Register capture request with workers
-        await self._collective_rpc("register_capture_request", request_id, layers)
-
-        try:
-            # Generate (vLLM batches this with other concurrent requests automatically)
-            final_output = None
-            async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
-                final_output = output
-
-            if final_output is None:
-                raise RuntimeError("No output from generation")
-
-            text = final_output.outputs[0].text
-
-            # Fetch activations
-            worker_captures = await self._collective_rpc("fetch_request_activations", request_id)
-
-            # Deserialize tensors
-            activations = {}
-            for layer_idx, serialized in worker_captures[0].items():
-                activations[int(layer_idx)] = steering_runtime.deserialize_tensor(
-                    serialized, device=torch.device("cpu")
-                )
-
-            return text, activations
-
-        except Exception:
-            # Clean up on error
-            await self._collective_rpc("unregister_capture_request", request_id)
-            raise
-
     def save_pretrained(self, save_directory: str | Path, **_) -> None:
         path = Path(save_directory)
         path.mkdir(parents=True, exist_ok=True)
@@ -1262,6 +1181,56 @@ class VLLMSteerModel(SteerableModel):
 
         return decoded
 
+    async def fetch_captures_batch(
+        self,
+        handles: Sequence[CaptureHandle]
+    ) -> None:
+        """Fetch captures for multiple handles in a single RPC call.
+
+        Args:
+            handles: Sequence of CaptureHandle objects to fetch captures for.
+
+        Note:
+            This mutates the handles in-place by populating their _captures field.
+            Handles that already have captures fetched are skipped.
+        """
+        await self._ensure_engine_initialized()
+
+        # Filter to handles that need fetching
+        to_fetch = [h for h in handles if h._captures is None]
+        if not to_fetch:
+            return
+
+        # Extract request IDs
+        request_ids = [h.request_id for h in to_fetch]
+
+        # Fetch all at once
+        batch_payloads = await self._collective_rpc("fetch_batch_captures", request_ids)
+
+        # Deserialize: batch_payloads is a list (one per worker) of
+        # dict[str, dict[int, Any]] where outer key is request_id
+        results_by_request: dict[str, dict[int, list[dict[str, Any]]]] = {}
+
+        for worker_batch in batch_payloads:
+            for request_id, layer_data in worker_batch.items():
+                if request_id not in results_by_request:
+                    results_by_request[request_id] = {}
+
+                for layer_idx_str, tensor_data in layer_data.items():
+                    layer_idx = int(layer_idx_str)
+                    tensor = steering_runtime.deserialize_tensor(
+                        tensor_data,
+                        device=self.llm.llm_engine.device,
+                        dtype=self._vector_dtype
+                    )
+                    if layer_idx not in results_by_request[request_id]:
+                        results_by_request[request_id][layer_idx] = []
+                    results_by_request[request_id][layer_idx].append({"hidden": tensor})
+
+        # Populate handles
+        for handle in to_fetch:
+            handle._captures = results_by_request.get(handle.request_id, {})
+
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)
     # ------------------------------------------------------------------
@@ -1283,357 +1252,3 @@ class VLLMSteerModel(SteerableModel):
             worker_vectors.append(worker_map)
         return worker_vectors
 
-    async def enable_hidden_state_capture(
-        self,
-        layer_idx: int | Sequence[int],
-        *,
-        capture_before: bool = True,
-        capture_after: bool = True,
-        max_captures: int | None = None,
-    ) -> None:
-        """Enable hidden state capture for debugging and analysis.
-
-        Captured states are stored on workers and can be retrieved via
-        :meth:`fetch_hidden_states`. States remain in memory until cleared
-        with :meth:`clear_hidden_states` or disabled with
-        :meth:`disable_hidden_state_capture`.
-
-        Parameters
-        ----------
-        layer_idx :
-            Layer index or sequence of indices to enable capture for.
-        capture_before :
-            Capture hidden states before steering is applied.
-        capture_after :
-            Capture hidden states after steering is applied.
-        max_captures :
-            Maximum number of capture entries per layer. ``None`` means unlimited.
-            When the limit is reached, new captures are ignored.
-
-        Examples
-        --------
-        >>> model.enable_hidden_state_capture(2, capture_before=True, capture_after=True)
-        >>> model.generate(["test prompt"], sampling_params)
-        >>> states = model.fetch_hidden_states()
-        >>> print(states[0][2][0]["before"].shape)  # worker 0, layer 2, first capture
-        """
-        await self._ensure_engine_initialized()
-        indices = (
-            [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
-        )
-        for idx in indices:
-            if idx < 0 or idx >= self.layer_count:
-                raise ValueError(
-                    f"Layer index {idx} out of range for model with {self.layer_count} layers"
-                )
-            await self._collective_rpc(
-                "enable_hidden_state_capture",
-                idx,
-                kwargs={
-                    "capture_before": capture_before,
-                    "capture_after": capture_after,
-                    "max_captures": max_captures,
-                },
-            )
-
-    async def disable_hidden_state_capture(
-        self, layer_idx: int | Sequence[int] | None = None
-    ) -> None:
-        """Disable hidden state capture for one or more layers.
-
-        This also clears any captured states for the affected layers.
-
-        Parameters
-        ----------
-        layer_idx :
-            Layer index, sequence of indices, or ``None`` to disable all layers.
-        """
-        await self._ensure_engine_initialized()
-        if layer_idx is None:
-            await self._collective_rpc("disable_hidden_state_capture", None)
-        else:
-            indices = (
-                [int(layer_idx)] if isinstance(layer_idx, int) else [int(i) for i in layer_idx]
-            )
-            for idx in indices:
-                await self._collective_rpc("disable_hidden_state_capture", idx)
-
-    async def fetch_hidden_states(
-        self, layer_idx: int | Sequence[int] | None = None
-    ) -> list[dict[int, list[dict[str, Any]]]]:
-        """Retrieve captured hidden states from workers.
-
-        Returns a list of capture maps, one per worker. Each map is keyed by
-        layer index and contains a list of capture entries. Each entry has
-        ``"before"``/``"after"`` tensors plus optional ``"meta"`` (phase, step) and
-        ``"cap_delta"`` diagnostics captured when projection caps are active.
-
-        Parameters
-        ----------
-        layer_idx :
-            Layer index, iterable of indices, or ``None`` to fetch all layers.
-
-        Returns
-        -------
-        list[dict[int, list[dict[str, Any]]]]
-            List of worker capture maps. Length equals the number of workers
-            (tensor parallel size).
-
-        Examples
-        --------
-        >>> model.enable_hidden_state_capture(2)
-        >>> await model.generate(["test"], sampling_params)
-        >>> states = await model.fetch_hidden_states(layer_idx=2)
-        >>> worker_0_captures = states[0][2]
-        >>> first_capture = worker_0_captures[0]
-        >>> before_steering = first_capture["before"]  # shape: [batch, seq_len, hidden_size]
-        >>> after_steering = first_capture["after"]
-        >>> step_meta = first_capture["meta"]  # {'phase': 'prefill', 'step': 0, ...}
-        """
-        await self._ensure_engine_initialized()
-        if layer_idx is None:
-            rpc_args: tuple[Any, ...] = ()
-        elif isinstance(layer_idx, Sequence) and not isinstance(layer_idx, (str, bytes, bytearray)):
-            rpc_args = (tuple(int(idx) for idx in layer_idx),)
-        else:
-            rpc_args = (int(layer_idx),)
-
-        payloads = await self._collective_rpc(
-            "fetch_captured_hidden_states", *rpc_args
-        )
-        def _is_tensor_payload(value: Any) -> bool:
-            return (
-                isinstance(value, dict)
-                and "dtype" in value
-                and "shape" in value
-                and "data" in value
-            )
-
-        decoded: list[dict[int, list[dict[str, Any]]]] = []
-        for payload in payloads:
-            layer_map: dict[int, list[dict[str, Any]]] = {}
-            for layer_idx, entries in payload.items():
-                decoded_entries: list[dict[str, Any]] = []
-                for entry in entries:
-                    decoded_entry: dict[str, Any] = {}
-                    for key, value in entry.items():
-                        if _is_tensor_payload(value):
-                            decoded_entry[key] = steering_runtime.deserialize_tensor(
-                                value,
-                                device=torch.device("cpu"),
-                            )
-                        elif isinstance(value, dict):
-                            decoded_entry[key] = dict(value)
-                        else:
-                            decoded_entry[key] = value
-                    decoded_entries.append(decoded_entry)
-                layer_map[int(layer_idx)] = decoded_entries
-            decoded.append(layer_map)
-        return decoded
-
-    async def clear_hidden_states(self, layer_idx: int | None = None) -> None:
-        """Clear captured hidden states without disabling capture.
-
-        This frees memory while keeping capture enabled for future generations.
-
-        Parameters
-        ----------
-        layer_idx :
-            Layer index to clear, or ``None`` to clear all layers.
-        """
-        await self._ensure_engine_initialized()
-        if layer_idx is None:
-            await self._collective_rpc("clear_captured_hidden_states")
-        else:
-            await self._collective_rpc("clear_captured_hidden_states", layer_idx)
-
-    def _reconstruct_sequences_from_captures(
-        self,
-        captures: list[dict[str, Any]],
-        prompt_lengths: list[int],
-        key: str = "before",
-    ) -> list[torch.Tensor]:
-        """Reconstruct per-prompt sequences from chunked vLLM captures.
-
-        vLLM's chunked prefill may split a batch into multiple captures. This
-        method concatenates all chunks and splits them back into per-prompt
-        sequences using the provided prompt lengths.
-
-        Parameters
-        ----------
-        captures :
-            List of capture entries from fetch_hidden_states().
-        prompt_lengths :
-            Token lengths for each original prompt, in order.
-        key :
-            Which tensor to extract from each capture ("before" or "after").
-
-        Returns
-        -------
-        list[torch.Tensor]
-            One tensor per prompt, each with shape [prompt_len, hidden_size].
-        """
-        if not captures:
-            raise ValueError("No captures provided for reconstruction.")
-        if not prompt_lengths:
-            raise ValueError("No prompt lengths provided for reconstruction.")
-
-        # Filter to only prefill-phase captures (skip decode)
-        prefill_captures = [
-            c for c in captures
-            if c.get("meta", {}).get("phase") == "prefill"
-        ]
-
-        if not prefill_captures:
-            raise ValueError("No prefill captures found. Decode captures cannot be reconstructed.")
-
-        # Concatenate all prefill captures into a single flat tensor
-        all_tokens = []
-        for capture in prefill_captures:
-            if key not in capture:
-                raise ValueError(f"Capture missing key '{key}'.")
-            tensor = capture[key]
-            # Ensure 2D shape [num_tokens, hidden_size]
-            if tensor.dim() != 2:
-                raise ValueError(f"Expected 2D capture tensor, got shape {tensor.shape}")
-            all_tokens.append(tensor)
-
-        # Concatenate along token dimension
-        flat_tensor = torch.cat(all_tokens, dim=0)  # [total_tokens, hidden_size]
-
-        # Validate total length matches
-        total_expected = sum(prompt_lengths)
-        total_actual = flat_tensor.shape[0]
-        if total_actual != total_expected:
-            raise ValueError(
-                f"Total tokens mismatch: expected {total_expected} "
-                f"(sum of prompt lengths), got {total_actual} from captures."
-            )
-
-        # Split by prompt lengths
-        sequences = []
-        offset = 0
-        for length in prompt_lengths:
-            seq = flat_tensor[offset : offset + length]  # [length, hidden_size]
-            sequences.append(seq)
-            offset += length
-
-        return sequences
-
-    async def prefill_and_capture(
-        self,
-        prompts: list[str],
-        layer_idx: int | Sequence[int] | None = None,
-        *,
-        capture_before: bool = True,
-        capture_after: bool = False,
-    ) -> dict[int, list[torch.Tensor]]:
-        """Capture hidden states during prefill for a batch of prompts.
-
-        This method runs prefill on the provided prompts and returns hidden states
-        reconstructed into per-prompt tensors, hiding vLLM's internal chunking.
-
-        Parameters
-        ----------
-        prompts :
-            List of prompts to process.
-        layer_idx :
-            Layer index, sequence of indices, or ``None`` to use all currently
-            configured capture layers. If no layers are configured, raises an error.
-        capture_before :
-            Capture hidden states before steering is applied.
-        capture_after :
-            Capture hidden states after steering is applied.
-
-        Returns
-        -------
-        dict[int, list[torch.Tensor]]
-            Mapping of layer indices to lists of tensors. Each list has one tensor
-            per prompt, with shape ``[prompt_length, hidden_size]``.
-
-        Examples
-        --------
-        >>> model.enable_hidden_state_capture(2)
-        >>> result = model.prefill_and_capture(["Hello world", "Test prompt"])
-        >>> len(result[2])  # Two prompts
-        2
-        >>> result[2][0].shape  # First prompt
-        torch.Size([2, 1024])  # 2 tokens, 1024 hidden size
-        >>> result[2][1].shape  # Second prompt
-        torch.Size([2, 1024])  # 2 tokens, 1024 hidden size
-
-        Notes
-        -----
-        - This method automatically tokenizes prompts to determine their lengths.
-        - Decode-phase captures (from generated tokens) are ignored.
-        - vLLM's chunked prefill is transparently handled.
-        - If both ``capture_before`` and ``capture_after`` are enabled, returns
-          only the "before" captures by default. Use ``fetch_hidden_states()``
-          directly for more control.
-        """
-        await self._ensure_engine_initialized()
-        if isinstance(prompts, str):
-            prompts = [prompts]
-        if not prompts:
-            raise ValueError("At least one prompt is required.")
-
-        # Determine which layers to capture
-        if layer_idx is None:
-            # Use all currently configured capture layers
-            current_captures = (await self._collective_rpc("fetch_captured_hidden_states"))[0]
-            if not current_captures:
-                raise ValueError(
-                    "No capture layers configured. Enable capture first with "
-                    "enable_hidden_state_capture()."
-                )
-            target_layers = list(current_captures.keys())
-        elif isinstance(layer_idx, int):
-            target_layers = [int(layer_idx)]
-        else:
-            target_layers = [int(idx) for idx in layer_idx]
-
-        # Enable capture on target layers if not already enabled
-        for idx in target_layers:
-            self.enable_hidden_state_capture(
-                idx,
-                capture_before=capture_before,
-                capture_after=capture_after,
-                max_captures=None,
-            )
-
-        # Clear existing captures to ensure clean state
-        for idx in target_layers:
-            self.clear_hidden_states(idx)
-
-        # Run minimal generation (just prefill + 1 token)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-        self.generate(prompts, sampling_params=sampling_params)
-
-        # Fetch captures
-        all_states = self.fetch_hidden_states(layer_idx=target_layers)
-        worker_captures = all_states[0]  # Single worker (TP=1)
-
-        # Get prompt lengths from the last generate() call
-        if self._last_prompt_lengths is None or len(self._last_prompt_lengths) != len(prompts):
-            raise RuntimeError(
-                "Prompt lengths not tracked properly. This is a bug."
-            )
-        prompt_lengths = self._last_prompt_lengths
-
-        # Reconstruct sequences for each layer
-        result: dict[int, list[torch.Tensor]] = {}
-        key = "before" if capture_before else "after"
-
-        for layer_id in target_layers:
-            if layer_id not in worker_captures:
-                raise ValueError(f"Layer {layer_id} has no captures.")
-            captures = worker_captures[layer_id]
-            if not captures:
-                raise ValueError(f"Layer {layer_id} has no capture entries.")
-
-            sequences = self._reconstruct_sequences_from_captures(
-                captures, prompt_lengths, key=key
-            )
-            result[layer_id] = sequences
-
-        return result

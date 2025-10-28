@@ -237,52 +237,33 @@ async def test_llama_hidden_state_capture(model_name: str):
     except OSError as exc:  # pragma: no cover - allows offline environments
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
-    # Enable capture
-    await model.enable_hidden_state_capture(
-        target_layer,
-        capture_before=True,
-        capture_after=True,
-        max_captures=3
-    )
-
-    # Apply steering and generate
+    # Apply steering and generate with capture
     vector = torch.randn(model.hidden_size, dtype=torch.float32) * 0.5
     await model.set_layer_vector(target_layer, vector)
 
     prompt = "Once upon a time"
     sampling = SamplingParams(temperature=0.0, max_tokens=5)
-    _ = await model.generate([prompt], sampling)
+    texts, handles = await model.generate([prompt], sampling, capture_layers=target_layer)
 
     # Fetch captured states
-    states = await model.fetch_hidden_states(layer_idx=target_layer)
-    assert states, "Expected captured states"
-    assert target_layer in states[0], f"Expected layer {target_layer} in captured states"
+    assert len(handles) == 1, "Expected one capture handle"
+    handle = handles[0]
+    await handle.fetch()
+    captures_dict = handle.captures
 
-    captures = states[0][target_layer]
+    assert target_layer in captures_dict, f"Expected layer {target_layer} in captured states"
+    captures = captures_dict[target_layer]
     assert len(captures) > 0, "Expected at least one capture"
 
-    # Verify capture structure
+    # Verify capture structure (captures are per-worker, get first worker)
     first_capture = captures[0]
-    assert "before" in first_capture, "Expected 'before' in capture"
-    assert "after" in first_capture, "Expected 'after' in capture"
-    assert "meta" in first_capture, "Expected 'meta' in capture"
+    assert "hidden" in first_capture, "Expected 'hidden' in capture"
 
-    # Verify shapes
-    before = first_capture["before"]
-    after = first_capture["after"]
-    assert before.shape[-1] == model.hidden_size, "Before shape mismatch"
-    assert after.shape[-1] == model.hidden_size, "After shape mismatch"
-
-    # Verify steering had an effect
-    assert not torch.allclose(before, after, atol=1e-3), "Steering should modify hidden states"
-
-    # Test clearing
-    await model.clear_hidden_states(target_layer)
-    cleared_states = await model.fetch_hidden_states(layer_idx=target_layer)
-    assert len(cleared_states[0][target_layer]) == 0, "Expected empty captures after clear"
-
-    # Disable capture
-    await model.disable_hidden_state_capture(target_layer)
+    # For testing steering effect, we'd need both before and after,
+    # but new API only captures final hidden state.
+    # Verify shape
+    hidden = first_capture["hidden"]
+    assert hidden.shape[-1] == model.hidden_size, "Hidden state shape mismatch"
 
     del model
 
