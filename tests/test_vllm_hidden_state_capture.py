@@ -66,7 +66,7 @@ async def test_hidden_state_capture_basic():
     assert meta["step"] == 0, "First capture should have step index 0"
 
     # Clear captured states
-    model.clear_hidden_states(target_layer)
+    await model.clear_hidden_states(target_layer)
     cleared_states = await model.fetch_hidden_states(layer_idx=target_layer)
     assert len(cleared_states[0][target_layer]) == 0, "States should be cleared"
 
@@ -79,8 +79,8 @@ async def test_hidden_state_capture_basic():
     # Enable projection cap and verify cap delta instrumentation is present
     unit = torch.zeros(model.hidden_size, dtype=torch.float32)
     unit[0] = 1.0
-    model.set_layer_projection_cap(target_layer, unit, max=0.0)
-    model.clear_hidden_states(target_layer)
+    await model.set_layer_projection_cap(target_layer, unit, max=0.0)
+    await model.clear_hidden_states(target_layer)
     await model.generate([prompt], sampling_params=sampling)
     capped_states = await model.fetch_hidden_states(layer_idx=target_layer)
     capped_capture = capped_states[0][target_layer][0]

@@ -1343,7 +1343,7 @@ class VLLMSteerModel(SteerableModel):
             decoded.append(layer_map)
         return decoded
 
-    def clear_hidden_states(self, layer_idx: int | None = None) -> None:
+    async def clear_hidden_states(self, layer_idx: int | None = None) -> None:
         """Clear captured hidden states without disabling capture.
 
         This frees memory while keeping capture enabled for future generations.
@@ -1353,10 +1353,11 @@ class VLLMSteerModel(SteerableModel):
         layer_idx :
             Layer index to clear, or ``None`` to clear all layers.
         """
+        await self._ensure_engine_initialized()
         if layer_idx is None:
-            self._collective_rpc("clear_captured_hidden_states")
+            await self._collective_rpc("clear_captured_hidden_states")
         else:
-            self._collective_rpc("clear_captured_hidden_states", layer_idx)
+            await self._collective_rpc("clear_captured_hidden_states", layer_idx)
 
     def _reconstruct_sequences_from_captures(
         self,
@@ -1431,7 +1432,7 @@ class VLLMSteerModel(SteerableModel):
 
         return sequences
 
-    def prefill_and_capture(
+    async def prefill_and_capture(
         self,
         prompts: list[str],
         layer_idx: int | Sequence[int] | None = None,
@@ -1482,6 +1483,7 @@ class VLLMSteerModel(SteerableModel):
           only the "before" captures by default. Use ``fetch_hidden_states()``
           directly for more control.
         """
+        await self._ensure_engine_initialized()
         if isinstance(prompts, str):
             prompts = [prompts]
         if not prompts:
@@ -1490,7 +1492,7 @@ class VLLMSteerModel(SteerableModel):
         # Determine which layers to capture
         if layer_idx is None:
             # Use all currently configured capture layers
-            current_captures = self._collective_rpc("fetch_captured_hidden_states")[0]
+            current_captures = (await self._collective_rpc("fetch_captured_hidden_states"))[0]
             if not current_captures:
                 raise ValueError(
                     "No capture layers configured. Enable capture first with "

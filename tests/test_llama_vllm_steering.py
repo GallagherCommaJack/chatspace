@@ -213,10 +213,11 @@ def test_llama_vllm_chat_respects_steering(model_name: str):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+@pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [
     "meta-llama/Llama-3.2-1B-Instruct",
 ])
-def test_llama_hidden_state_capture(model_name: str):
+async def test_llama_hidden_state_capture(model_name: str):
     """Test hidden state capture functionality with Llama models."""
     torch.manual_seed(42)
 
@@ -237,7 +238,7 @@ def test_llama_hidden_state_capture(model_name: str):
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Enable capture
-    model.enable_hidden_state_capture(
+    await model.enable_hidden_state_capture(
         target_layer,
         capture_before=True,
         capture_after=True,
@@ -246,14 +247,14 @@ def test_llama_hidden_state_capture(model_name: str):
 
     # Apply steering and generate
     vector = torch.randn(model.hidden_size, dtype=torch.float32) * 0.5
-    model.set_layer_vector(target_layer, vector)
+    await model.set_layer_vector(target_layer, vector)
 
     prompt = "Once upon a time"
     sampling = SamplingParams(temperature=0.0, max_tokens=5)
-    _ = model.generate([prompt], sampling)
+    _ = await model.generate([prompt], sampling)
 
     # Fetch captured states
-    states = model.fetch_hidden_states(layer_idx=target_layer)
+    states = await model.fetch_hidden_states(layer_idx=target_layer)
     assert states, "Expected captured states"
     assert target_layer in states[0], f"Expected layer {target_layer} in captured states"
 
@@ -276,12 +277,12 @@ def test_llama_hidden_state_capture(model_name: str):
     assert not torch.allclose(before, after, atol=1e-3), "Steering should modify hidden states"
 
     # Test clearing
-    model.clear_hidden_states(target_layer)
-    cleared_states = model.fetch_hidden_states(layer_idx=target_layer)
+    await model.clear_hidden_states(target_layer)
+    cleared_states = await model.fetch_hidden_states(layer_idx=target_layer)
     assert len(cleared_states[0][target_layer]) == 0, "Expected empty captures after clear"
 
     # Disable capture
-    model.disable_hidden_state_capture(target_layer)
+    await model.disable_hidden_state_capture(target_layer)
 
     del model
 

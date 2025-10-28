@@ -182,8 +182,8 @@ async def test_vllm_hf_steering_combinations_match():
             await vllm_model.clear_all_vectors()
             await vllm_model.clear_layer_projection_cap(target_layer)
             await vllm_model.clear_layer_ablation(target_layer)
-            vllm_model.clear_hidden_states(target_layer)
-            vllm_model.clear_hidden_states(downstream_layer)
+            await vllm_model.clear_hidden_states(target_layer)
+            await vllm_model.clear_hidden_states(downstream_layer)
 
             # Only set steering at target layer
             if case["vector"] is not None:
@@ -880,8 +880,8 @@ async def test_vllm_hf_multi_magnitude_steering():
             # vLLM path
             # -------------------------------------------------------------------------
             await vllm_model.clear_all_vectors()
-            vllm_model.clear_hidden_states(target_layer)
-            vllm_model.clear_hidden_states(downstream_layer)
+            await vllm_model.clear_hidden_states(target_layer)
+            await vllm_model.clear_hidden_states(downstream_layer)
 
             # Set steering vector at this magnitude
             await vllm_model.set_layer_vector(target_layer, steering_vector)
