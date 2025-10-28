@@ -118,6 +118,17 @@ class _SteeringState:
     capture_lock: threading.Lock | None
     capture_pending: dict[int, int]
 
+    # Per-request activation capture
+    active_capture_requests: dict[str, set[int]] = None  # request_id -> layer indices
+    request_captures: dict[str, dict[int, torch.Tensor]] = None  # request_id -> layer -> tensor
+    request_prefill_buffers: dict[str, dict[int, list[torch.Tensor]]] = None  # request_id -> layer -> chunks
+    request_last_phase: dict[str, str] = None  # request_id -> "prefill" or "decode"
+    request_token_counts: dict[str, int] = None  # request_id -> token count
+
+    # Per-step batch metadata (captured from model runner)
+    step_metadata: dict[int, dict[str, Any]] = None  # step_number -> {request_ids, seq_lens, ...}
+    global_step: int = 0  # Monotonically increasing step counter
+
 
 @dataclass
 class _ProjectionCapConfig:
@@ -768,7 +779,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
 
-        # Capture hidden state after steering if requested
+        # Capture hidden state after steering if requested (old-style global capture)
         if capture_enabled:
             try:
                 captured_after: torch.Tensor | None = None
@@ -825,6 +836,84 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
             except Exception:  # pragma: no cover - graceful degradation
                 pass
         cap_debug_payload = None
+
+        # Per-request activation capture (metadata-based)
+        try:
+            state = getattr(self, "_chatspace_steering_state", None)
+            if state is not None and state.active_capture_requests:
+                # Get current step metadata
+                current_step = state.global_step - 1  # Most recent step
+                if current_step < 0:
+                    return output
+
+                metadata = state.step_metadata.get(current_step)
+                if metadata is None:
+                    return output
+
+                request_ids = metadata.get("request_ids", [])
+                seq_lens = metadata.get("seq_lens")
+
+                layer_idx = getattr(self, "_chatspace_layer_index", None)
+                if layer_idx is None:
+                    return output
+
+                # Extract hidden state (after steering)
+                hidden = _extract_hidden_from_output(output)
+                if hidden is None or hidden.dim() != 2:
+                    return output
+
+                # For each request in the batch that wants this layer
+                start_idx = 0
+                for i, req_id in enumerate(request_ids):
+                    if req_id not in state.active_capture_requests:
+                        # Skip this request, advance index
+                        if seq_lens and i < len(seq_lens):
+                            start_idx += seq_lens[i]
+                        continue
+
+                    if layer_idx not in state.active_capture_requests[req_id]:
+                        # This request doesn't want this layer
+                        if seq_lens and i < len(seq_lens):
+                            start_idx += seq_lens[i]
+                        continue
+
+                    # Determine slice for this request
+                    if seq_lens and i < len(seq_lens):
+                        seq_len = seq_lens[i]
+                        end_idx = start_idx + seq_len
+                        req_hidden = hidden[start_idx:end_idx]
+                        start_idx = end_idx
+                    else:
+                        # No seq_lens available, assume single request owns full batch
+                        req_hidden = hidden
+
+                    # Determine phase
+                    req_seq_len = req_hidden.shape[0]
+                    phase = "prefill" if req_seq_len > 1 else "decode"
+                    last_phase = state.request_last_phase.get(req_id, "prefill")
+
+                    if phase == "prefill":
+                        # Buffer chunks during prefill
+                        state.request_prefill_buffers[req_id][layer_idx].append(
+                            req_hidden.detach().clone()
+                        )
+                    else:
+                        # Coalesce prefill when transitioning to decode
+                        if last_phase == "prefill":
+                            _coalesce_prefill_chunks(state, req_id)
+
+                        # Append decode token
+                        if layer_idx in state.request_captures[req_id]:
+                            existing = state.request_captures[req_id][layer_idx]
+                            state.request_captures[req_id][layer_idx] = torch.cat(
+                                [existing, req_hidden.detach().clone()], dim=0
+                            )
+                        else:
+                            state.request_captures[req_id][layer_idx] = req_hidden.detach().clone()
+
+                    state.request_last_phase[req_id] = phase
+        except Exception:  # pragma: no cover - graceful degradation
+            pass
 
         return output
 
@@ -1010,6 +1099,74 @@ def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
     return payload
 
 
+def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
+    """Patch GPUModelRunner.execute_model to capture per-step batch metadata."""
+    model_runner = worker.model_runner
+    original_execute = getattr(model_runner, "_original_execute_model", None)
+
+    if original_execute is not None:
+        # Already patched
+        return
+
+    original_execute = model_runner.execute_model
+
+    def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
+        """Intercept execute_model to capture batch metadata."""
+        # Extract request IDs and sequence lengths from model_input
+        try:
+            request_ids = None
+            seq_lens = None
+
+            # V1 engine: model_input is SchedulerOutput
+            # It has scheduled_new_reqs (list) and scheduled_cached_reqs (CachedRequestData object)
+            if hasattr(model_input, "scheduled_new_reqs") and hasattr(model_input, "scheduled_cached_reqs"):
+                # Extract from NEW requests (prefill phase)
+                if model_input.scheduled_new_reqs:
+                    new_reqs = model_input.scheduled_new_reqs
+                    if not isinstance(new_reqs, list):
+                        new_reqs = [new_reqs]
+
+                    request_ids = []
+                    seq_lens = []
+                    for req in new_reqs:
+                        if hasattr(req, "req_id"):
+                            request_ids.append(req.req_id)
+                        # For NewRequestData, use len(prompt_token_ids)
+                        if hasattr(req, "prompt_token_ids"):
+                            seq_lens.append(len(req.prompt_token_ids))
+
+                # Also handle CACHED requests (decode phase)
+                if model_input.scheduled_cached_reqs and hasattr(model_input.scheduled_cached_reqs, "req_ids"):
+                    cached = model_input.scheduled_cached_reqs
+                    if cached.num_reqs > 0 and cached.req_ids:
+                        if not request_ids:
+                            request_ids = []
+                            seq_lens = []
+
+                        # Cached requests are generating 1 token each (decode)
+                        request_ids.extend(cached.req_ids)
+                        seq_lens.extend([1] * len(cached.req_ids))
+
+            if request_ids:
+                # Store metadata for this step
+                current_step = state.global_step
+                state.step_metadata[current_step] = {
+                    "request_ids": request_ids,
+                    "seq_lens": seq_lens,  # Can be None if not extractable
+                    "step": current_step,
+                }
+                state.global_step += 1
+        except Exception:
+            # Don't break generation if metadata extraction fails
+            pass
+
+        # Call original execute_model
+        return original_execute(model_input, *args, **kwargs)
+
+    model_runner.execute_model = patched_execute_model
+    model_runner._original_execute_model = original_execute
+
+
 def initialize_worker_state(
     worker: Any, layer_indices: Sequence[int] | None = None
 ) -> dict[str, Any]:
@@ -1047,9 +1204,19 @@ def initialize_worker_state(
         capture_stream=None,
         capture_lock=None,
         capture_pending={},
+        active_capture_requests={},
+        request_captures={},
+        request_prefill_buffers={},
+        request_last_phase={},
+        request_token_counts={},
+        step_metadata={},
+        global_step=0,
     )
     worker._chatspace_steering = state
     _setup_async_capture_infrastructure(state)
+
+    # Patch model runner to capture batch metadata for per-request activation tracking
+    _patch_model_runner(worker, state)
 
     if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
         worker.model_runner.model = _SteeredModelWrapper(model, state)
@@ -1493,6 +1660,69 @@ def clear_captured_hidden_states(
             counter.reset()
 
 
+def _coalesce_prefill_chunks(state: _SteeringState, request_id: str) -> None:
+    """Concatenate buffered prefill chunks into final tensor."""
+    if request_id not in state.request_prefill_buffers:
+        return
+
+    buffers = state.request_prefill_buffers[request_id]
+    for layer_idx, chunks in buffers.items():
+        if not chunks:
+            continue
+
+        # Concatenate all chunks along sequence dimension
+        coalesced = torch.cat(chunks, dim=0)  # [total_prefill_tokens, hidden_size]
+        state.request_captures[request_id][layer_idx] = coalesced
+
+        # Clear buffer
+        chunks.clear()
+
+
+def register_capture_request(
+    worker: Any, request_id: str, layer_indices: list[int]
+) -> None:
+    """Register request and prepare buffers for per-request capture."""
+    state = _ensure_state(worker)
+    state.active_capture_requests[request_id] = set(layer_indices)
+    state.request_captures[request_id] = {}
+    state.request_prefill_buffers[request_id] = {idx: [] for idx in layer_indices}
+    state.request_last_phase[request_id] = "prefill"
+    state.request_token_counts[request_id] = 0
+
+
+def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
+    """Fetch activations, coalesce any remaining chunks, serialize, and cleanup."""
+    state = _ensure_state(worker)
+
+    # Coalesce any remaining prefill chunks
+    _coalesce_prefill_chunks(state, request_id)
+
+    # Serialize captures
+    captures = state.request_captures.pop(request_id, {})
+    serialized = {
+        layer_idx: serialize_tensor(tensor)
+        for layer_idx, tensor in captures.items()
+    }
+
+    # Cleanup
+    state.active_capture_requests.pop(request_id, None)
+    state.request_prefill_buffers.pop(request_id, None)
+    state.request_last_phase.pop(request_id, None)
+    state.request_token_counts.pop(request_id, None)
+
+    return serialized
+
+
+def unregister_capture_request(worker: Any, request_id: str) -> None:
+    """Clean up aborted or cancelled capture request."""
+    state = _ensure_state(worker)
+    state.request_captures.pop(request_id, None)
+    state.active_capture_requests.pop(request_id, None)
+    state.request_prefill_buffers.pop(request_id, None)
+    state.request_last_phase.pop(request_id, None)
+    state.request_token_counts.pop(request_id, None)
+
+
 for _rpc_fn in (
     initialize_worker_state,
     set_worker_vector,
@@ -1509,6 +1739,9 @@ for _rpc_fn in (
     disable_hidden_state_capture,
     fetch_captured_hidden_states,
     clear_captured_hidden_states,
+    register_capture_request,
+    fetch_request_activations,
+    unregister_capture_request,
 ):
     _register_rpc(_rpc_fn.__name__, _rpc_fn)
 

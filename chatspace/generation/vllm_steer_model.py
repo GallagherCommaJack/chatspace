@@ -249,58 +249,96 @@ class VLLMSteerModel(SteerableModel):
         )
 
         steering_runtime.ensure_layer_patch_installed()
-        try:
-            self.llm = LLM(model=cfg.model_name, **llm_kwargs)
-        except Exception as exc:
-            msg = str(exc)
-            memory_hint = "No available memory for the cache blocks" in msg
-            engine_failed = "Engine core initialization failed" in msg
-            if memory_hint or engine_failed:
-                requested_util = float(llm_kwargs.get("gpu_memory_utilization", cfg.gpu_memory_utilization))
-                raise RuntimeError(
-                    "vLLM steering initialization failed: gpu_memory_utilization="
-                    f"{requested_util:.3f} did not leave enough room for the KV cache. "
-                    "Please rerun with a higher gpu_memory_utilization."
-                ) from exc
-            raise
+        steering_runtime.ensure_collective_rpc_gateway_installed()
+
+        # Use AsyncLLMEngine for async API
+        from vllm import AsyncEngineArgs, AsyncLLMEngine
+        import asyncio
+
+        engine_args = AsyncEngineArgs(
+            model=cfg.model_name,
+            **llm_kwargs
+        )
+
+        # Create engine (this needs to run in async context, so we'll defer)
+        self._engine_args = engine_args
+        self._engine = None  # Will be initialized on first use
+        self._engine_client = None
+        self._engine_init_lock = asyncio.Lock()
+
         if not enforce_eager:
             logger.warning(
                 "vLLM steering currently requires enforce_eager=True to apply layer hooks."
             )
-        self._engine_client = self.llm.llm_engine.engine_core
-        steering_runtime.ensure_collective_rpc_gateway_installed()
 
-        init_layers: tuple[int, ...]
+        self._init_layers: tuple[int, ...]
         if bootstrap_layers is not None:
-            init_layers = tuple(int(idx) for idx in bootstrap_layers)
+            self._init_layers = tuple(int(idx) for idx in bootstrap_layers)
         else:
-            init_layers = tuple(int(idx) for idx in cfg.bootstrap_layers)
+            self._init_layers = tuple(int(idx) for idx in cfg.bootstrap_layers)
 
-        setup_info = self._collective_rpc("initialize_worker_state", init_layers)
-        if not setup_info:
-            raise RuntimeError("Failed to initialize steering state on workers.")
-
-        first = setup_info[0]
-        self.hidden_size = int(first["hidden_size"])
-        self._vector_dtype = _parse_dtype(first["dtype"])
-        layer_count = int(first["layer_count"])
-        self.layer_count = layer_count
+        # Defer worker initialization until first use
+        self.hidden_size: int | None = None
+        self._vector_dtype: torch.dtype | None = None
+        self.layer_count: int | None = None
         self._layer_specs: dict[int, LayerSteeringSpec] = {}
         self._steering_stack: list[SteeringSpec] = []
-        for idx in init_layers:
-            if idx < 0 or idx >= layer_count:
-                raise ValueError(
-                    f"bootstrap layer {idx} is out of range for model with {layer_count} layers"
-                )
-            self._ensure_layer_spec(idx)
         self._active_layer: int | None = None
-        if init_layers:
-            self.set_target_layer(init_layers[0])
-        elif layer_count > 0:
-            self.set_target_layer(0)
+
+        # Track prompt token lengths for capture reconstruction
+        self._last_prompt_lengths: list[int] | None = None
+        self._tokenizer = None
+
+        # Capture lock for serializing per-request captures
+        self._capture_lock = asyncio.Lock()
+
+    @property
+    def tokenizer(self):
+        """Lazy-load tokenizer for prompt length tracking."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(self.cfg.model_name)
+        return self._tokenizer
+
+    async def _ensure_engine_initialized(self) -> None:
+        """Initialize AsyncLLMEngine and workers on first use."""
+        async with self._engine_init_lock:
+            if self._engine is not None:
+                return
+
+            from vllm import AsyncLLMEngine
+
+            # Create async engine
+            self._engine = AsyncLLMEngine.from_engine_args(self._engine_args)
+            self._engine_client = self._engine  # AsyncLLMEngine has collective_rpc directly
+
+            # Initialize worker state
+            setup_info = await self._collective_rpc("initialize_worker_state", self._init_layers)
+            if not setup_info:
+                raise RuntimeError("Failed to initialize steering state on workers.")
+
+            first = setup_info[0]
+            self.hidden_size = int(first["hidden_size"])
+            self._vector_dtype = _parse_dtype(first["dtype"])
+            layer_count = int(first["layer_count"])
+            self.layer_count = layer_count
+
+            for idx in self._init_layers:
+                if idx < 0 or idx >= layer_count:
+                    raise ValueError(
+                        f"bootstrap layer {idx} is out of range for model with {layer_count} layers"
+                    )
+                self._ensure_layer_spec(idx)
+
+            if self._init_layers:
+                self.set_target_layer(self._init_layers[0])
+            elif layer_count > 0:
+                self.set_target_layer(0)
 
     def _ensure_layer_spec(self, layer_idx: int) -> LayerSteeringSpec:
         idx = int(layer_idx)
+        if self.layer_count is None:
+            raise RuntimeError("Engine not initialized. Call an async method first.")
         if idx < 0 or idx >= self.layer_count:
             raise ValueError(
                 f"Layer index {idx} out of range for model with {self.layer_count} layers"
@@ -319,15 +357,17 @@ class VLLMSteerModel(SteerableModel):
         if spec.is_empty():
             self._layer_specs.pop(idx, None)
 
-    def _collective_rpc(
+    async def _collective_rpc(
         self,
         op: str,
         *args: Any,
         timeout: float | None = None,
         kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
+        if self._engine_client is None:
+            raise RuntimeError("Engine not initialized. Call an async method first.")
         rpc_kwargs = kwargs if kwargs else None
-        return self._engine_client.collective_rpc(
+        return await self._engine_client.collective_rpc(
             steering_runtime.STEERING_RPC_METHOD,
             timeout=timeout,
             args=steering_runtime.rpc_args(op, *args),
@@ -362,15 +402,15 @@ class VLLMSteerModel(SteerableModel):
         unit, _ = self._normalize_vector(vector, context=context)
         return unit
 
-    def _broadcast_add(self, layer_idx: int, add_spec: AddSpec) -> None:
+    async def _broadcast_add(self, layer_idx: int, add_spec: AddSpec) -> None:
         payload = steering_runtime.serialize_tensor(
             add_spec.materialize().to(dtype=self._vector_dtype)
         )
-        self._collective_rpc("set_worker_vector", int(layer_idx), payload)
+        await self._collective_rpc("set_worker_vector", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.add = add_spec.clone()
 
-    def _broadcast_projection_cap(
+    async def _broadcast_projection_cap(
         self, layer_idx: int, spec: ProjectionCapSpec
     ) -> None:
         payload = {
@@ -380,32 +420,32 @@ class VLLMSteerModel(SteerableModel):
             "min": spec.min,
             "max": spec.max,
         }
-        self._collective_rpc("set_worker_projection_cap", int(layer_idx), payload)
+        await self._collective_rpc("set_worker_projection_cap", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.projection_cap = spec.clone()
 
-    def _broadcast_ablation(self, layer_idx: int, spec: AblationSpec) -> None:
+    async def _broadcast_ablation(self, layer_idx: int, spec: AblationSpec) -> None:
         payload = {
             "vector": steering_runtime.serialize_tensor(
                 spec.vector.to(dtype=self._vector_dtype)
             ),
             "scale": float(spec.scale),
         }
-        self._collective_rpc("set_worker_ablation", int(layer_idx), payload)
+        await self._collective_rpc("set_worker_ablation", int(layer_idx), payload)
         layer_spec = self._ensure_layer_spec(int(layer_idx))
         layer_spec.ablation = spec.clone()
 
-    def _broadcast_clear(self, layer_idx: int | None = None) -> None:
+    async def _broadcast_clear(self, layer_idx: int | None = None) -> None:
         if layer_idx is None:
-            self._collective_rpc("clear_worker_vector")
-            self._collective_rpc("clear_worker_projection_cap")
-            self._collective_rpc("clear_worker_ablation")
+            await self._collective_rpc("clear_worker_vector")
+            await self._collective_rpc("clear_worker_projection_cap")
+            await self._collective_rpc("clear_worker_ablation")
             self._layer_specs.clear()
         else:
             target = int(layer_idx)
-            self._collective_rpc("clear_worker_vector", target)
-            self._collective_rpc("clear_worker_projection_cap", target)
-            self._collective_rpc("clear_worker_ablation", target)
+            await self._collective_rpc("clear_worker_vector", target)
+            await self._collective_rpc("clear_worker_projection_cap", target)
+            await self._collective_rpc("clear_worker_ablation", target)
             layer_spec = self._layer_specs.get(target)
             if layer_spec is not None:
                 layer_spec.add = None
@@ -627,20 +667,57 @@ class VLLMSteerModel(SteerableModel):
     def clear_all_vectors(self) -> None:
         self._broadcast_clear()
 
-    def generate(
+    async def generate(
         self,
         prompts: list[str] | str,
         sampling_params: SamplingParams | None = None,
         **kwargs: Any,
     ) -> list[str]:
+        """Generate text for a list of prompts asynchronously.
+
+        Parameters
+        ----------
+        prompts : list[str] | str
+            Prompt or list of prompts to generate from.
+        sampling_params : SamplingParams | None
+            Sampling parameters for generation.
+        **kwargs : Any
+            Additional sampling parameters (used if sampling_params is None).
+
+        Returns
+        -------
+        list[str]
+            Generated texts, one per prompt.
+        """
+        import uuid
+        await self._ensure_engine_initialized()
+
         if isinstance(prompts, str):
             prompts = [prompts]
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
-        return [output.outputs[0].text for output in outputs]
 
-    def chat(
+        # Track prompt lengths for capture reconstruction (legacy support)
+        self._last_prompt_lengths = [
+            len(self.tokenizer.encode(prompt)) for prompt in prompts
+        ]
+
+        # Generate each prompt
+        results = []
+        for prompt in prompts:
+            request_id = f"gen_{uuid.uuid4().hex}"
+            final_output = None
+            async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
+                final_output = output
+
+            if final_output is None:
+                raise RuntimeError(f"No output for prompt: {prompt}")
+
+            results.append(final_output.outputs[0].text)
+
+        return results
+
+    async def chat(
         self,
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
@@ -744,19 +821,114 @@ class VLLMSteerModel(SteerableModel):
         else:
             prepared_messages = batched_messages
 
-        outputs = self.llm.chat(
-            prepared_messages,
-            sampling_params=sampling_params,
-            use_tqdm=use_tqdm,
-            **chat_kwargs,
-        )
+        await self._ensure_engine_initialized()
+
+        # Use engine.chat() - AsyncLLMEngine has a chat method
+        import uuid
         texts: list[str] = []
-        for output in outputs:
-            text = output.outputs[0].text
+
+        for messages_conv in prepared_messages:
+            request_id = f"chat_{uuid.uuid4().hex}"
+            final_output = None
+
+            async for output in self._engine.chat(
+                messages_conv,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **chat_kwargs,
+            ):
+                final_output = output
+
+            if final_output is None:
+                raise RuntimeError("No output from chat")
+
+            text = final_output.outputs[0].text
             if trim_prefix and text.startswith(trim_prefix):
                 text = text[len(trim_prefix) :].lstrip()
             texts.append(text)
+
         return texts
+
+    async def generate_with_activations(
+        self,
+        prompt: str,
+        layers: list[int] | int,
+        sampling_params: SamplingParams | None = None,
+        **sampling_kwargs: Any,
+    ) -> tuple[str, dict[int, torch.Tensor]]:
+        """Generate text and capture activations for this request.
+
+        Parameters
+        ----------
+        prompt : str
+            Input prompt to generate from.
+        layers : list[int] | int
+            Layer index or list of indices to capture activations from.
+        sampling_params : SamplingParams | None
+            Sampling parameters for generation.
+        **sampling_kwargs : Any
+            Alternative way to specify sampling params.
+
+        Returns
+        -------
+        tuple[str, dict[int, torch.Tensor]]
+            Generated text and dict mapping layer_idx to activation tensor.
+            Each tensor has shape [total_tokens, hidden_size] with prefill + decode tokens.
+
+        Examples
+        --------
+        >>> text, acts = await model.generate_with_activations("Hello", layers=[2])
+        >>> acts[2].shape
+        torch.Size([10, 1024])  # 10 tokens total (prefill + decode)
+
+        >>> # Concurrent requests with automatic batching
+        >>> results = await asyncio.gather(
+        ...     model.generate_with_activations("A", layers=[2]),
+        ...     model.generate_with_activations("B", layers=[5]),
+        ... )
+        """
+        import uuid
+
+        await self._ensure_engine_initialized()
+
+        if isinstance(layers, int):
+            layers = [layers]
+
+        if sampling_params is None:
+            sampling_params = SamplingParams(**sampling_kwargs)
+
+        request_id = f"capture_{uuid.uuid4().hex}"
+
+        # Register capture request with workers
+        await self._collective_rpc("register_capture_request", request_id, layers)
+
+        try:
+            # Generate (vLLM batches this with other concurrent requests automatically)
+            final_output = None
+            async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
+                final_output = output
+
+            if final_output is None:
+                raise RuntimeError("No output from generation")
+
+            text = final_output.outputs[0].text
+
+            # Fetch activations
+            worker_captures = await self._collective_rpc("fetch_request_activations", request_id)
+
+            # Deserialize tensors
+            activations = {}
+            for layer_idx, serialized in worker_captures[0].items():
+                activations[int(layer_idx)] = steering_runtime.deserialize_tensor(
+                    serialized, device=torch.device("cpu")
+                )
+
+            return text, activations
+
+        except Exception:
+            # Clean up on error
+            await self._collective_rpc("unregister_capture_request", request_id)
+            raise
 
     def save_pretrained(self, save_directory: str | Path, **_) -> None:
         path = Path(save_directory)
@@ -861,6 +1033,48 @@ class VLLMSteerModel(SteerableModel):
                         float(scale),
                     )
         return model
+
+    # ------------------------------------------------------------------
+    # Sync wrappers for backward compatibility (deprecated)
+    # ------------------------------------------------------------------
+
+    def generate_sync(self, *args, **kwargs) -> list[str]:
+        """Synchronous wrapper for generate(). DEPRECATED - use async generate()."""
+        import asyncio
+        import warnings
+
+        warnings.warn(
+            "generate_sync() is deprecated. Use async generate() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.generate(*args, **kwargs))
+
+    def chat_sync(self, *args, **kwargs) -> list[str]:
+        """Synchronous wrapper for chat(). DEPRECATED - use async chat()."""
+        import asyncio
+        import warnings
+
+        warnings.warn(
+            "chat_sync() is deprecated. Use async chat() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.chat(*args, **kwargs))
+
+    def generate_with_activations_sync(
+        self, *args, **kwargs
+    ) -> tuple[str, dict[int, torch.Tensor]]:
+        """Synchronous wrapper for generate_with_activations(). DEPRECATED."""
+        import asyncio
+        import warnings
+
+        warnings.warn(
+            "generate_with_activations_sync() is deprecated. Use async generate_with_activations() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.generate_with_activations(*args, **kwargs))
 
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)
@@ -1041,3 +1255,193 @@ class VLLMSteerModel(SteerableModel):
             self._collective_rpc("clear_captured_hidden_states")
         else:
             self._collective_rpc("clear_captured_hidden_states", layer_idx)
+
+    def _reconstruct_sequences_from_captures(
+        self,
+        captures: list[dict[str, Any]],
+        prompt_lengths: list[int],
+        key: str = "before",
+    ) -> list[torch.Tensor]:
+        """Reconstruct per-prompt sequences from chunked vLLM captures.
+
+        vLLM's chunked prefill may split a batch into multiple captures. This
+        method concatenates all chunks and splits them back into per-prompt
+        sequences using the provided prompt lengths.
+
+        Parameters
+        ----------
+        captures :
+            List of capture entries from fetch_hidden_states().
+        prompt_lengths :
+            Token lengths for each original prompt, in order.
+        key :
+            Which tensor to extract from each capture ("before" or "after").
+
+        Returns
+        -------
+        list[torch.Tensor]
+            One tensor per prompt, each with shape [prompt_len, hidden_size].
+        """
+        if not captures:
+            raise ValueError("No captures provided for reconstruction.")
+        if not prompt_lengths:
+            raise ValueError("No prompt lengths provided for reconstruction.")
+
+        # Filter to only prefill-phase captures (skip decode)
+        prefill_captures = [
+            c for c in captures
+            if c.get("meta", {}).get("phase") == "prefill"
+        ]
+
+        if not prefill_captures:
+            raise ValueError("No prefill captures found. Decode captures cannot be reconstructed.")
+
+        # Concatenate all prefill captures into a single flat tensor
+        all_tokens = []
+        for capture in prefill_captures:
+            if key not in capture:
+                raise ValueError(f"Capture missing key '{key}'.")
+            tensor = capture[key]
+            # Ensure 2D shape [num_tokens, hidden_size]
+            if tensor.dim() != 2:
+                raise ValueError(f"Expected 2D capture tensor, got shape {tensor.shape}")
+            all_tokens.append(tensor)
+
+        # Concatenate along token dimension
+        flat_tensor = torch.cat(all_tokens, dim=0)  # [total_tokens, hidden_size]
+
+        # Validate total length matches
+        total_expected = sum(prompt_lengths)
+        total_actual = flat_tensor.shape[0]
+        if total_actual != total_expected:
+            raise ValueError(
+                f"Total tokens mismatch: expected {total_expected} "
+                f"(sum of prompt lengths), got {total_actual} from captures."
+            )
+
+        # Split by prompt lengths
+        sequences = []
+        offset = 0
+        for length in prompt_lengths:
+            seq = flat_tensor[offset : offset + length]  # [length, hidden_size]
+            sequences.append(seq)
+            offset += length
+
+        return sequences
+
+    def prefill_and_capture(
+        self,
+        prompts: list[str],
+        layer_idx: int | Sequence[int] | None = None,
+        *,
+        capture_before: bool = True,
+        capture_after: bool = False,
+    ) -> dict[int, list[torch.Tensor]]:
+        """Capture hidden states during prefill for a batch of prompts.
+
+        This method runs prefill on the provided prompts and returns hidden states
+        reconstructed into per-prompt tensors, hiding vLLM's internal chunking.
+
+        Parameters
+        ----------
+        prompts :
+            List of prompts to process.
+        layer_idx :
+            Layer index, sequence of indices, or ``None`` to use all currently
+            configured capture layers. If no layers are configured, raises an error.
+        capture_before :
+            Capture hidden states before steering is applied.
+        capture_after :
+            Capture hidden states after steering is applied.
+
+        Returns
+        -------
+        dict[int, list[torch.Tensor]]
+            Mapping of layer indices to lists of tensors. Each list has one tensor
+            per prompt, with shape ``[prompt_length, hidden_size]``.
+
+        Examples
+        --------
+        >>> model.enable_hidden_state_capture(2)
+        >>> result = model.prefill_and_capture(["Hello world", "Test prompt"])
+        >>> len(result[2])  # Two prompts
+        2
+        >>> result[2][0].shape  # First prompt
+        torch.Size([2, 1024])  # 2 tokens, 1024 hidden size
+        >>> result[2][1].shape  # Second prompt
+        torch.Size([2, 1024])  # 2 tokens, 1024 hidden size
+
+        Notes
+        -----
+        - This method automatically tokenizes prompts to determine their lengths.
+        - Decode-phase captures (from generated tokens) are ignored.
+        - vLLM's chunked prefill is transparently handled.
+        - If both ``capture_before`` and ``capture_after`` are enabled, returns
+          only the "before" captures by default. Use ``fetch_hidden_states()``
+          directly for more control.
+        """
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if not prompts:
+            raise ValueError("At least one prompt is required.")
+
+        # Determine which layers to capture
+        if layer_idx is None:
+            # Use all currently configured capture layers
+            current_captures = self._collective_rpc("fetch_captured_hidden_states")[0]
+            if not current_captures:
+                raise ValueError(
+                    "No capture layers configured. Enable capture first with "
+                    "enable_hidden_state_capture()."
+                )
+            target_layers = list(current_captures.keys())
+        elif isinstance(layer_idx, int):
+            target_layers = [int(layer_idx)]
+        else:
+            target_layers = [int(idx) for idx in layer_idx]
+
+        # Enable capture on target layers if not already enabled
+        for idx in target_layers:
+            self.enable_hidden_state_capture(
+                idx,
+                capture_before=capture_before,
+                capture_after=capture_after,
+                max_captures=None,
+            )
+
+        # Clear existing captures to ensure clean state
+        for idx in target_layers:
+            self.clear_hidden_states(idx)
+
+        # Run minimal generation (just prefill + 1 token)
+        sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
+        self.generate(prompts, sampling_params=sampling_params)
+
+        # Fetch captures
+        all_states = self.fetch_hidden_states(layer_idx=target_layers)
+        worker_captures = all_states[0]  # Single worker (TP=1)
+
+        # Get prompt lengths from the last generate() call
+        if self._last_prompt_lengths is None or len(self._last_prompt_lengths) != len(prompts):
+            raise RuntimeError(
+                "Prompt lengths not tracked properly. This is a bug."
+            )
+        prompt_lengths = self._last_prompt_lengths
+
+        # Reconstruct sequences for each layer
+        result: dict[int, list[torch.Tensor]] = {}
+        key = "before" if capture_before else "after"
+
+        for layer_id in target_layers:
+            if layer_id not in worker_captures:
+                raise ValueError(f"Layer {layer_id} has no captures.")
+            captures = worker_captures[layer_id]
+            if not captures:
+                raise ValueError(f"Layer {layer_id} has no capture entries.")
+
+            sequences = self._reconstruct_sequences_from_captures(
+                captures, prompt_lengths, key=key
+            )
+            result[layer_id] = sequences
+
+        return result
