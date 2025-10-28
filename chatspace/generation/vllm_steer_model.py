@@ -772,8 +772,10 @@ class VLLMSteerModel(SteerableModel):
         self,
         prompts: list[str] | str,
         sampling_params: SamplingParams | None = None,
+        *,
+        capture_hidden: bool = False,
         **kwargs: Any,
-    ) -> tuple[list[str], CaptureHandle | None]:
+    ) -> list[str] | tuple[list[str], CaptureHandle | None]:
         if isinstance(prompts, str):
             prompts = [prompts]
         if self._capture_enabled and len(prompts) != 1:
@@ -794,15 +796,18 @@ class VLLMSteerModel(SteerableModel):
             texts = [output.outputs[0].text for output in outputs]
             if self._capture_enabled and outputs:
                 request_id = outputs[0].request_id
-                handle = CaptureHandle(
-                    request_id=request_id,
-                    layer_indices=self._capture_layers,
-                )
                 self._collective_rpc("register_capture_request", request_id)
                 payloads = self._collective_rpc("finalize_capture_request", request_id)
                 captures = self._decode_capture_payloads(payloads)
-                handle.captures = captures
-            return texts, handle
+                if capture_hidden:
+                    handle = CaptureHandle(
+                        request_id=request_id,
+                        layer_indices=self._capture_layers,
+                        captures=captures,
+                    )
+            if capture_hidden:
+                return texts, handle
+            return texts
         except Exception:
             if request_id is not None:
                 self._collective_rpc("abort_capture_request", request_id)
@@ -816,8 +821,9 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
+        capture_hidden: bool = False,
         **sampling_kwargs: Any,
-    ) -> tuple[list[str], CaptureHandle | None]:
+    ) -> list[str] | tuple[list[str], CaptureHandle | None]:
         """Execute chat-style generation with optional sampling overrides.
 
         Parameters
@@ -842,6 +848,11 @@ class VLLMSteerModel(SteerableModel):
             are normalized to match template formatting. The helper automatically
             strips the prefix (including the sentinel) from returned outputs. Set
             to ``None`` or ``False`` to disable prefilling.
+        capture_hidden : bool, default False
+            When ``True``, return a tuple of ``(texts, handle)`` so callers can
+            inspect per-request hidden states. ``handle`` will be ``None`` when
+            global capture is disabled. The default ``False`` preserves the
+            legacy signature and discards captured activations after cleanup.
         **sampling_kwargs : Any
             Keyword arguments used to build a ``SamplingParams`` instance when
             ``sampling_params`` is not supplied.
@@ -934,15 +945,18 @@ class VLLMSteerModel(SteerableModel):
                 texts.append(text)
             if self._capture_enabled and outputs:
                 request_id = outputs[0].request_id
-                handle = CaptureHandle(
-                    request_id=request_id,
-                    layer_indices=self._capture_layers,
-                )
                 self._collective_rpc("register_capture_request", request_id)
                 payloads = self._collective_rpc("finalize_capture_request", request_id)
                 captures = self._decode_capture_payloads(payloads)
-                handle.captures = captures
-            return texts, handle
+                if capture_hidden:
+                    handle = CaptureHandle(
+                        request_id=request_id,
+                        layer_indices=self._capture_layers,
+                        captures=captures,
+                    )
+            if capture_hidden:
+                return texts, handle
+            return texts
         except Exception:
             if request_id is not None:
                 self._collective_rpc("abort_capture_request", request_id)
