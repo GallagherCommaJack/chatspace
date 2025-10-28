@@ -293,7 +293,6 @@ async def test_hidden_states_match_hf():
     )
 
 
-@pytest.mark.skip(reason="TODO: Fix steering parity - HF and vLLM steered states have cos_sim=0.096 (expected >0.99)")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_states_with_steering_applied():
@@ -303,6 +302,9 @@ async def test_hidden_states_with_steering_applied():
     at the steering layer in both implementations. We compare:
     1. The modified hidden states after steering is applied
     2. The difference between baseline and steered states (the steering effect itself)
+
+    Note: Uses forward hooks to capture HF states, as output_hidden_states captures
+    before steering hooks run.
     """
     torch.manual_seed(42)
 
@@ -339,15 +341,28 @@ async def test_hidden_states_with_steering_applied():
     hidden_size = hf_model.config.hidden_size
     steering_vector = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 5.0
 
+    # Capture hidden states using hooks (output_hidden_states doesn't see steering hook output)
+    captured_states = []
+
+    def capture_hook(module, input, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        captured_states.append(hidden[0, -1, :].detach().cpu())
+
+    hook_handle = hf_model.model.model.layers[target_layer].register_forward_hook(capture_hook)
+
     # Get HF baseline hidden states
     with torch.no_grad():
-        hf_baseline_outputs = hf_model(**inputs, output_hidden_states=True, use_cache=False)
-        hf_baseline_hidden = hf_baseline_outputs.hidden_states[target_layer + 1][0, -1, :].cpu()
+        captured_states.clear()
+        hf_baseline_outputs = hf_model(**inputs, use_cache=False)
+        hf_baseline_hidden = captured_states[0]
 
         # Apply steering and get modified hidden states
         hf_model.set_vector(steering_vector)
-        hf_steered_outputs = hf_model(**inputs, output_hidden_states=True, use_cache=False)
-        hf_steered_hidden = hf_steered_outputs.hidden_states[target_layer + 1][0, -1, :].cpu()
+        captured_states.clear()
+        hf_steered_outputs = hf_model(**inputs, use_cache=False)
+        hf_steered_hidden = captured_states[0]
+
+    hook_handle.remove()
 
     hf_steering_effect = hf_steered_hidden - hf_baseline_hidden
 
