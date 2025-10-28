@@ -163,6 +163,53 @@ class LayerSteeringSpec:
 
 
 @dataclass
+class CaptureHandle:
+    """Handle for lazily fetching activation captures for a single request.
+
+    Attributes
+    ----------
+    request_id : str
+        Internal request identifier used for fetching captures.
+    layer_indices : tuple[int, ...]
+        Layer indices that were captured for this request.
+    """
+
+    request_id: str
+    layer_indices: tuple[int, ...]
+    _model: "VLLMSteerModel" = field(repr=False)
+    _captures: dict[int, list[dict[str, Any]]] | None = field(default=None, repr=False, init=False)
+
+    async def fetch(self) -> dict[int, list[dict[str, Any]]]:
+        """Fetch captures from workers (idempotent).
+
+        Returns
+        -------
+        dict[int, list[dict[str, Any]]]
+            Mapping of layer indices to lists of capture entries. Each entry
+            contains "before", "after", "meta" keys.
+        """
+        if self._captures is None:
+            self._captures = await self._model._fetch_request_captures(self.request_id)
+        return self._captures
+
+    @property
+    def captures(self) -> dict[int, list[dict[str, Any]]]:
+        """Get captures (must call fetch() first).
+
+        Raises
+        ------
+        RuntimeError
+            If captures haven't been fetched yet.
+        """
+        if self._captures is None:
+            raise RuntimeError(
+                f"Captures not fetched yet for request {self.request_id}. "
+                "Call: await handle.fetch()"
+            )
+        return self._captures
+
+
+@dataclass
 class SteeringSpec:
     """Bundle steering metadata for multiple layers.
 
@@ -700,32 +747,16 @@ class VLLMSteerModel(SteerableModel):
         await self._ensure_engine_initialized()
         await self._broadcast_clear()
 
-    @overload
     async def generate(
         self,
         prompts: list[str] | str,
         sampling_params: SamplingParams | None = None,
-        raw_output: Literal[False] = False,
-        **kwargs: Any,
-    ) -> list[str]: ...
-
-    @overload
-    async def generate(
-        self,
-        prompts: list[str] | str,
-        sampling_params: SamplingParams | None = None,
-        raw_output: Literal[True] = True,
-        **kwargs: Any,
-    ) -> list[Any]: ...  # RequestOutput not imported, use Any
-
-    async def generate(
-        self,
-        prompts: list[str] | str,
-        sampling_params: SamplingParams | None = None,
+        *,
+        capture_layers: int | Sequence[int] | None = None,
         raw_output: bool = False,
         **kwargs: Any,
-    ) -> list[str] | list[Any]:
-        """Generate text for a list of prompts asynchronously.
+    ) -> list[str] | tuple[list[str], list[CaptureHandle]] | list[Any] | tuple[list[Any], list[CaptureHandle]]:
+        """Generate text with optional activation capture.
 
         Parameters
         ----------
@@ -733,16 +764,20 @@ class VLLMSteerModel(SteerableModel):
             Prompt or list of prompts to generate from.
         sampling_params : SamplingParams | None
             Sampling parameters for generation.
+        capture_layers : int | Sequence[int] | None
+            Layer indices to capture activations from. If provided, returns
+            (texts, handles) instead of just texts.
         raw_output : bool
-            If True, return full RequestOutput objects with token IDs and logprobs.
-            If False (default), return just the generated text strings.
+            If True, return full RequestOutput objects instead of text strings.
         **kwargs : Any
             Additional sampling parameters (used if sampling_params is None).
 
         Returns
         -------
-        list[str] | list[RequestOutput]
-            Generated texts (or RequestOutput objects if raw_output=True), one per prompt.
+        list[str] if capture_layers is None and raw_output is False
+        tuple[list[str], list[CaptureHandle]] if capture_layers is not None and raw_output is False
+        list[RequestOutput] if capture_layers is None and raw_output is True
+        tuple[list[RequestOutput], list[CaptureHandle]] if capture_layers is not None and raw_output is True
         """
         import uuid
         await self._ensure_engine_initialized()
@@ -752,15 +787,36 @@ class VLLMSteerModel(SteerableModel):
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
 
-        # Track prompt lengths for capture reconstruction (legacy support)
-        self._last_prompt_lengths = [
-            len(self.tokenizer.encode(prompt)) for prompt in prompts
-        ]
+        # Setup capture if requested
+        handles: list[CaptureHandle] | None = None
+        if capture_layers is not None:
+            # Convert to tuple
+            if isinstance(capture_layers, int):
+                layers_tuple = (capture_layers,)
+            else:
+                layers_tuple = tuple(capture_layers)
+
+            # Register captures for each prompt
+            handles = []
+            for i, prompt in enumerate(prompts):
+                req_id = f"capture_{uuid.uuid4().hex}"
+                await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
+                handle = CaptureHandle(
+                    request_id=req_id,
+                    layer_indices=layers_tuple,
+                    _model=self,
+                )
+                handles.append(handle)
 
         # Generate each prompt
         results = []
-        for prompt in prompts:
-            request_id = f"gen_{uuid.uuid4().hex}"
+        for i, prompt in enumerate(prompts):
+            # Use capture request_id if capturing, otherwise random
+            if handles:
+                request_id = handles[i].request_id
+            else:
+                request_id = f"gen_{uuid.uuid4().hex}"
+
             final_output = None
             async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
                 final_output = output
@@ -773,7 +829,11 @@ class VLLMSteerModel(SteerableModel):
             else:
                 results.append(final_output.outputs[0].text)
 
-        return results
+        # Return with or without handles
+        if handles:
+            return results, handles
+        else:
+            return results
 
     @overload
     async def chat(
@@ -1173,6 +1233,34 @@ class VLLMSteerModel(SteerableModel):
             stacklevel=2,
         )
         return asyncio.run(self.generate_with_activations(*args, **kwargs))
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _fetch_request_captures(
+        self,
+        request_id: str
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Fetch and deserialize captures for a single request."""
+        await self._ensure_engine_initialized()
+        payloads = await self._collective_rpc("fetch_request_activations", request_id)
+
+        # Deserialize tensors (same logic as fetch_hidden_states)
+        decoded: dict[int, list[dict[str, Any]]] = {}
+        for worker_payload in payloads:
+            for layer_idx_str, tensor_data in worker_payload.items():
+                layer_idx = int(layer_idx_str)
+                tensor = steering_runtime.deserialize_tensor(
+                    tensor_data,
+                    device=self.llm.llm_engine.device,
+                    dtype=self._vector_dtype
+                )
+                if layer_idx not in decoded:
+                    decoded[layer_idx] = []
+                decoded[layer_idx].append({"hidden": tensor})
+
+        return decoded
 
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)

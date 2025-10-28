@@ -139,9 +139,7 @@ class _SteeringState:
     step_metadata: dict[int, dict[str, Any]] = None  # step_number -> {request_ids, seq_lens, ...}
     global_step: int = 0  # Monotonically increasing step counter
 
-    # New global capture mode (replaces per-request tracking)
-    capture_enabled: bool = False
-    global_capture_layers: set[int] = None
+    # Future: current_step_context for optimized routing
     current_step_context: _StepContext | None = None
 
 
@@ -384,20 +382,13 @@ def _finalize_capture_entry(
     entry.pop("_pending", None)
     async_flag = entry.pop("_async", False)
     max_captures = entry.pop("_max", None)
-    is_global = bool(entry.pop("_global_capture", False))
-
-    if is_global:
-        # Route to per-request captures using precomputed slicing
-        _route_global_capture_entry(state, int(layer_idx), entry)
-    else:
-        # Legacy path: append to captured_states
-        captures = state.captured_states.setdefault(layer_idx, [])
-        lock = state.capture_lock
-        context = lock if lock is not None else nullcontext()
-        with context:
-            if max_captures is not None and len(captures) >= max_captures:
-                captures.pop(0)
-            captures.append(entry)
+    captures = state.captured_states.setdefault(layer_idx, [])
+    lock = state.capture_lock
+    context = lock if lock is not None else nullcontext()
+    with context:
+        if max_captures is not None and len(captures) >= max_captures:
+            captures.pop(0)
+        captures.append(entry)
     if async_flag:
         pending = state.capture_pending.get(layer_idx, 0)
         if pending > 0:
@@ -1121,70 +1112,6 @@ def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
     return payload
 
 
-def _flatten_hidden(tensor: torch.Tensor | None) -> torch.Tensor | None:
-    """Flatten hidden state tensor to [total_tokens, hidden_dim]."""
-    if tensor is None:
-        return None
-    if tensor.ndim == 1:
-        return tensor.reshape(1, -1)
-    hidden_dim = tensor.shape[-1]
-    return tensor.reshape(-1, hidden_dim)
-
-
-def _route_global_capture_entry(
-    state: _SteeringState,
-    layer_idx: int,
-    entry: dict[str, Any],
-) -> None:
-    """Split batch-level capture into per-request captures using precomputed slices."""
-    ctx = state.current_step_context
-    if ctx is None:
-        return
-
-    # Extract and flatten tensors
-    before_tensor = entry.pop("before", None)
-    after_tensor = entry.pop("after", None)
-    cap_delta = entry.pop("cap_delta", None)
-    base_meta = entry.get("meta")
-    cap_meta = entry.get("cap_meta")
-
-    flat_before = _flatten_hidden(before_tensor)
-    flat_after = _flatten_hidden(after_tensor)
-    flat_delta = _flatten_hidden(cap_delta)
-
-    # Route each request's slice to its capture buffer
-    lock = state.capture_lock
-    context = lock if lock is not None else nullcontext()
-
-    with context:
-        for i, req_id in enumerate(ctx.request_ids):
-            if i >= len(ctx.slice_ranges):
-                break
-
-            start, end = ctx.slice_ranges[i]
-
-            # Get or create capture list for this request/layer
-            layer_map = state.request_captures.setdefault(req_id, {})
-            capture_list = layer_map.setdefault(int(layer_idx), [])
-
-            # Build capture entry for this request
-            capture_entry: dict[str, Any] = {}
-
-            if flat_before is not None and start < flat_before.shape[0]:
-                capture_entry["before"] = flat_before[start:end].clone()
-            if flat_after is not None and start < flat_after.shape[0]:
-                capture_entry["after"] = flat_after[start:end].clone()
-            if flat_delta is not None and start < flat_delta.shape[0]:
-                capture_entry["cap_delta"] = flat_delta[start:end].clone()
-
-            if base_meta:
-                capture_entry["meta"] = dict(base_meta)
-            if cap_meta:
-                capture_entry["cap_meta"] = dict(cap_meta)
-
-            capture_list.append(capture_entry)
-
-
 def _record_step_context(
     state: _SteeringState,
     request_ids: list[str],
@@ -1332,8 +1259,6 @@ def initialize_worker_state(
         request_token_counts={},
         step_metadata={},
         global_step=0,
-        capture_enabled=False,
-        global_capture_layers=set(),
         current_step_context=None,
     )
     worker._chatspace_steering = state
