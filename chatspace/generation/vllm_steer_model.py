@@ -775,13 +775,9 @@ class VLLMSteerModel(SteerableModel):
         *,
         capture_hidden: bool = False,
         **kwargs: Any,
-    ) -> list[str] | tuple[list[str], CaptureHandle | None]:
+    ) -> list[str] | tuple[list[str], list[CaptureHandle | None]]:
         if isinstance(prompts, str):
             prompts = [prompts]
-        if self._capture_enabled and len(prompts) != 1:
-            raise ValueError(
-                "Activation capture currently supports exactly one prompt per generate call."
-            )
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
         elif kwargs:
@@ -789,27 +785,33 @@ class VLLMSteerModel(SteerableModel):
                 "Provide either sampling_params or keyword overrides, not both."
             )
 
-        request_id: str | None = None
-        handle: CaptureHandle | None = None
+        request_ids: list[str] = []
+        handles: list[CaptureHandle | None] = []
         try:
             outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
             texts = [output.outputs[0].text for output in outputs]
             if self._capture_enabled and outputs:
-                request_id = outputs[0].request_id
-                self._collective_rpc("register_capture_request", request_id)
-                payloads = self._collective_rpc("finalize_capture_request", request_id)
-                captures = self._decode_capture_payloads(payloads)
-                if capture_hidden:
-                    handle = CaptureHandle(
-                        request_id=request_id,
-                        layer_indices=self._capture_layers,
-                        captures=captures,
-                    )
+                for output in outputs:
+                    request_id = output.request_id
+                    request_ids.append(request_id)
+                    self._collective_rpc("register_capture_request", request_id)
+                    payloads = self._collective_rpc("finalize_capture_request", request_id)
+                    captures = self._decode_capture_payloads(payloads)
+                    if capture_hidden:
+                        handles.append(
+                            CaptureHandle(
+                                request_id=request_id,
+                                layer_indices=self._capture_layers,
+                                captures=captures,
+                            )
+                        )
+                    else:
+                        handles.append(None)
             if capture_hidden:
-                return texts, handle
+                return texts, handles
             return texts
         except Exception:
-            if request_id is not None:
+            for request_id in request_ids:
                 self._collective_rpc("abort_capture_request", request_id)
             raise
 
@@ -823,7 +825,7 @@ class VLLMSteerModel(SteerableModel):
         prefill_assistant: str | bool | None = None,
         capture_hidden: bool = False,
         **sampling_kwargs: Any,
-    ) -> list[str] | tuple[list[str], CaptureHandle | None]:
+    ) -> list[str] | tuple[list[str], list[CaptureHandle | None]]:
         """Execute chat-style generation with optional sampling overrides.
 
         Parameters
@@ -923,13 +925,8 @@ class VLLMSteerModel(SteerableModel):
         else:
             prepared_messages = batched_messages
 
-        if self._capture_enabled and len(prepared_messages) != 1:
-            raise ValueError(
-                "Activation capture currently supports exactly one conversation per chat call."
-            )
-
-        request_id: str | None = None
-        handle: CaptureHandle | None = None
+        request_ids: list[str] = []
+        handles: list[CaptureHandle | None] = []
         try:
             outputs = self.llm.chat(
                 prepared_messages,
@@ -944,21 +941,27 @@ class VLLMSteerModel(SteerableModel):
                     text = text[len(trim_prefix) :].lstrip()
                 texts.append(text)
             if self._capture_enabled and outputs:
-                request_id = outputs[0].request_id
-                self._collective_rpc("register_capture_request", request_id)
-                payloads = self._collective_rpc("finalize_capture_request", request_id)
-                captures = self._decode_capture_payloads(payloads)
-                if capture_hidden:
-                    handle = CaptureHandle(
-                        request_id=request_id,
-                        layer_indices=self._capture_layers,
-                        captures=captures,
-                    )
+                for output in outputs:
+                    request_id = output.request_id
+                    request_ids.append(request_id)
+                    self._collective_rpc("register_capture_request", request_id)
+                    payloads = self._collective_rpc("finalize_capture_request", request_id)
+                    captures = self._decode_capture_payloads(payloads)
+                    if capture_hidden:
+                        handles.append(
+                            CaptureHandle(
+                                request_id=request_id,
+                                layer_indices=self._capture_layers,
+                                captures=captures,
+                            )
+                        )
+                    else:
+                        handles.append(None)
             if capture_hidden:
-                return texts, handle
+                return texts, handles
             return texts
         except Exception:
-            if request_id is not None:
+            for request_id in request_ids:
                 self._collective_rpc("abort_capture_request", request_id)
             raise
 

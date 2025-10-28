@@ -454,6 +454,15 @@ def _select_capture_slice(tensor: torch.Tensor, index: int) -> torch.Tensor:
     return sliced.contiguous().detach().clone()
 
 
+def _flatten_hidden(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.ndim == 1:
+        return tensor.reshape(1, -1)
+    hidden_dim = tensor.shape[-1]
+    return tensor.reshape(-1, hidden_dim)
+
+
 def _route_global_capture_entry(
     state: _SteeringState,
     layer_idx: int,
@@ -471,16 +480,48 @@ def _route_global_capture_entry(
     lock = state.capture_lock
     context = lock if lock is not None else nullcontext()
     with context:
+        flat_before = _flatten_hidden(before_tensor)
+        flat_after = _flatten_hidden(after_tensor)
+        flat_delta = _flatten_hidden(cap_delta)
+        total_tokens = flat_before.shape[0] if flat_before is not None else (
+            flat_after.shape[0] if flat_after is not None else 0
+        )
+        lengths: list[int] = []
+        running = 0
+        for idx, request_id in enumerate(request_ids):
+            length = 1
+            if idx < len(scheduled_tokens):
+                try:
+                    candidate = int(scheduled_tokens[idx])
+                    if candidate > 0:
+                        length = candidate
+                except Exception:
+                    pass
+            lengths.append(length)
+            running += length
+        if total_tokens and running != total_tokens:
+            lengths = []
+            remaining = total_tokens
+            chunk = max(1, total_tokens // max(1, len(request_ids)))
+            for idx in range(len(request_ids)):
+                if idx == len(request_ids) - 1:
+                    lengths.append(max(1, remaining))
+                else:
+                    lengths.append(max(1, min(chunk, remaining)))
+                    remaining -= lengths[-1]
+        offset = 0
         for row_index, request_id in enumerate(request_ids):
             layer_map = state.request_captures.setdefault(request_id, {})
             capture_list = layer_map.setdefault(int(layer_idx), [])
             capture_entry: dict[str, Any] = {}
-            if isinstance(before_tensor, torch.Tensor):
-                capture_entry["before"] = _select_capture_slice(before_tensor, row_index)
-            if isinstance(after_tensor, torch.Tensor):
-                capture_entry["after"] = _select_capture_slice(after_tensor, row_index)
-            if isinstance(cap_delta, torch.Tensor):
-                capture_entry["cap_delta"] = _select_capture_slice(cap_delta, row_index)
+            length = lengths[row_index] if row_index < len(lengths) else 1
+            length = max(1, length)
+            if flat_before is not None:
+                capture_entry["before"] = flat_before[offset : offset + length].clone()
+            if flat_after is not None:
+                capture_entry["after"] = flat_after[offset : offset + length].clone()
+            if flat_delta is not None:
+                capture_entry["cap_delta"] = flat_delta[offset : offset + length].clone()
             if isinstance(cap_meta, dict):
                 capture_entry["cap_meta"] = dict(cap_meta)
             meta_payload: dict[str, Any] | None = None
@@ -490,10 +531,10 @@ def _route_global_capture_entry(
                 meta_payload = {}
             meta_payload["request_id"] = request_id
             meta_payload["row_index"] = row_index
-            if scheduled_tokens and row_index < len(scheduled_tokens):
-                meta_payload["scheduled_tokens"] = int(scheduled_tokens[row_index])
+            meta_payload["scheduled_tokens"] = length
             capture_entry["meta"] = meta_payload
             capture_list.append(capture_entry)
+            offset += length
 
 
 def _patch_model_runner(worker: Any, state: _SteeringState) -> None:

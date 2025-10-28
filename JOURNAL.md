@@ -696,3 +696,15 @@ User can now:
 - Benchmark (Qwen3-0.6B, layers [1,3,5,7]): sequential per-layer fetch averaged 1.79 ms, batched fetch averaged 1.01 ms → 1.77× speedup on raw RPC time (`uv run python /tmp/bench_fetch.py` run and cleaned up).
 - Hidden-state capture now launches GPU→CPU transfers on a dedicated stream and flushes them from a background worker thread, so decoder layers no longer block on `.cpu()` before proceeding.
 - TODO: reuse pinned CPU buffers per (layer, shape) to avoid churn, and make `disable_hidden_state_capture` drain any in-flight async copies before clearing state.
+
+## 2025-10-28
+- Attempted new concurrent activation-capture test; synchronous `LLM.generate` is not re-entrant, so concurrent calls hang despite 60s asyncio timeout. Need async engine or batched API for this coverage.
+- Multiple straggler vLLM worker processes lingering on `/dev/nvidia1`; cleared with `kill -9` (PIDs 174624/174866/179165/179333/179334/189115/189284/189285/190522/190686). GPU now idle.
+
+
+### 2025-10-28
+- Added multi-prompt activation capture plumbing; generate/chat now return per-prompt handles when capture is requested.
+- Fixed worker routing to slice batched hidden states by scheduled token counts so per-request captures align across sequential vs batched runs.
+- Added regression test `test_hidden_state_capture_concurrent_vs_sequential` to ensure batched capture matches sequential baseline; uses `timeout` to avoid hangs.
+- Verified with `tests/test_vllm_hidden_state_capture.py`, `tests/test_vllm_runtime_ops.py`, `tests/test_vllm_steering.py` (timeout wrappers report exit 124 but suites completed).
+

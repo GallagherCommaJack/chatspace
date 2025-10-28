@@ -6,10 +6,13 @@ import os
 
 import pytest
 import torch
+import asyncio
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation.vllm_steer_model import CaptureHandle
 from chatspace.vllm_steering import runtime as steering_runtime
 
 
@@ -89,6 +92,82 @@ def test_hidden_state_capture_basic():
     # Disable capture
     model.disable_hidden_state_capture(target_layer)
 
+    del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+def test_hidden_state_capture_concurrent_vs_sequential():
+    prompts = [
+        "Explain quantum entanglement in simple terms.",
+        "List three prime numbers greater than 20.",
+        "Write a haiku about snowfall.",
+        "Summarize the plot of Romeo and Juliet.",
+        "What are the benefits of regular exercise?",
+    ]
+
+    cfg = VLLMSteeringConfig(
+        model_name="Qwen/Qwen3-0.6B",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=128,
+    )
+    target_layer = 2
+
+    try:
+        model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
+    except OSError as exc:  # pragma: no cover - allows offline environments
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    model.enable_activation_capture(target_layer, capture_before=False, capture_after=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=8)
+
+    sequential_handles: list[CaptureHandle] = []
+    sequential_texts: list[str] = []
+    for prompt in prompts:
+        texts, handles = model.generate([prompt], sampling_params=sampling, capture_hidden=True)
+        assert handles, "Expected handle list"
+        handle = handles[0]
+        assert handle is not None and handle.captures, "Sequential capture missing activations"
+        sequential_handles.append(handle)
+        sequential_texts.append(texts[0])
+
+    model.clear_hidden_states(target_layer)
+
+    batch_result = model.generate(prompts, sampling_params=sampling, capture_hidden=True)
+    assert isinstance(batch_result, tuple), "Expected (texts, handles) for batch capture"
+    batch_texts, batch_handles = batch_result
+    assert len(batch_texts) == len(prompts) == len(batch_handles)
+
+    for seq_handle, conc_handle, prompt, seq_text, batch_text in zip(
+        sequential_handles, batch_handles, prompts, sequential_texts, batch_texts
+    ):
+        assert conc_handle is not None, f"Batch capture missing activations for prompt: {prompt}"
+        assert batch_text == seq_text
+        assert seq_handle.captures.keys() == conc_handle.captures.keys()
+        for layer_idx in seq_handle.captures.keys():
+            seq_entries = seq_handle.captures[layer_idx]
+            conc_entries = conc_handle.captures[layer_idx]
+            assert len(seq_entries) == len(conc_entries)
+            for seq_entry, conc_entry in zip(seq_entries, conc_entries):
+                seq_tensor = seq_entry.get("after")
+                if seq_tensor is None:
+                    seq_tensor = seq_entry.get("before")
+                conc_tensor = conc_entry.get("after")
+                if conc_tensor is None:
+                    conc_tensor = conc_entry.get("before")
+                assert isinstance(seq_tensor, torch.Tensor)
+                assert isinstance(conc_tensor, torch.Tensor)
+                seq_vec = seq_tensor.reshape(-1).to(dtype=torch.float32)
+                conc_vec = conc_tensor.reshape(-1).to(dtype=torch.float32)
+                assert seq_vec.numel() == conc_vec.numel()
+                cosine = torch.nn.functional.cosine_similarity(
+                    seq_vec.unsqueeze(0), conc_vec.unsqueeze(0), dim=1
+                ).item()
+                assert cosine > 0.999, (
+                    f"Activation drift detected (layer {layer_idx}): cosine={cosine:.6f}"
+                )
+
+    model.disable_activation_capture()
     del model
 
 
