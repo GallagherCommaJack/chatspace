@@ -183,6 +183,23 @@ class SteeringSpec:
         return all(spec.is_empty() for spec in self.layers.values())
 
 
+@dataclass
+class CaptureHandle:
+    """Represents deferred activation captures for a single request."""
+
+    request_id: str
+    layer_indices: tuple[int, ...]
+    captures: dict[int, list[dict[str, Any]]] | None = None
+
+    def is_ready(self) -> bool:
+        return self.captures is not None
+
+    def result(self) -> dict[int, list[dict[str, Any]]]:
+        if self.captures is None:
+            raise RuntimeError("Capture results are not ready yet.")
+        return self.captures
+
+
 def _parse_dtype(dtype_str: str) -> torch.dtype:
     if not dtype_str.startswith("torch."):
         raise ValueError(f"Unexpected dtype format: {dtype_str}")
@@ -298,6 +315,8 @@ class VLLMSteerModel(SteerableModel):
             self.set_target_layer(init_layers[0])
         elif layer_count > 0:
             self.set_target_layer(0)
+        self._capture_enabled: bool = False
+        self._capture_layers: tuple[int, ...] = ()
 
     def _ensure_layer_spec(self, layer_idx: int) -> LayerSteeringSpec:
         idx = int(layer_idx)
@@ -318,6 +337,91 @@ class VLLMSteerModel(SteerableModel):
             return
         if spec.is_empty():
             self._layer_specs.pop(idx, None)
+
+    def _decode_capture_payloads(
+        self, payloads: list[dict[int, list[dict[str, Any]]]]
+    ) -> dict[int, list[dict[str, Any]]]:
+        if not payloads:
+            return {}
+
+        def _is_tensor_payload(value: Any) -> bool:
+            return (
+                isinstance(value, dict)
+                and "dtype" in value
+                and "shape" in value
+                and "data" in value
+            )
+
+        decoded_workers: list[dict[int, list[dict[str, Any]]]] = []
+        for payload in payloads:
+            layer_map: dict[int, list[dict[str, Any]]] = {}
+            for layer_idx, entries in payload.items():
+                decoded_entries: list[dict[str, Any]] = []
+                for entry in entries:
+                    decoded_entry: dict[str, Any] = {}
+                    for key, value in entry.items():
+                        if _is_tensor_payload(value):
+                            decoded_entry[key] = steering_runtime.deserialize_tensor(
+                                value,
+                                device=torch.device("cpu"),
+                            )
+                        elif isinstance(value, dict):
+                            decoded_entry[key] = dict(value)
+                        else:
+                            decoded_entry[key] = value
+                    decoded_entries.append(decoded_entry)
+                layer_map[int(layer_idx)] = decoded_entries
+            decoded_workers.append(layer_map)
+
+        canonical = decoded_workers[0]
+        for worker_idx, worker_map in enumerate(decoded_workers[1:], start=1):
+            if not self._captures_match(canonical, worker_map):
+                logger.warning(
+                    "Activation capture payload mismatch on worker %s; using first worker's tensors",
+                    worker_idx,
+                )
+        result: dict[int, list[dict[str, Any]]] = {}
+        for layer_idx, entries in canonical.items():
+            tensor_entries: list[dict[str, Any]] = []
+            for entry in entries:
+                decoded_entry: dict[str, Any] = {}
+                for key, value in entry.items():
+                    if isinstance(value, torch.Tensor):
+                        decoded_entry[key] = value
+                if "meta" in entry:
+                    decoded_entry["meta"] = entry["meta"]  # type: ignore[assignment]
+                if "cap_meta" in entry:
+                    decoded_entry["cap_meta"] = entry["cap_meta"]  # type: ignore[assignment]
+                tensor_entries.append(decoded_entry)
+            result[int(layer_idx)] = tensor_entries
+        return result
+
+    def _captures_match(
+        self,
+        baseline: dict[int, list[dict[str, Any]]],
+        candidate: dict[int, list[dict[str, Any]]],
+    ) -> bool:
+        if baseline.keys() != candidate.keys():
+            return False
+        for layer_idx in baseline.keys():
+            base_entries = baseline[layer_idx]
+            cand_entries = candidate[layer_idx]
+            if len(base_entries) != len(cand_entries):
+                return False
+            for base_entry, cand_entry in zip(base_entries, cand_entries):
+                if base_entry.keys() != cand_entry.keys():
+                    return False
+                for key, base_value in base_entry.items():
+                    cand_value = cand_entry[key]
+                    if isinstance(base_value, torch.Tensor) and isinstance(cand_value, torch.Tensor):
+                        if base_value.shape != cand_value.shape:
+                            return False
+                        if not torch.equal(base_value, cand_value):
+                            return False
+                    else:
+                        if base_value != cand_value:
+                            return False
+        return True
 
     def _collective_rpc(
         self,
@@ -627,18 +731,82 @@ class VLLMSteerModel(SteerableModel):
     def clear_all_vectors(self) -> None:
         self._broadcast_clear()
 
+    def enable_activation_capture(
+        self,
+        layers: Sequence[int] | int,
+        *,
+        capture_before: bool = True,
+        capture_after: bool = True,
+        max_captures: int | None = None,
+    ) -> None:
+        """Enable global activation capture for specified transformer layers."""
+
+        if isinstance(layers, int):
+            layer_indices = (int(layers),)
+        else:
+            layer_indices = tuple(int(idx) for idx in layers)
+        if not layer_indices:
+            raise ValueError("At least one layer index must be provided for activation capture.")
+        self._collective_rpc(
+            "set_global_capture",
+            True,
+            layer_indices,
+            kwargs={
+                "capture_before": capture_before,
+                "capture_after": capture_after,
+                "max_captures": max_captures,
+            },
+        )
+        self._capture_enabled = True
+        self._capture_layers = layer_indices
+
+    def disable_activation_capture(self) -> None:
+        """Disable global activation capture and release stored buffers."""
+
+        self._collective_rpc("set_global_capture", False, ())
+        self._collective_rpc("clear_global_capture")
+        self._capture_enabled = False
+        self._capture_layers = ()
+
     def generate(
         self,
         prompts: list[str] | str,
         sampling_params: SamplingParams | None = None,
         **kwargs: Any,
-    ) -> list[str]:
+    ) -> tuple[list[str], CaptureHandle | None]:
         if isinstance(prompts, str):
             prompts = [prompts]
+        if self._capture_enabled and len(prompts) != 1:
+            raise ValueError(
+                "Activation capture currently supports exactly one prompt per generate call."
+            )
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
-        return [output.outputs[0].text for output in outputs]
+        elif kwargs:
+            raise ValueError(
+                "Provide either sampling_params or keyword overrides, not both."
+            )
+
+        request_id: str | None = None
+        handle: CaptureHandle | None = None
+        try:
+            outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
+            texts = [output.outputs[0].text for output in outputs]
+            if self._capture_enabled and outputs:
+                request_id = outputs[0].request_id
+                handle = CaptureHandle(
+                    request_id=request_id,
+                    layer_indices=self._capture_layers,
+                )
+                self._collective_rpc("register_capture_request", request_id)
+                payloads = self._collective_rpc("finalize_capture_request", request_id)
+                captures = self._decode_capture_payloads(payloads)
+                handle.captures = captures
+            return texts, handle
+        except Exception:
+            if request_id is not None:
+                self._collective_rpc("abort_capture_request", request_id)
+            raise
 
     def chat(
         self,
@@ -649,7 +817,7 @@ class VLLMSteerModel(SteerableModel):
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
         **sampling_kwargs: Any,
-    ) -> list[str]:
+    ) -> tuple[list[str], CaptureHandle | None]:
         """Execute chat-style generation with optional sampling overrides.
 
         Parameters
@@ -744,19 +912,41 @@ class VLLMSteerModel(SteerableModel):
         else:
             prepared_messages = batched_messages
 
-        outputs = self.llm.chat(
-            prepared_messages,
-            sampling_params=sampling_params,
-            use_tqdm=use_tqdm,
-            **chat_kwargs,
-        )
-        texts: list[str] = []
-        for output in outputs:
-            text = output.outputs[0].text
-            if trim_prefix and text.startswith(trim_prefix):
-                text = text[len(trim_prefix) :].lstrip()
-            texts.append(text)
-        return texts
+        if self._capture_enabled and len(prepared_messages) != 1:
+            raise ValueError(
+                "Activation capture currently supports exactly one conversation per chat call."
+            )
+
+        request_id: str | None = None
+        handle: CaptureHandle | None = None
+        try:
+            outputs = self.llm.chat(
+                prepared_messages,
+                sampling_params=sampling_params,
+                use_tqdm=use_tqdm,
+                **chat_kwargs,
+            )
+            texts: list[str] = []
+            for output in outputs:
+                text = output.outputs[0].text
+                if trim_prefix and text.startswith(trim_prefix):
+                    text = text[len(trim_prefix) :].lstrip()
+                texts.append(text)
+            if self._capture_enabled and outputs:
+                request_id = outputs[0].request_id
+                handle = CaptureHandle(
+                    request_id=request_id,
+                    layer_indices=self._capture_layers,
+                )
+                self._collective_rpc("register_capture_request", request_id)
+                payloads = self._collective_rpc("finalize_capture_request", request_id)
+                captures = self._decode_capture_payloads(payloads)
+                handle.captures = captures
+            return texts, handle
+        except Exception:
+            if request_id is not None:
+                self._collective_rpc("abort_capture_request", request_id)
+            raise
 
     def save_pretrained(self, save_directory: str | Path, **_) -> None:
         path = Path(save_directory)

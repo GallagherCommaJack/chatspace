@@ -41,8 +41,9 @@ import queue
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
+from types import MethodType
 from typing import Any, Callable, Sequence
 
 import torch
@@ -100,6 +101,15 @@ class _CaptureCounters:
 
 
 @dataclass
+class _StepContext:
+    """Describe the active scheduler step for global capture."""
+
+    step_index: int
+    request_ids: tuple[str, ...]
+    scheduled_tokens: tuple[int, ...]
+
+
+@dataclass
 class _SteeringState:
     """Track steering metadata for a worker."""
 
@@ -117,6 +127,14 @@ class _SteeringState:
     capture_stream: torch.cuda.Stream | None
     capture_lock: threading.Lock | None
     capture_pending: dict[int, int]
+    capture_enabled: bool = False
+    global_capture_layers: set[int] = field(default_factory=set)
+    global_capture_config: _CaptureConfig | None = None
+    global_step: int = 0
+    current_step_context: _StepContext | None = None
+    active_requests: set[str] = field(default_factory=set)
+    request_captures: dict[str, dict[int, list[dict[str, Any]]]] = field(default_factory=dict)
+    config_lock: threading.RLock | None = None
 
 
 @dataclass
@@ -247,6 +265,8 @@ def _setup_async_capture_infrastructure(state: _SteeringState) -> None:
     """Ensure background capture machinery is initialised for a worker."""
     if state.capture_lock is None:
         state.capture_lock = threading.Lock()
+    if state.config_lock is None:
+        state.config_lock = threading.RLock()
     if state.device.type != "cuda":
         state.capture_task_queue = None
         state.capture_stream = None
@@ -358,13 +378,17 @@ def _finalize_capture_entry(
     entry.pop("_pending", None)
     async_flag = entry.pop("_async", False)
     max_captures = entry.pop("_max", None)
-    captures = state.captured_states.setdefault(layer_idx, [])
-    lock = state.capture_lock
-    context = lock if lock is not None else nullcontext()
-    with context:
-        if max_captures is not None and len(captures) >= max_captures:
-            captures.pop(0)
-        captures.append(entry)
+    is_global = bool(entry.pop("_global_capture", False))
+    if is_global:
+        _route_global_capture_entry(state, int(layer_idx), entry)
+    else:
+        captures = state.captured_states.setdefault(layer_idx, [])
+        lock = state.capture_lock
+        context = lock if lock is not None else nullcontext()
+        with context:
+            if max_captures is not None and len(captures) >= max_captures:
+                captures.pop(0)
+            captures.append(entry)
     if async_flag:
         pending = state.capture_pending.get(layer_idx, 0)
         if pending > 0:
@@ -390,6 +414,111 @@ def _wait_for_pending_captures(state: _SteeringState, indices: Sequence[int]) ->
         time.sleep(0.0005)
 
 
+def _record_step_context(
+    state: _SteeringState,
+    runner: Any,
+    scheduler_output: Any,
+) -> None:
+    if not state.capture_enabled:
+        state.current_step_context = None
+        return
+    batch = getattr(runner, "input_batch", None)
+    if batch is None:
+        state.current_step_context = None
+        return
+    req_id_to_index = getattr(batch, "req_id_to_index", None)
+    if not req_id_to_index:
+        state.current_step_context = None
+        return
+    ordered = sorted(req_id_to_index.items(), key=lambda item: item[1])
+    if not ordered:
+        state.current_step_context = None
+        return
+    request_ids = tuple(str(req_id) for req_id, _ in ordered)
+    scheduled_map = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+    scheduled_tokens = tuple(int(scheduled_map.get(req_id, 0)) for req_id in request_ids)
+    state.current_step_context = _StepContext(
+        step_index=state.global_step,
+        request_ids=request_ids,
+        scheduled_tokens=scheduled_tokens,
+    )
+    state.global_step += 1
+
+
+def _select_capture_slice(tensor: torch.Tensor, index: int) -> torch.Tensor:
+    if tensor.ndim == 0:
+        return tensor.detach().clone()
+    sliced = tensor[index]
+    if sliced.ndim == 1:
+        sliced = sliced.unsqueeze(0)
+    return sliced.contiguous().detach().clone()
+
+
+def _route_global_capture_entry(
+    state: _SteeringState,
+    layer_idx: int,
+    entry: dict[str, Any],
+) -> None:
+    request_ids = entry.pop("_request_ids", ())
+    if not request_ids:
+        return
+    scheduled_tokens = entry.pop("_scheduled_tokens", ())
+    before_tensor = entry.pop("before", None)
+    after_tensor = entry.pop("after", None)
+    cap_delta = entry.pop("cap_delta", None)
+    base_meta = entry.get("meta")
+    cap_meta = entry.get("cap_meta")
+    lock = state.capture_lock
+    context = lock if lock is not None else nullcontext()
+    with context:
+        for row_index, request_id in enumerate(request_ids):
+            layer_map = state.request_captures.setdefault(request_id, {})
+            capture_list = layer_map.setdefault(int(layer_idx), [])
+            capture_entry: dict[str, Any] = {}
+            if isinstance(before_tensor, torch.Tensor):
+                capture_entry["before"] = _select_capture_slice(before_tensor, row_index)
+            if isinstance(after_tensor, torch.Tensor):
+                capture_entry["after"] = _select_capture_slice(after_tensor, row_index)
+            if isinstance(cap_delta, torch.Tensor):
+                capture_entry["cap_delta"] = _select_capture_slice(cap_delta, row_index)
+            if isinstance(cap_meta, dict):
+                capture_entry["cap_meta"] = dict(cap_meta)
+            meta_payload: dict[str, Any] | None = None
+            if isinstance(base_meta, dict):
+                meta_payload = dict(base_meta)
+            if meta_payload is None:
+                meta_payload = {}
+            meta_payload["request_id"] = request_id
+            meta_payload["row_index"] = row_index
+            if scheduled_tokens and row_index < len(scheduled_tokens):
+                meta_payload["scheduled_tokens"] = int(scheduled_tokens[row_index])
+            capture_entry["meta"] = meta_payload
+            capture_list.append(capture_entry)
+
+
+def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        return
+    if getattr(runner, "_chatspace_capture_runner_patch", False):
+        return
+
+    original_update_states = runner._update_states
+    original_execute_model = runner.execute_model
+
+    def _patched_update_states(self: Any, scheduler_output: Any) -> None:
+        original_update_states(scheduler_output)
+        _record_step_context(state, self, scheduler_output)
+
+    def _patched_execute_model(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_execute_model(scheduler_output, *args, **kwargs)
+        finally:
+            state.current_step_context = None
+
+    runner._update_states = MethodType(_patched_update_states, runner)  # type: ignore[attr-defined]
+    runner.execute_model = MethodType(_patched_execute_model, runner)  # type: ignore[attr-defined]
+    runner._chatspace_capture_runner_patch = True
 def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
     """Extract the primary hidden state tensor from layer output.
 
@@ -434,18 +563,27 @@ def _infer_sequence_length(tensor: torch.Tensor | None) -> int:
 
 
 def _prepare_capture_metadata(
-    counter: _CaptureCounters | None, reference: torch.Tensor | None
-) -> dict[str, int | str]:
+    counter: _CaptureCounters | None,
+    reference: torch.Tensor | None,
+    *,
+    global_step: int | None = None,
+    request_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
     if counter is None:
         return {}
     seq_len = _infer_sequence_length(reference)
     phase, phase_index, step = counter.next(seq_len)
-    return {
+    metadata: dict[str, Any] = {
         "phase": phase,
         "phase_index": phase_index,
         "step": step,
         "seq_len": seq_len,
     }
+    if global_step is not None:
+        metadata["global_step"] = int(global_step)
+    if request_ids is not None:
+        metadata["request_ids"] = list(request_ids)
+    return metadata
 
 
 def _is_qwen_layer_output(output: Any) -> bool:
@@ -732,8 +870,18 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         output = original_forward(self, *args, **kwargs)
 
         # Check if this layer should capture hidden states
+        state = getattr(self, "_chatspace_steering_state", None)
+        layer_idx = getattr(self, "_chatspace_layer_index", None)
         capture_config = getattr(self, "_chatspace_capture_config", None)
         capture_enabled = isinstance(capture_config, _CaptureConfig)
+        global_capture_active = (
+            capture_enabled
+            and state is not None
+            and layer_idx is not None
+            and state.capture_enabled
+            and layer_idx in state.global_capture_layers
+        )
+        step_context = state.current_step_context if global_capture_active else None
         captured_before: torch.Tensor | None = None
         cap_debug_payload: dict[str, Any] | None = None
 
@@ -776,8 +924,6 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                     captured_after = _extract_hidden_from_output(output)
                 if captured_before is not None or captured_after is not None:
                     capture_entry: dict[str, Any] = {}
-                    state = getattr(self, "_chatspace_steering_state", None)
-                    layer_idx = getattr(self, "_chatspace_layer_index", None)
                     if captured_before is not None:
                         _queue_capture_tensor(
                             captured_before,
@@ -798,7 +944,12 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                         )
                     counter = getattr(self, "_chatspace_capture_counter", None)
                     reference_tensor = captured_after if captured_after is not None else captured_before
-                    metadata = _prepare_capture_metadata(counter, reference_tensor)
+                    metadata = _prepare_capture_metadata(
+                        counter,
+                        reference_tensor,
+                        global_step=step_context.step_index if step_context else None,
+                        request_ids=step_context.request_ids if step_context else None,
+                    )
                     if metadata:
                         capture_entry["meta"] = metadata
                     if cap_debug_payload is not None:
@@ -820,6 +971,11 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                         if cap_meta:
                             capture_entry["cap_meta"] = cap_meta
                         cap_debug_payload = None
+                    if global_capture_active:
+                        capture_entry["_global_capture"] = True
+                        if step_context is not None:
+                            capture_entry["_request_ids"] = step_context.request_ids
+                            capture_entry["_scheduled_tokens"] = step_context.scheduled_tokens
                     if ("before" in capture_entry or "after" in capture_entry or capture_entry.get("_pending")):
                         _finalize_capture_entry(state, layer_idx, capture_entry)
             except Exception:  # pragma: no cover - graceful degradation
@@ -1050,6 +1206,7 @@ def initialize_worker_state(
     )
     worker._chatspace_steering = state
     _setup_async_capture_infrastructure(state)
+    _patch_model_runner(worker, state)
 
     if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
         worker.model_runner.model = _SteeredModelWrapper(model, state)
@@ -1493,6 +1650,123 @@ def clear_captured_hidden_states(
             counter.reset()
 
 
+def set_global_capture(
+    worker: Any,
+    enabled: bool,
+    layer_indices: Sequence[int] | None = None,
+    *,
+    capture_before: bool = True,
+    capture_after: bool = True,
+    max_captures: int | None = None,
+) -> None:
+    state = _ensure_state(worker)
+    lock = state.config_lock
+    context = lock if lock is not None else nullcontext()
+    with context:
+        if enabled:
+            layers = [int(idx) for idx in (layer_indices or ())]
+            if not layers:
+                raise ValueError("layer_indices must be provided when enabling capture.")
+            if state.active_requests:
+                raise RuntimeError(
+                    "Cannot enable activation capture while requests are in flight."
+                )
+            capture_cfg = _CaptureConfig(
+                capture_before=bool(capture_before),
+                capture_after=bool(capture_after),
+                max_captures=int(max_captures) if max_captures is not None else None,
+            )
+            # Ensure no conflicting manual capture is active.
+            if state.capture_configs and set(state.capture_configs.keys()) - set(layers):
+                raise RuntimeError(
+                    "Global activation capture requires existing per-layer capture to be disabled first."
+                )
+            for idx in layers:
+                enable_hidden_state_capture(
+                    worker,
+                    idx,
+                    capture_before=capture_before,
+                    capture_after=capture_after,
+                    max_captures=max_captures,
+                )
+            state.capture_enabled = True
+            state.global_capture_layers = set(layers)
+            state.global_capture_config = capture_cfg
+            state.request_captures.clear()
+            state.global_step = 0
+        else:
+            if not state.capture_enabled:
+                state.global_capture_layers.clear()
+                state.global_capture_config = None
+                state.request_captures.clear()
+                return
+            if state.active_requests:
+                raise RuntimeError(
+                    "Cannot disable activation capture while requests are in flight."
+                )
+            for idx in list(state.global_capture_layers):
+                disable_hidden_state_capture(worker, idx)
+            state.capture_enabled = False
+            state.global_capture_layers.clear()
+            state.global_capture_config = None
+            state.request_captures.clear()
+            state.current_step_context = None
+
+
+def register_capture_request(worker: Any, request_id: str) -> None:
+    state = _ensure_state(worker)
+    if request_id in state.active_requests:
+        return
+    state.active_requests.add(request_id)
+    if not state.capture_enabled:
+        return
+    state.request_captures.setdefault(
+        request_id,
+        {idx: [] for idx in state.global_capture_layers},
+    )
+
+
+def finalize_capture_request(worker: Any, request_id: str) -> dict[int, list[dict[str, Any]]]:
+    state = _ensure_state(worker)
+    try:
+        if not state.capture_enabled:
+            state.request_captures.pop(request_id, None)
+            return {}
+        _wait_for_pending_captures(state, sorted(state.global_capture_layers))
+        lock = state.capture_lock
+        context = lock if lock is not None else nullcontext()
+        with context:
+            captures = state.request_captures.pop(request_id, {})
+        serialized: dict[int, list[dict[str, Any]]] = {}
+        for layer_idx, entries in captures.items():
+            serialized_entries: list[dict[str, Any]] = []
+            for entry in entries:
+                serialized_entry: dict[str, Any] = {}
+                for key, value in entry.items():
+                    if isinstance(value, torch.Tensor):
+                        serialized_entry[key] = serialize_tensor(value)
+                    elif isinstance(value, dict):
+                        serialized_entry[key] = dict(value)
+                    else:
+                        serialized_entry[key] = value
+                serialized_entries.append(serialized_entry)
+            serialized[int(layer_idx)] = serialized_entries
+        return serialized
+    finally:
+        state.active_requests.discard(request_id)
+
+
+def abort_capture_request(worker: Any, request_id: str) -> None:
+    state = _ensure_state(worker)
+    state.request_captures.pop(request_id, None)
+    state.active_requests.discard(request_id)
+
+
+def clear_global_capture(worker: Any) -> None:
+    state = _ensure_state(worker)
+    state.request_captures.clear()
+
+
 for _rpc_fn in (
     initialize_worker_state,
     set_worker_vector,
@@ -1509,6 +1783,11 @@ for _rpc_fn in (
     disable_hidden_state_capture,
     fetch_captured_hidden_states,
     clear_captured_hidden_states,
+    set_global_capture,
+    register_capture_request,
+    finalize_capture_request,
+    abort_capture_request,
+    clear_global_capture,
 ):
     _register_rpc(_rpc_fn.__name__, _rpc_fn)
 
