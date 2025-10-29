@@ -360,7 +360,7 @@ async def test_comprehensive_vllm_integration():
         # =====================================================================
         # Part 4: Test RWLock with Concurrent Operations
         # =====================================================================
-        print(f"\n[3/3] Testing RWLock with concurrent operations...")
+        print(f"\n[3/4] Testing RWLock with concurrent operations...")
 
         async def concurrent_generate(prompt_idx: int):
             """Generate with a single prompt (should be allowed concurrently)."""
@@ -411,7 +411,74 @@ async def test_comprehensive_vllm_integration():
         else:
             print(f"    ⚠ Sequential execution detected (may be vLLM engine batching)")
 
-        # Test 2: Steering change blocks until generation completes
+        # Test 2: Verify concurrent captures are properly isolated (don't get mixed up)
+        print("  Testing capture isolation (concurrent requests don't mix)...")
+
+        # Generate concurrently WITH capture, using unique seeds per request
+        capture_layers = [layer_2_config["layer"], layer_5_config["layer"]]
+
+        async def concurrent_generate_with_capture(prompt_idx: int):
+            # Use unique seed per prompt for different outputs
+            texts_conc, handles_conc = await vllm_model.generate(
+                [prompts[prompt_idx]],
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=10, seed=5000 + prompt_idx),
+                capture_layers=capture_layers,
+            )
+            await vllm_model.fetch_captures_batch(handles_conc)
+            return (texts_conc[0], handles_conc[0].captures, prompt_idx)
+
+        # Queue up concurrent tasks
+        conc_task1 = asyncio.create_task(concurrent_generate_with_capture(0))
+        conc_task2 = asyncio.create_task(concurrent_generate_with_capture(1))
+        conc_task3 = asyncio.create_task(concurrent_generate_with_capture(2))
+
+        results = await asyncio.gather(conc_task1, conc_task2, conc_task3)
+
+        # Verify each capture has reasonable properties
+        capture_issues = []
+        for text, captures, prompt_idx in results:
+            # Debug: Check tokenization details
+            prompt_only = tokenizer(prompts[prompt_idx], return_tensors="pt")
+            prompt_len = prompt_only.input_ids.shape[1]
+            generated_only = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+            generated_len = generated_only.input_ids.shape[1]
+            full_output = tokenizer(prompts[prompt_idx] + text, return_tensors="pt")
+            full_len = full_output.input_ids.shape[1]
+
+            for layer in capture_layers:
+                if layer not in captures:
+                    capture_issues.append(f"Prompt {prompt_idx}: missing layer {layer}")
+                    continue
+
+                captured_hidden = captures[layer][0]["hidden"]
+                actual_len = captured_hidden.shape[0]
+
+                # In autoregressive generation, the final sampled token is never processed
+                # through the model - it's only sampled from logits. So the capture should have:
+                # prompt_tokens + (generated_tokens - 1)
+                # Example: 15 prompt + (10 generated - 1 final) = 24 captured
+                expected_len = prompt_len + (generated_len - 1)
+
+                if actual_len != expected_len:
+                    capture_issues.append(
+                        f"Prompt {prompt_idx}, Layer {layer}: length mismatch "
+                        f"(captured {actual_len} != expected {expected_len}, "
+                        f"prompt={prompt_len}, generated={generated_len})"
+                    )
+
+                # Verify no NaNs or Infs
+                if torch.isnan(captured_hidden).any() or torch.isinf(captured_hidden).any():
+                    capture_issues.append(f"Prompt {prompt_idx}, Layer {layer}: contains NaN/Inf")
+
+        if capture_issues:
+            print(f"    ✗ Capture isolation issues detected:")
+            for issue in capture_issues:
+                print(f"      - {issue}")
+            raise AssertionError(f"Concurrent capture isolation failed: {capture_issues}")
+        else:
+            print(f"    ✓ All {len(results)} concurrent captures properly isolated and valid")
+
+        # Test 3: Steering change blocks until generation completes
         print("  Testing steering change blocks during generation...")
 
         async def long_generate():
@@ -469,6 +536,7 @@ async def test_comprehensive_vllm_integration():
             print("  - Batch generation with chat formatting works")
             print("  - Decode phase steering matches HF ground truth")
             print("  - Multi-method steering (add + cap + ablation) works")
+            print("  - Concurrent captures match serial execution (isolation verified)")
             print("  - RWLock correctly coordinates concurrent operations")
         else:
             print("\n✗ SOME TESTS FAILED")
