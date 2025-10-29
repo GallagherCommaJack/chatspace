@@ -36,6 +36,7 @@ to confirm.
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import queue
 import threading
@@ -47,6 +48,13 @@ from typing import Any, Callable, Sequence
 
 import torch
 from torch import nn
+
+# Use vLLM's logger to ensure logs appear in worker processes
+try:
+    from vllm.logger import init_logger
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 try:  # pragma: no cover - torch._dynamo optional at runtime
     import torch._dynamo as _dynamo
 except Exception:  # pragma: no cover - fallback when unavailable
@@ -856,11 +864,21 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
             if state is not None and state.active_capture_requests:
                 # Get current step metadata
                 current_step = state.global_step - 1  # Most recent step
+                logger.debug(
+                    f"Forward hook: layer_idx={getattr(self, '_chatspace_layer_index', None)}, "
+                    f"global_step={state.global_step}, current_step={current_step}, "
+                    f"step_metadata keys={list(state.step_metadata.keys())}"
+                )
                 if current_step < 0:
+                    logger.debug("Forward hook: current_step < 0, skipping capture")
                     return output
 
                 metadata = state.step_metadata.get(current_step)
                 if metadata is None:
+                    logger.debug(
+                        f"Forward hook: No metadata found for step {current_step}. "
+                        f"Available steps: {list(state.step_metadata.keys())}"
+                    )
                     return output
 
                 request_ids = metadata.get("request_ids", [])
@@ -1150,16 +1168,40 @@ def _record_step_context(
 def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
     """Patch GPUModelRunner.execute_model to capture per-step batch metadata."""
     model_runner = worker.model_runner
+    logger.info(
+        f"_patch_model_runner: model_runner type={type(model_runner).__name__}, "
+        f"has execute_model={hasattr(model_runner, 'execute_model')}"
+    )
+    
+    if not hasattr(model_runner, "execute_model"):
+        logger.error(f"model_runner does not have execute_model method! Available methods: {[m for m in dir(model_runner) if not m.startswith('_')][:20]}")
+        return
+    
     original_execute = getattr(model_runner, "_original_execute_model", None)
 
     if original_execute is not None:
         # Already patched
+        logger.info("Model runner already patched, skipping")
         return
 
     original_execute = model_runner.execute_model
+    logger.info(
+        f"Patching model_runner.execute_model: original={original_execute}, "
+        f"model_runner type={type(model_runner).__name__}"
+    )
 
     def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
         """Intercept execute_model to capture batch metadata."""
+        logger.debug(
+            f"patched_execute_model called: model_input type={type(model_input).__name__}, "
+            f"has scheduled_new_reqs={hasattr(model_input, 'scheduled_new_reqs')}, "
+            f"has scheduled_cached_reqs={hasattr(model_input, 'scheduled_cached_reqs')}, "
+            f"global_step={state.global_step}"
+        )
+        # Log all attributes of model_input for debugging
+        attrs = [attr for attr in dir(model_input) if not attr.startswith("_")]
+        logger.debug(f"model_input attributes: {attrs[:20]}")  # Limit to first 20
+            
         # Extract request IDs and sequence lengths from model_input
         try:
             request_ids = None
@@ -1168,15 +1210,20 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
             # V1 engine: model_input is SchedulerOutput
             # It has scheduled_new_reqs (list) and scheduled_cached_reqs (CachedRequestData object)
             if hasattr(model_input, "scheduled_new_reqs") and hasattr(model_input, "scheduled_cached_reqs"):
+                logger.debug("Found scheduled_new_reqs and scheduled_cached_reqs attributes")
+                
                 # Extract from NEW requests (prefill phase)
-                if model_input.scheduled_new_reqs:
-                    new_reqs = model_input.scheduled_new_reqs
+                new_reqs_val = model_input.scheduled_new_reqs
+                if new_reqs_val:
+                    new_reqs = new_reqs_val
+                    logger.debug(f"scheduled_new_reqs: type={type(new_reqs)}, len={len(new_reqs) if isinstance(new_reqs, list) else 'N/A'}")
                     if not isinstance(new_reqs, list):
                         new_reqs = [new_reqs]
 
                     request_ids = []
                     seq_lens = []
                     for req in new_reqs:
+                        logger.debug(f"Processing new_req: type={type(req).__name__}, has req_id={hasattr(req, 'req_id')}, has prompt_token_ids={hasattr(req, 'prompt_token_ids')}")
                         if hasattr(req, "req_id"):
                             request_ids.append(req.req_id)
                         # For NewRequestData, use len(prompt_token_ids)
@@ -1184,8 +1231,11 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                             seq_lens.append(len(req.prompt_token_ids))
 
                 # Also handle CACHED requests (decode phase)
-                if model_input.scheduled_cached_reqs and hasattr(model_input.scheduled_cached_reqs, "req_ids"):
-                    cached = model_input.scheduled_cached_reqs
+                cached_reqs_val = model_input.scheduled_cached_reqs
+                if cached_reqs_val and hasattr(cached_reqs_val, "req_ids"):
+                    cached = cached_reqs_val
+                    num_reqs = getattr(cached, "num_reqs", None)
+                    logger.debug(f"scheduled_cached_reqs: type={type(cached)}, num_reqs={num_reqs}, has req_ids={hasattr(cached, 'req_ids')}")
                     if cached.num_reqs > 0 and cached.req_ids:
                         if not request_ids:
                             request_ids = []
@@ -1194,6 +1244,12 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                         # Cached requests are generating 1 token each (decode)
                         request_ids.extend(cached.req_ids)
                         seq_lens.extend([1] * len(cached.req_ids))
+            else:
+                logger.debug(
+                    f"model_input does not have expected attributes. "
+                    f"has scheduled_new_reqs={hasattr(model_input, 'scheduled_new_reqs')}, "
+                    f"has scheduled_cached_reqs={hasattr(model_input, 'scheduled_cached_reqs')}"
+                )
 
             if request_ids:
                 # Store metadata for this step (legacy)
@@ -1203,11 +1259,20 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                     "seq_lens": seq_lens,  # Can be None if not extractable
                     "step": current_step,
                 }
+                logger.debug(
+                    f"Stored step_metadata for step {current_step}: "
+                    f"request_ids={request_ids}, seq_lens={seq_lens}"
+                )
                 # Record step context with precomputed slicing (new)
                 _record_step_context(state, request_ids, seq_lens)
-        except Exception:
-            # Don't break generation if metadata extraction fails
-            pass
+            else:
+                logger.debug("No request_ids extracted from model_input")
+        except Exception as e:
+            # Log exception details instead of silently failing
+            logger.warning(
+                f"Failed to extract metadata from model_input: {type(e).__name__}: {e}",
+                exc_info=True
+            )
 
         # Call original execute_model
         return original_execute(model_input, *args, **kwargs)
@@ -1266,10 +1331,19 @@ def initialize_worker_state(
     _setup_async_capture_infrastructure(state)
 
     # Patch model runner to capture batch metadata for per-request activation tracking
+    logger.info(f"About to patch model runner. worker.model_runner type: {type(worker.model_runner).__name__}")
+    logger.info(f"worker.model_runner has execute_model: {hasattr(worker.model_runner, 'execute_model')}")
     _patch_model_runner(worker, state)
+    logger.info(f"After patching, execute_model type: {type(worker.model_runner.execute_model).__name__}")
 
     if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
         worker.model_runner.model = _SteeredModelWrapper(model, state)
+
+    # Attach state and layer indices to all layers so forward hooks can access them
+    layers = _resolve_layers(worker.model_runner.model)
+    for layer_idx, layer in enumerate(layers):
+        setattr(layer, "_chatspace_steering_state", state)
+        setattr(layer, "_chatspace_layer_index", layer_idx)
 
     initial_layers = tuple(int(idx) for idx in (layer_indices or ()))
     seen: set[int] = set()
@@ -1550,6 +1624,7 @@ def register_capture_request(
 ) -> None:
     """Register request and prepare buffers for per-request capture."""
     state = _ensure_state(worker)
+    logger.debug(f"register_capture_request: request_id={request_id}, layer_indices={layer_indices}")
     state.active_capture_requests[request_id] = set(layer_indices)
     state.request_captures[request_id] = {}
     state.request_prefill_buffers[request_id] = {idx: [] for idx in layer_indices}
