@@ -136,6 +136,19 @@ Each run records:
 - Guard against regressions by checking embedding dimension, norm bounds, and manifest integrity
 - **IMPORTANT**: Always run tests with timeouts - bugs can cause hangs and GPU memory recovery is tricky
 
+### vLLM Steering Tests
+
+- `tests/test_vllm_comprehensive_integration.py`: End-to-end integration test covering:
+  - Batch generation with chat formatting (10 prompts, 40 tokens each)
+  - Multi-method steering (additive, projection cap, ablation on multiple layers)
+  - Hidden state capture during prefill AND decode
+  - HuggingFace parity validation (cosine similarity ~1.0, MAE <0.02)
+  - Concurrent generation with temporal overlap verification
+  - Capture isolation (concurrent requests don't mix)
+  - RWLock coordination (steering changes block during generation)
+- Run this test when modifying steering logic, capture mechanisms, or concurrency handling
+- Expected runtime: ~20-25 seconds with CUDA available
+
 ## Coding Style
 
 - Follow PEP 8 with 4-space indentation, descriptive snake_case for functions, UpperCamelCase for classes
@@ -157,6 +170,45 @@ Each run records:
 - Running via `uv run` keeps repo root on `sys.path`, so `sitecustomize.py` patch triggers automatically
 - Use `scripts/steering_smoke.py` for quick verification of steering behavior
 - **Qwen decoder layer fusion**: vLLM fuses RMSNorm with skip connection, returns `(mlp_delta, residual_before_mlp)` - must add `delta + residual` to mirror HuggingFace captures
+
+### Concurrency and Threading Model
+
+**AsyncRWLock for Steering Configuration:**
+- `VLLMSteerModel` uses a readers-writer lock (`AsyncRWLock`) to coordinate concurrent operations
+- **Read operations** (concurrent): Multiple `generate()` calls can run simultaneously
+- **Write operations** (exclusive): Steering configuration changes block until all in-flight requests complete
+- Write operations include:
+  - `set_layer_vector()`, `set_layer_projection_cap()`, `set_layer_ablation()`
+  - `clear_layer_projection_cap()`, `clear_layer_ablation()`, `clear_all_vectors()`
+  - `apply_steering_spec()`
+- Writers signal intent via `_writer_waiting` flag to prevent reader starvation
+- Concurrent generation is safe and performant - requests don't block each other
+
+### Hidden State Capture Behavior
+
+**Capture API Structure:**
+- vLLM captures return a **single concatenated tensor** per layer containing all processed tokens
+- Format: `captures[layer_idx][0]["hidden"]` with shape `[seq_len, hidden_size]`
+- This tensor includes both prefill and decode tokens in sequence order
+- To extract specific tokens, slice the tensor by position (e.g., `captures[2][0]["hidden"][prompt_len:]` for decode-only)
+
+**Critical: Autoregressive Generation Length**
+- Captured tensors have length `prompt_tokens + (generated_tokens - 1)`, NOT `prompt_tokens + generated_tokens`
+- **Why**: In autoregressive generation, the final sampled token is never processed through the model
+  1. Prefill: Process all prompt tokens
+  2. Decode iterations 1..(N-1): Each iteration processes a token and produces logits for the next
+  3. Final iteration N: Sample from logits only - the Nth token never flows through the model
+- **Example**: 15-token prompt generating 10 tokens
+  - Output text: 25 tokens total
+  - Captured hidden states: 24 tokens (15 prefill + 9 decode)
+  - Missing: The 10th generated token (sampled but never processed)
+- **When validating**: Always use `expected_len = prompt_len + (generated_len - 1)`
+- This is universal LLM behavior, not vLLM-specific
+
+**Capture Isolation:**
+- Concurrent requests with capture enabled maintain proper per-request isolation
+- Each request's captures are tracked independently via request IDs
+- Validated in `tests/test_vllm_comprehensive_integration.py` with temporal overlap verification
 
 ## Journaling Practices
 
