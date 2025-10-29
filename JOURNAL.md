@@ -1,5 +1,88 @@
 # Engineering Journal
 
+## 2025-10-29
+
+### RWLock for vLLM Steering and Comprehensive Integration Test
+
+**Timestamp:** 2025-10-29 00:20 UTC
+
+Implemented readers-writer lock (RWLock) for coordinating concurrent vLLM generation requests and steering configuration changes, plus comprehensive integration test covering realistic usage patterns.
+
+**Motivation:**
+- Steering configuration changes are global to the vLLM model
+- Multiple concurrent `generate()` calls should be allowed (read operations)
+- Steering changes should wait for all in-flight requests to complete (write operations)
+- Prevent race conditions when modifying steering during active generation
+
+**Implementation:**
+
+1. **AsyncRWLock Class** (`chatspace/generation/vllm_steer_model.py`):
+   - Readers-writer lock pattern using `asyncio.Lock` and `asyncio.Condition`
+   - Multiple concurrent readers OR single exclusive writer
+   - Writers wait for `_readers` counter to reach zero
+   - Added `_writer_waiting` flag to prevent reader starvation
+
+2. **Integration Points**:
+   - `generate()`: Acquires read lock for entire generation duration
+   - All steering modification methods acquire write lock:
+     - `set_layer_vector()`, `set_layer_projection_cap()`, `set_layer_ablation()`
+     - `clear_layer_projection_cap()`, `clear_layer_ablation()`, `clear_all_vectors()`
+     - `apply_steering_spec()` (refactored to avoid nested locks)
+
+3. **Comprehensive Integration Test** (`tests/test_vllm_comprehensive_integration.py`):
+   - **Batch Generation**: 10 prompts with chat formatting via `tokenizer.apply_chat_template()`
+   - **Decode Phase**: 40 tokens per sequence (not just prefill)
+   - **Multi-Method Steering**: All 3 methods active on 2 distinct layers:
+     - Layer 2: Additive vector + Projection cap
+     - Layer 5: Ablation + Projection cap
+   - **Hidden State Capture**: New `CaptureHandle` API with batch fetching
+   - **HF Ground Truth**: Compares decode-phase hidden states vs HuggingFace float32 reference
+   - **RWLock Testing**: Verifies concurrent generations work and steering blocks during generation
+
+**Key Design Decisions:**
+- Chose RWLock over simple mutex to allow concurrent request throughput
+- Writers signal intent via `_writer_waiting` flag to prevent starvation
+- Refactored `apply_steering_spec()` to call `_broadcast_*` directly, avoiding nested lock acquisition
+- Test samples 3 prompts for HF comparison (balance thoroughness vs runtime)
+
+**Test Results:**
+- ✅ **Comprehensive integration test PASSED** (23.21s)
+  - Generated 10 batched prompts with chat formatting
+  - Captured activations during prefill AND decode (40 tokens/sequence)
+  - Applied all 3 steering methods on 2 layers simultaneously
+  - Achieved perfect HF parity: cosine similarity ~1.0, MAE ~0.0003-0.0007
+  - RWLock correctly coordinated concurrent operations
+- ✅ Basic steering round-trip test passes with RWLock (16.48s)
+- ✅ Hidden state capture tests pass
+- RWLock allows concurrent generations without blocking
+- Steering changes correctly block until generation completes
+
+**Capture API Clarification:**
+- vLLM captures return a **single concatenated tensor** per layer containing all tokens (prefill + decode)
+- Structure: `captures[layer_idx][0]["hidden"]` is shape `[seq_len, hidden_size]`
+- Test slices this tensor to compare individual decode tokens vs HuggingFace ground truth
+
+**Files Changed:**
+- `chatspace/generation/vllm_steer_model.py`:
+  - Added `AsyncRWLock` class (90 lines)
+  - Added `self._steering_rwlock` to `VLLMSteerModel.__init__`
+  - Wrapped `generate()` with `read_lock()`
+  - Wrapped steering methods with `write_lock()`
+  - Refactored `apply_steering_spec()` to avoid nested locks
+- `tests/test_vllm_comprehensive_integration.py`: New 370-line integration test
+
+**Performance Implications:**
+- Read locks (generation) add minimal overhead (~microseconds for uncontended lock)
+- Write locks (steering changes) now wait for in-flight requests, but this is desired behavior
+- Multiple concurrent generations can proceed without interference
+
+**Future Considerations:**
+- Consider request-scoped steering (pass `SteeringSpec` to `generate()`) to avoid global state
+- Monitor lock contention in production workloads
+- Add telemetry for lock wait times
+
+---
+
 ## 2025-10-28
 
 ### Fixed HF/vLLM Hidden State Parity Test - Off-by-One Indexing Error

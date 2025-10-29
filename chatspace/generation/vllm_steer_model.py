@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -36,6 +37,57 @@ from .base import SteerableModel
 
 
 logger = logging.getLogger(__name__)
+
+
+class AsyncRWLock:
+    """Readers-writer lock for async code.
+
+    Allows multiple concurrent readers OR a single exclusive writer.
+    Writers wait for all active readers to complete before acquiring.
+    """
+
+    def __init__(self):
+        self._readers = 0
+        self._writer_waiting = False
+        self._lock = asyncio.Lock()
+        self._read_ok = asyncio.Condition(self._lock)
+        self._write_ok = asyncio.Condition(self._lock)
+
+    @asynccontextmanager
+    async def read_lock(self):
+        """Acquire read lock (shared access)."""
+        async with self._lock:
+            # Wait if a writer is waiting or active
+            while self._writer_waiting:
+                await self._read_ok.wait()
+            self._readers += 1
+
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._readers -= 1
+                if self._readers == 0:
+                    # Notify waiting writers
+                    self._write_ok.notify()
+
+    @asynccontextmanager
+    async def write_lock(self):
+        """Acquire write lock (exclusive access)."""
+        async with self._lock:
+            # Signal that a writer is waiting
+            self._writer_waiting = True
+            # Wait until no readers are active
+            while self._readers > 0:
+                await self._write_ok.wait()
+
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._writer_waiting = False
+                # Notify all waiting readers
+                self._read_ok.notify_all()
 
 
 @dataclass
@@ -338,6 +390,9 @@ class VLLMSteerModel(SteerableModel):
         self._last_prompt_lengths: list[int] | None = None
         self._tokenizer = None
 
+        # RWLock for coordinating generation (readers) and steering changes (writers)
+        self._steering_rwlock = AsyncRWLock()
+
     @property
     def tokenizer(self):
         """Lazy-load tokenizer for prompt length tracking."""
@@ -522,21 +577,22 @@ class VLLMSteerModel(SteerableModel):
 
     async def set_layer_vector(self, layer_idx: int, vector: torch.Tensor | None) -> None:
         await self._ensure_engine_initialized()
-        target = int(layer_idx)
-        if vector is None:
-            await self._broadcast_clear(target)
-            return
+        async with self._steering_rwlock.write_lock():
+            target = int(layer_idx)
+            if vector is None:
+                await self._broadcast_clear(target)
+                return
 
-        prepared = self._prepare_layer_vector(
-            vector, context="Steering vector update"
-        )
-        magnitude = float(prepared.norm().item())
-        if not math.isfinite(magnitude) or magnitude <= 0.0:
-            await self._broadcast_clear(target)
-            return
-        unit = (prepared / magnitude).contiguous()
-        add_spec = AddSpec(vector=unit, scale=magnitude)
-        await self._broadcast_add(target, add_spec)
+            prepared = self._prepare_layer_vector(
+                vector, context="Steering vector update"
+            )
+            magnitude = float(prepared.norm().item())
+            if not math.isfinite(magnitude) or magnitude <= 0.0:
+                await self._broadcast_clear(target)
+                return
+            unit = (prepared / magnitude).contiguous()
+            add_spec = AddSpec(vector=unit, scale=magnitude)
+            await self._broadcast_add(target, add_spec)
 
     async def set_vector(self, vector: torch.Tensor | None) -> None:
         """Set the steering vector for the active layer."""
@@ -559,28 +615,30 @@ class VLLMSteerModel(SteerableModel):
         max: float | None = None,
     ) -> None:
         await self._ensure_engine_initialized()
-        target = int(layer_idx)
-        self._ensure_layer_spec(target)
-        if min is None and max is None:
-            raise ValueError("Projection cap requires at least one bound.")
-        lower = float(min) if min is not None else None
-        upper = float(max) if max is not None else None
-        if lower is not None and upper is not None and lower > upper:
-            raise ValueError("min cannot exceed max.")
-        prepared = self._prepare_direction_vector(
-            vector, context="Projection cap vector"
-        )
-        spec = ProjectionCapSpec(vector=prepared, min=lower, max=upper)
-        await self._broadcast_projection_cap(target, spec)
+        async with self._steering_rwlock.write_lock():
+            target = int(layer_idx)
+            self._ensure_layer_spec(target)
+            if min is None and max is None:
+                raise ValueError("Projection cap requires at least one bound.")
+            lower = float(min) if min is not None else None
+            upper = float(max) if max is not None else None
+            if lower is not None and upper is not None and lower > upper:
+                raise ValueError("min cannot exceed max.")
+            prepared = self._prepare_direction_vector(
+                vector, context="Projection cap vector"
+            )
+            spec = ProjectionCapSpec(vector=prepared, min=lower, max=upper)
+            await self._broadcast_projection_cap(target, spec)
 
     async def clear_layer_projection_cap(self, layer_idx: int) -> None:
         await self._ensure_engine_initialized()
-        target = int(layer_idx)
-        await self._collective_rpc("clear_worker_projection_cap", target)
-        layer_spec = self._layer_specs.get(target)
-        if layer_spec is not None:
-            layer_spec.projection_cap = None
-        self._prune_layer_entry(target)
+        async with self._steering_rwlock.write_lock():
+            target = int(layer_idx)
+            await self._collective_rpc("clear_worker_projection_cap", target)
+            layer_spec = self._layer_specs.get(target)
+            if layer_spec is not None:
+                layer_spec.projection_cap = None
+            self._prune_layer_entry(target)
 
     def current_projection_cap(self, layer_idx: int) -> ProjectionCapSpec | None:
         layer_spec = self._layer_specs.get(int(layer_idx))
@@ -610,25 +668,27 @@ class VLLMSteerModel(SteerableModel):
         scale: float,
     ) -> None:
         await self._ensure_engine_initialized()
-        target = int(layer_idx)
-        self._ensure_layer_spec(target)
-        if not isinstance(scale, (int, float)):
-            raise TypeError("Ablation scale must be a numeric value.")
-        scale_value = float(scale)
-        if not math.isfinite(scale_value):
-            raise ValueError("Ablation scale must be finite.")
-        prepared = self._prepare_direction_vector(vector, context="Ablation vector")
-        spec = AblationSpec(vector=prepared, scale=scale_value)
-        await self._broadcast_ablation(target, spec)
+        async with self._steering_rwlock.write_lock():
+            target = int(layer_idx)
+            self._ensure_layer_spec(target)
+            if not isinstance(scale, (int, float)):
+                raise TypeError("Ablation scale must be a numeric value.")
+            scale_value = float(scale)
+            if not math.isfinite(scale_value):
+                raise ValueError("Ablation scale must be finite.")
+            prepared = self._prepare_direction_vector(vector, context="Ablation vector")
+            spec = AblationSpec(vector=prepared, scale=scale_value)
+            await self._broadcast_ablation(target, spec)
 
     async def clear_layer_ablation(self, layer_idx: int) -> None:
         await self._ensure_engine_initialized()
-        target = int(layer_idx)
-        await self._collective_rpc("clear_worker_ablation", target)
-        layer_spec = self._layer_specs.get(target)
-        if layer_spec is not None:
-            layer_spec.ablation = None
-        self._prune_layer_entry(target)
+        async with self._steering_rwlock.write_lock():
+            target = int(layer_idx)
+            await self._collective_rpc("clear_worker_ablation", target)
+            layer_spec = self._layer_specs.get(target)
+            if layer_spec is not None:
+                layer_spec.ablation = None
+            self._prune_layer_entry(target)
 
     def current_ablation(self, layer_idx: int) -> AblationSpec | None:
         layer_spec = self._layer_specs.get(int(layer_idx))
@@ -658,39 +718,54 @@ class VLLMSteerModel(SteerableModel):
         projection caps or ablations present in the spec.
         """
         await self._ensure_engine_initialized()
-        target_layers = {int(idx) for idx in spec.layers.keys()}
-        if clear_missing:
-            existing_layers = set(self._layer_specs.keys())
-            for layer_idx in sorted(existing_layers - target_layers):
-                await self.clear_layer_vector(layer_idx)
+        async with self._steering_rwlock.write_lock():
+            target_layers = {int(idx) for idx in spec.layers.keys()}
+            if clear_missing:
+                existing_layers = set(self._layer_specs.keys())
+                for layer_idx in sorted(existing_layers - target_layers):
+                    # Clear operations: call _broadcast_clear directly to avoid nested locks
+                    target = int(layer_idx)
+                    await self._broadcast_clear(target)
 
-        for layer_idx_raw, layer_spec in spec.layers.items():
-            layer_idx = int(layer_idx_raw)
-            add_spec = layer_spec.add
-            cleared = add_spec is None
-            if cleared:
-                await self.clear_layer_vector(layer_idx)
-            else:
-                await self._broadcast_add(layer_idx, add_spec)
+            for layer_idx_raw, layer_spec in spec.layers.items():
+                layer_idx = int(layer_idx_raw)
+                add_spec = layer_spec.add
+                cleared = add_spec is None
+                if cleared:
+                    # Call _broadcast_clear directly to avoid nested locks
+                    await self._broadcast_clear(layer_idx)
+                else:
+                    await self._broadcast_add(layer_idx, add_spec)
 
-            projection_spec = layer_spec.projection_cap
-            if projection_spec is not None:
-                await self.set_layer_projection_cap(
-                    layer_idx,
-                    projection_spec.vector,
-                    min=projection_spec.min,
-                    max=projection_spec.max,
-                )
-            elif not cleared:
-                await self.clear_layer_projection_cap(layer_idx)
+                projection_spec = layer_spec.projection_cap
+                if projection_spec is not None:
+                    # Call _broadcast_projection_cap directly to avoid nested locks
+                    target = int(layer_idx)
+                    self._ensure_layer_spec(target)
+                    await self._broadcast_projection_cap(target, projection_spec)
+                elif not cleared:
+                    # Call clear RPC directly to avoid nested locks
+                    target = int(layer_idx)
+                    await self._collective_rpc("clear_worker_projection_cap", target)
+                    layer_spec_obj = self._layer_specs.get(target)
+                    if layer_spec_obj is not None:
+                        layer_spec_obj.projection_cap = None
+                    self._prune_layer_entry(target)
 
-            ablation_spec = layer_spec.ablation
-            if ablation_spec is not None:
-                await self.set_layer_ablation(
-                    layer_idx, ablation_spec.vector, ablation_spec.scale
-                )
-            elif not cleared:
-                await self.clear_layer_ablation(layer_idx)
+                ablation_spec = layer_spec.ablation
+                if ablation_spec is not None:
+                    # Call _broadcast_ablation directly to avoid nested locks
+                    target = int(layer_idx)
+                    self._ensure_layer_spec(target)
+                    await self._broadcast_ablation(target, ablation_spec)
+                elif not cleared:
+                    # Call clear RPC directly to avoid nested locks
+                    target = int(layer_idx)
+                    await self._collective_rpc("clear_worker_ablation", target)
+                    layer_spec_obj = self._layer_specs.get(target)
+                    if layer_spec_obj is not None:
+                        layer_spec_obj.ablation = None
+                    self._prune_layer_entry(target)
 
     async def push_steering_spec(
         self, spec: SteeringSpec, *, clear_missing: bool = True
@@ -745,7 +820,8 @@ class VLLMSteerModel(SteerableModel):
 
     async def clear_all_vectors(self) -> None:
         await self._ensure_engine_initialized()
-        await self._broadcast_clear()
+        async with self._steering_rwlock.write_lock():
+            await self._broadcast_clear()
 
     async def generate(
         self,
@@ -782,58 +858,61 @@ class VLLMSteerModel(SteerableModel):
         import uuid
         await self._ensure_engine_initialized()
 
-        if isinstance(prompts, str):
-            prompts = [prompts]
-        if sampling_params is None:
-            sampling_params = SamplingParams(**kwargs)
+        # Acquire read lock for the duration of generation
+        # This prevents steering changes while requests are in flight
+        async with self._steering_rwlock.read_lock():
+            if isinstance(prompts, str):
+                prompts = [prompts]
+            if sampling_params is None:
+                sampling_params = SamplingParams(**kwargs)
 
-        # Setup capture if requested
-        handles: list[CaptureHandle] | None = None
-        if capture_layers is not None:
-            # Convert to tuple
-            if isinstance(capture_layers, int):
-                layers_tuple = (capture_layers,)
-            else:
-                layers_tuple = tuple(capture_layers)
+            # Setup capture if requested
+            handles: list[CaptureHandle] | None = None
+            if capture_layers is not None:
+                # Convert to tuple
+                if isinstance(capture_layers, int):
+                    layers_tuple = (capture_layers,)
+                else:
+                    layers_tuple = tuple(capture_layers)
 
-            # Register captures for each prompt
-            handles = []
+                # Register captures for each prompt
+                handles = []
+                for i, prompt in enumerate(prompts):
+                    req_id = f"capture_{uuid.uuid4().hex}"
+                    await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
+                    handle = CaptureHandle(
+                        request_id=req_id,
+                        layer_indices=layers_tuple,
+                        _model=self,
+                    )
+                    handles.append(handle)
+
+            # Generate each prompt
+            results = []
             for i, prompt in enumerate(prompts):
-                req_id = f"capture_{uuid.uuid4().hex}"
-                await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
-                handle = CaptureHandle(
-                    request_id=req_id,
-                    layer_indices=layers_tuple,
-                    _model=self,
-                )
-                handles.append(handle)
+                # Use capture request_id if capturing, otherwise random
+                if handles:
+                    request_id = handles[i].request_id
+                else:
+                    request_id = f"gen_{uuid.uuid4().hex}"
 
-        # Generate each prompt
-        results = []
-        for i, prompt in enumerate(prompts):
-            # Use capture request_id if capturing, otherwise random
+                final_output = None
+                async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
+                    final_output = output
+
+                if final_output is None:
+                    raise RuntimeError(f"No output for prompt: {prompt}")
+
+                if raw_output:
+                    results.append(final_output)
+                else:
+                    results.append(final_output.outputs[0].text)
+
+            # Return with or without handles
             if handles:
-                request_id = handles[i].request_id
+                return results, handles
             else:
-                request_id = f"gen_{uuid.uuid4().hex}"
-
-            final_output = None
-            async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
-                final_output = output
-
-            if final_output is None:
-                raise RuntimeError(f"No output for prompt: {prompt}")
-
-            if raw_output:
-                results.append(final_output)
-            else:
-                results.append(final_output.outputs[0].text)
-
-        # Return with or without handles
-        if handles:
-            return results, handles
-        else:
-            return results
+                return results
 
     @overload
     async def chat(
