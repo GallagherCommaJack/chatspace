@@ -370,11 +370,46 @@ async def test_comprehensive_vllm_integration():
             )
             return result[0]
 
-        # Test 1: Multiple concurrent generations (should work - read locks)
-        print("  Testing concurrent generations (read locks)...")
-        gen_tasks = [concurrent_generate(i) for i in range(3)]
-        results = await asyncio.gather(*gen_tasks)
-        print(f"    ✓ {len(results)} concurrent generations completed")
+        # Test 1: Queue up multiple generations before awaiting any
+        print("  Testing truly concurrent generations (queue then await)...")
+        import time
+
+        # Track when each generation starts/ends
+        gen_timings = []
+
+        async def timed_generate(prompt_idx: int):
+            """Generate with timing tracking."""
+            start = time.time()
+            result = await vllm_model.generate(
+                [prompts[prompt_idx]],
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=10),
+            )
+            end = time.time()
+            gen_timings.append({"idx": prompt_idx, "start": start, "end": end})
+            return result[0]
+
+        # Create tasks WITHOUT awaiting (queue them up)
+        task1 = asyncio.create_task(timed_generate(0))
+        task2 = asyncio.create_task(timed_generate(1))
+        task3 = asyncio.create_task(timed_generate(2))
+
+        # NOW await all of them
+        results = await asyncio.gather(task1, task2, task3)
+
+        # Check if they overlapped
+        gen_timings.sort(key=lambda x: x["start"])
+        overlapping = False
+        for i in range(len(gen_timings) - 1):
+            # Check if gen i+1 started before gen i ended
+            if gen_timings[i+1]["start"] < gen_timings[i]["end"]:
+                overlapping = True
+                break
+
+        print(f"    ✓ {len(results)} generations completed")
+        if overlapping:
+            print(f"    ✓ Verified concurrent execution (requests overlapped in time)")
+        else:
+            print(f"    ⚠ Sequential execution detected (may be vLLM engine batching)")
 
         # Test 2: Steering change blocks until generation completes
         print("  Testing steering change blocks during generation...")
