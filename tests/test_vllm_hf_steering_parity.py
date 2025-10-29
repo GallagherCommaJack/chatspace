@@ -121,7 +121,6 @@ async def test_vllm_hf_steering_combinations_match():
         dtype="float16",
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
@@ -182,9 +181,7 @@ async def test_vllm_hf_steering_combinations_match():
             await vllm_model.clear_all_vectors()
             await vllm_model.clear_layer_projection_cap(target_layer)
             await vllm_model.clear_layer_ablation(target_layer)
-            await vllm_model.clear_hidden_states(target_layer)
-            await vllm_model.clear_hidden_states(downstream_layer)
-
+                
             # Only set steering at target layer
             if case["vector"] is not None:
                 await vllm_model.set_layer_vector(target_layer, case["vector"])
@@ -202,10 +199,10 @@ async def test_vllm_hf_steering_combinations_match():
                     scale=case["ablation"].scale,
                 )
 
-            await vllm_model.generate([prompt], sampling_params=sampling)
-            states = await vllm_model.fetch_hidden_states()
-            vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-            vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+            await vllm_model.fetch_captures_batch(handles)
+            vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+            vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
             # ------------------------------------------------------------------
             # Comparison
@@ -287,11 +284,10 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     # Generate tokens
     sampling = SamplingParams(temperature=0.0, max_tokens=5, logprobs=0, ignore_eos=True)
-    outputs = await vllm_model.generate([prompt], sampling_params=sampling)
+    outputs = texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
     # Get the generated text (outputs is list[str] of completion only)
     generated_text = outputs[0]
@@ -529,16 +525,15 @@ async def test_vllm_hf_high_magnitude_steering():
     await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        await vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = await vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
         # -------------------------------------------------------------------------
         # Comparison
@@ -716,16 +711,15 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
     )
 
     # Enable capture on both layers
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        await vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = await vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
         # -------------------------------------------------------------------------
         # Comparison
@@ -829,7 +823,6 @@ async def test_vllm_hf_multi_magnitude_steering():
         dtype="float16",
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
@@ -880,17 +873,15 @@ async def test_vllm_hf_multi_magnitude_steering():
             # vLLM path
             # -------------------------------------------------------------------------
             await vllm_model.clear_all_vectors()
-            await vllm_model.clear_hidden_states(target_layer)
-            await vllm_model.clear_hidden_states(downstream_layer)
-
+                
             # Set steering vector at this magnitude
             await vllm_model.set_layer_vector(target_layer, steering_vector)
 
-            await vllm_model.generate([prompt], sampling_params=sampling)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-            states = await vllm_model.fetch_hidden_states()
-            vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-            vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+            await vllm_model.fetch_captures_batch(handles)
+            vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+            vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
             # -------------------------------------------------------------------------
             # Comparison
@@ -1025,16 +1016,15 @@ async def test_vllm_hf_high_precision_steering():
     await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        await vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = await vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"]
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"]
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"]
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"]
 
         # -------------------------------------------------------------------------
         # Comparison (everything in float32)
@@ -1198,14 +1188,13 @@ async def test_delta_vs_residual_numerics():
                 )
                 vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
                 await vllm_model.set_layer_vector(target_layer, steering_vector)
-                await vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
-
+            
                 sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-                await vllm_model.generate([prompt], sampling_params=sampling)
+                texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-                states = await vllm_model.fetch_hidden_states()
-                target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-                downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+                await vllm_model.fetch_captures_batch(handles)
+                target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+                downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
                 # Compute errors vs ground truth
                 target_error = torch.mean(torch.abs(target_hidden.reshape(-1) - ground_truth_target.reshape(-1))).item()
@@ -1387,13 +1376,12 @@ async def test_delta_vs_residual_instrumented():
             )
             vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
             await vllm_model.set_layer_vector(target_layer, steering_vector)
-            await vllm_model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
-
+        
             sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-            await vllm_model.generate([prompt], sampling_params=sampling)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-            states = await vllm_model.fetch_hidden_states()
-            hidden = states[0][target_layer][0]["after"]
+            await vllm_model.fetch_captures_batch(handles)
+            hidden = handles[0].captures[target_layer][0]["hidden"]
 
             results[approach_name] = {
                 "hidden": hidden,
@@ -1561,18 +1549,15 @@ async def test_vllm_hf_multi_layer_steering_float32():
     for layer_idx, vector in steering_vectors.items():
         await vllm_model.set_layer_vector(layer_idx, vector)
 
-    # Enable capture on all layers we want to check
-    for layer_idx in all_check_layers:
-        await vllm_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
-
+    # Generate with capture on all layers we want to check
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    await vllm_model.generate([prompt], sampling_params=sampling)
+    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_check_layers))
 
-    states = await vllm_model.fetch_hidden_states()
+    await vllm_model.fetch_captures_batch(handles)
 
     print("\nvLLM results:")
     for layer_idx in all_check_layers:
-        vllm_hidden = states[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
         print(f"  Layer {layer_idx}: shape={vllm_hidden.shape}, mean={vllm_hidden.mean().item():.6f}, "
               f"std={vllm_hidden.std().item():.6f}, norm={torch.norm(vllm_hidden).item():.2f}")
 
@@ -1584,7 +1569,7 @@ async def test_vllm_hf_multi_layer_steering_float32():
     all_pass = True
     for layer_idx in all_check_layers:
         hf_hidden = hf_captured[layer_idx]
-        vllm_hidden = states[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
 
         cos_sim = F.cosine_similarity(
             hf_hidden.flatten().unsqueeze(0),
@@ -1944,13 +1929,12 @@ async def test_bf16_degradation_hf_vs_vllm():
             await vllm_model.set_layer_vector(layer_idx, vector)
 
         # Enable capture at check layer
-        await vllm_model.enable_hidden_state_capture(check_layer, capture_before=False, capture_after=True)
-
+    
         sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-        await vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = await vllm_model.fetch_hidden_states()
-        vllm_bf16_hidden = states[0][check_layer][0]["after"]
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_bf16_hidden = handles[0].captures[check_layer][0]["hidden"]
 
         vllm_bf16_mae = torch.mean(torch.abs(vllm_bf16_hidden.cpu().float() - hf_fp32_hidden)).item()
         vllm_bf16_cos = F.cosine_similarity(

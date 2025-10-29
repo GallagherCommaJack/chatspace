@@ -86,19 +86,16 @@ async def test_comprehensive_hidden_state_diagnostics():
 
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    # Enable capture for vLLM
-    await vllm_model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=False)
-
-    # Generate with vLLM
+    # Generate with vLLM with capture
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    await vllm_model.generate([prompt], sampling_params=sampling)
+    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer])
 
     # Fetch captured states
-    vllm_states = await vllm_model.fetch_hidden_states(layer_idx=target_layer)
-    vllm_captures = vllm_states[0][target_layer]
+    await vllm_model.fetch_captures_batch(handles)
+    vllm_captures = handles[0].captures[target_layer]
 
     assert len(vllm_captures) > 0
-    vllm_hidden = vllm_captures[0]["before"].to(dtype=torch.float32)
+    vllm_hidden = vllm_captures[0]["hidden"].to(dtype=torch.float32)
 
     # Ensure shapes match
     assert hf_hidden.shape == vllm_hidden.shape

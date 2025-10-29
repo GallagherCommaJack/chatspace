@@ -46,6 +46,7 @@ class _DummyEngineClient:
 
 def _make_dummy_model(hidden_size: int = 8, layer_count: int = 12) -> VLLMSteerModel:
     import asyncio
+    from chatspace.generation.vllm_steer_model import AsyncRWLock
     model = object.__new__(VLLMSteerModel)
     model.cfg = VLLMSteeringConfig()
     model.hidden_size = hidden_size
@@ -55,6 +56,7 @@ def _make_dummy_model(hidden_size: int = 8, layer_count: int = 12) -> VLLMSteerM
     model._engine_client = _DummyEngineClient()
     model._layer_specs = {}
     model._steering_stack = []
+    model._steering_rwlock = AsyncRWLock()
     model._engine_init_lock = asyncio.Lock()
     model._engine_initialized = True  # Skip lazy init for dummy model
     return model

@@ -204,41 +204,27 @@ async def test_gemma_hidden_state_capture(model_name: str):
     except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
-    # Enable capture
-    await model.enable_hidden_state_capture(target_layer, capture_before=True, capture_after=True, max_captures=2)
-
+    # Generate with capture
     prompt = "Hello world"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=2)
-    await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    texts, handles = await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False, capture_layers=[target_layer])
 
     # Fetch captured states
-    captures_list = await model.fetch_hidden_states(layer_idx=target_layer)
-    assert len(captures_list) > 0, "Expected at least one worker"
-    captures = captures_list[0]  # Get first worker's captures
-    assert target_layer in captures, f"Expected captures for layer {target_layer}"
+    await model.fetch_captures_batch(handles)
+    assert len(handles) > 0, "Expected at least one request"
+    assert target_layer in handles[0].captures, f"Expected captures for layer {target_layer}"
 
-    layer_captures = captures[target_layer]
+    layer_captures = handles[0].captures[target_layer]
     assert len(layer_captures) > 0, "Expected at least one capture"
 
-    # Check structure
+    # Check structure (new API has simpler structure)
     first_capture = layer_captures[0]
-    assert "before" in first_capture or "after" in first_capture
-    assert "meta" in first_capture
-
-    metadata = first_capture["meta"]
-    assert "phase" in metadata
-    assert "step" in metadata
+    assert "hidden" in first_capture, "Expected 'hidden' key in capture"
 
     # Check shapes
-    if "before" in first_capture:
-        before_hidden = first_capture["before"]
-        assert isinstance(before_hidden, torch.Tensor)
-        assert before_hidden.size(-1) == model.hidden_size
-
-    if "after" in first_capture:
-        after_hidden = first_capture["after"]
-        assert isinstance(after_hidden, torch.Tensor)
-        assert after_hidden.size(-1) == model.hidden_size
+    hidden = first_capture["hidden"]
+    assert isinstance(hidden, torch.Tensor)
+    assert hidden.size(-1) == model.hidden_size
 
     del model
     torch.cuda.empty_cache()
