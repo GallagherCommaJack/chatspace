@@ -62,6 +62,54 @@ Implemented readers-writer lock (RWLock) for coordinating concurrent vLLM genera
 - Structure: `captures[layer_idx][0]["hidden"]` is shape `[seq_len, hidden_size]`
 - Test slices this tensor to compare individual decode tokens vs HuggingFace ground truth
 
+### Concurrent Capture Isolation Testing and Autoregressive Generation Behavior
+
+**Timestamp:** 2025-10-29 02:48 UTC
+
+Added explicit testing for truly concurrent generation and capture isolation to validate per-request capture correctness.
+
+**Test Enhancements:**
+
+1. **Explicit Concurrent Execution Verification**:
+   - Use `asyncio.create_task()` to queue multiple generation tasks BEFORE awaiting
+   - Track start/end times for each generation to verify temporal overlap
+   - Confirms requests truly execute concurrently (not just via `asyncio.gather()`)
+
+2. **Capture Isolation Validation**:
+   - Generate 3 concurrent requests with unique seeds
+   - Verify each capture has expected length and no NaN/Inf values
+   - Ensures per-request captures don't get mixed up during concurrent execution
+
+**Critical Finding: Autoregressive Generation and Capture Length**
+
+Discovered that captured tensor length is `prompt_tokens + (generated_tokens - 1)`, not `prompt_tokens + generated_tokens`. This is **expected behavior** for autoregressive generation:
+
+- **Generation process**: To generate N tokens, the model processes:
+  1. Prefill: all prompt tokens
+  2. Decode iterations 1..N-1: each produces logits for the next token
+  3. Final iteration N: only samples from logits, never processes the final token through the model
+
+- **Example**: 15-token prompt + 10 generated tokens:
+  - Total output text: 25 tokens
+  - Captured hidden states: 24 tokens (15 prefill + 9 decode)
+  - Missing token: the 10th generated token (only sampled, never processed)
+
+- **Implication**: When validating capture length, use:
+  ```python
+  expected_len = prompt_len + (generated_len - 1)
+  ```
+
+This behavior is inherent to autoregressive decoding and applies to all LLM inference engines, not just vLLM.
+
+**Test Results:**
+- ✅ Verified concurrent execution with temporal overlap
+- ✅ All concurrent captures properly isolated and valid
+- ✅ Capture length correctly accounts for autoregressive generation behavior
+
+**Commits:**
+- `450d082`: Add explicit timing verification for concurrent generation test
+- `2dda928`: Fix concurrent capture isolation test to account for autoregressive generation
+
 **Files Changed:**
 - `chatspace/generation/vllm_steer_model.py`:
   - Added `AsyncRWLock` class (90 lines)
