@@ -67,44 +67,6 @@ LayerLike = Any
 _PROJECTION_CAP_PRECISION: torch.dtype | None = None
 
 
-@dataclass
-class _CaptureConfig:
-    """Configuration for capturing hidden states at a layer."""
-
-    capture_before: bool = True
-    capture_after: bool = True
-    max_captures: int | None = None
-
-
-@dataclass
-class _CaptureCounters:
-    """Track capture step indices for prefill/decode phases."""
-
-    total: int = 0
-    prefill: int = 0
-    decode: int = 0
-    prefill_complete: bool = False
-
-    def reset(self) -> None:
-        self.total = 0
-        self.prefill = 0
-        self.decode = 0
-        self.prefill_complete = False
-
-    def next(self, seq_len: int) -> tuple[str, int, int]:
-        """Advance counters and return (phase, phase_index, step)."""
-        if not self.prefill_complete and seq_len > 1:
-            phase = "prefill"
-            phase_index = self.prefill
-            self.prefill += 1
-        else:
-            phase = "decode"
-            phase_index = self.decode
-            self.decode += 1
-            self.prefill_complete = True
-        step = self.total
-        self.total += 1
-        return phase, phase_index, step
 
 
 @dataclass
@@ -127,14 +89,6 @@ class _SteeringState:
     layer_vectors: dict[int, torch.Tensor]
     projection_caps: dict[int, "_ProjectionCapConfig"]
     ablations: dict[int, "_AblationConfig"]
-    capture_configs: dict[int, _CaptureConfig]
-    captured_states: dict[int, list[dict[str, torch.Tensor]]]
-    capture_counters: dict[int, _CaptureCounters]
-    capture_task_queue: "queue.SimpleQueue[_PendingCaptureTask] | None"
-    capture_worker: threading.Thread | None
-    capture_stream: torch.cuda.Stream | None
-    capture_lock: threading.Lock | None
-    capture_pending: dict[int, int]
 
     # Per-request activation capture
     active_capture_requests: dict[str, set[int]] = None  # request_id -> layer indices
@@ -166,17 +120,6 @@ class _AblationConfig:
 
     unit_vector: torch.Tensor
     scale: float
-
-
-@dataclass
-class _PendingCaptureTask:
-    """Describe an asynchronous GPU→CPU capture transfer."""
-
-    layer_idx: int
-    entry: dict[str, Any]
-    key: str
-    gpu_tensor: torch.Tensor
-    ready_event: torch.cuda.Event
 
 
 class _SteeredModelWrapper(nn.Module):
@@ -275,153 +218,6 @@ class SteeringWorkerExtension:
         return handler(self, *args, **kwargs)
 
 
-def _setup_async_capture_infrastructure(state: _SteeringState) -> None:
-    """Ensure background capture machinery is initialised for a worker."""
-    if state.capture_lock is None:
-        state.capture_lock = threading.Lock()
-    if state.device.type != "cuda":
-        state.capture_task_queue = None
-        state.capture_stream = None
-        state.capture_worker = None
-        return
-    if state.capture_task_queue is None:
-        state.capture_task_queue = queue.SimpleQueue()
-    if state.capture_stream is None:
-        state.capture_stream = torch.cuda.Stream(device=state.device)
-    if state.capture_worker is None:
-        worker = threading.Thread(
-            target=_capture_worker_loop,
-            args=(state,),
-            name="chatspace-capture-worker",
-            daemon=True,
-        )
-        state.capture_worker = worker
-        worker.start()
-
-
-def _capture_worker_loop(state: _SteeringState) -> None:
-    """Background worker that migrates captured tensors to CPU."""
-    if state.device.type == "cuda":
-        torch.cuda.set_device(state.device)
-    stream = state.capture_stream
-    queue_ref = state.capture_task_queue
-    if queue_ref is None or stream is None:
-        return
-    while True:
-        task = queue_ref.get()
-        try:
-            task.ready_event.wait()
-            transfer_event = torch.cuda.Event(blocking=False)
-            with torch.cuda.stream(stream):
-                cpu_tensor = task.gpu_tensor.to("cpu", non_blocking=True)
-                stream.record_event(transfer_event)
-            transfer_event.wait()
-            del task.gpu_tensor
-            cpu_tensor = cpu_tensor.detach().clone()
-            entry = task.entry
-            entry[task.key] = cpu_tensor
-            pending = entry.get("_pending", 0) - 1
-            if pending > 0:
-                entry["_pending"] = pending
-                continue
-            entry.pop("_pending", None)
-            _finalize_capture_entry(state, task.layer_idx, entry)
-        except Exception:
-            continue
-
-
-def _queue_capture_tensor(
-    tensor: torch.Tensor,
-    *,
-    entry: dict[str, Any],
-    key: str,
-    layer_idx: int | None,
-    state: _SteeringState | None,
-    capture_config: _CaptureConfig | None,
-) -> None:
-    """Queue tensor for asynchronous CPU materialisation or clone immediately."""
-    if tensor is None:
-        return
-    max_captures = capture_config.max_captures if capture_config is not None else None
-    if "_max" not in entry:
-        entry["_max"] = max_captures
-    if state is None or layer_idx is None:
-        entry[key] = tensor.detach().cpu().clone()
-        return
-    if tensor.device.type != "cuda":
-        entry[key] = tensor.detach().cpu().clone()
-        return
-    _setup_async_capture_infrastructure(state)
-    if state.capture_task_queue is None or state.capture_stream is None:
-        entry[key] = tensor.detach().cpu().clone()
-        return
-    gpu_clone = tensor.detach().clone()
-    ready_event = torch.cuda.Event(blocking=False)
-    torch.cuda.current_stream(device=gpu_clone.device).record_event(ready_event)
-    pending_before = entry.get("_pending", 0)
-    pending = pending_before + 1
-    entry["_pending"] = pending
-    if pending_before == 0:
-        entry["_async"] = True
-        state.capture_pending[layer_idx] = state.capture_pending.get(layer_idx, 0) + 1
-    task = _PendingCaptureTask(
-        layer_idx=layer_idx,
-        entry=entry,
-        key=key,
-        gpu_tensor=gpu_clone,
-        ready_event=ready_event,
-    )
-    state.capture_task_queue.put(task)
-
-
-def _finalize_capture_entry(
-    state: _SteeringState | None,
-    layer_idx: int | None,
-    entry: dict[str, Any],
-) -> None:
-    """Append capture entry when all pending tensor copies have completed."""
-    if state is None or layer_idx is None:
-        return
-    if not entry:
-        return
-    pending = entry.get("_pending", 0)
-    if pending > 0:
-        return
-    entry.pop("_pending", None)
-    async_flag = entry.pop("_async", False)
-    max_captures = entry.pop("_max", None)
-    captures = state.captured_states.setdefault(layer_idx, [])
-    lock = state.capture_lock
-    context = lock if lock is not None else nullcontext()
-    with context:
-        if max_captures is not None and len(captures) >= max_captures:
-            captures.pop(0)
-        captures.append(entry)
-    if async_flag:
-        pending = state.capture_pending.get(layer_idx, 0)
-        if pending > 0:
-            remaining = pending - 1
-            if remaining > 0:
-                state.capture_pending[layer_idx] = remaining
-            else:
-                state.capture_pending.pop(layer_idx, None)
-
-
-def _wait_for_pending_captures(state: _SteeringState, indices: Sequence[int]) -> None:
-    if state.capture_task_queue is None:
-        return
-    if not indices:
-        return
-    attempts = 0
-    while True:
-        if all(state.capture_pending.get(idx, 0) == 0 for idx in indices):
-            return
-        attempts += 1
-        if attempts > 2000:  # ~1s worst-case fallback
-            return
-        time.sleep(0.0005)
-
-
 def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
     """Extract the primary hidden state tensor from layer output.
 
@@ -455,29 +251,6 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
         if isinstance(hidden, torch.Tensor):
             return hidden
     return None
-
-
-def _infer_sequence_length(tensor: torch.Tensor | None) -> int:
-    if tensor is None:
-        return 1
-    if tensor.ndim >= 2:
-        return int(tensor.shape[-2])
-    return 1
-
-
-def _prepare_capture_metadata(
-    counter: _CaptureCounters | None, reference: torch.Tensor | None
-) -> dict[str, int | str]:
-    if counter is None:
-        return {}
-    seq_len = _infer_sequence_length(reference)
-    phase, phase_index, step = counter.next(seq_len)
-    return {
-        "phase": phase,
-        "phase_index": phase_index,
-        "step": step,
-        "seq_len": seq_len,
-    }
 
 
 def _is_qwen_layer_output(output: Any) -> bool:
@@ -763,102 +536,18 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
     def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
         output = original_forward(self, *args, **kwargs)
 
-        # Check if this layer should capture hidden states
-        capture_config = getattr(self, "_chatspace_capture_config", None)
-        capture_enabled = isinstance(capture_config, _CaptureConfig)
-        captured_before: torch.Tensor | None = None
-        cap_debug_payload: dict[str, Any] | None = None
-
-        def _capture_cap_debug(payload: dict[str, Any]) -> None:
-            nonlocal cap_debug_payload
-            projected_delta = payload.get("projected_delta")
-            if isinstance(projected_delta, torch.Tensor):
-                payload = dict(payload)
-                payload["projected_delta"] = projected_delta.detach().cpu().clone()
-            cap_debug_payload = payload
-
-        if capture_enabled and capture_config.capture_before:
-            # Extract and capture hidden state before steering
-            try:
-                captured_before = _extract_hidden_from_output(output)
-            except Exception:  # pragma: no cover - graceful degradation
-                pass
-
         # Apply steering operations
         vector = getattr(self, "_chatspace_steering_vector", None)
         if vector is not None:
             output = _apply_vector_to_output(output, vector)
         cap_config = getattr(self, "_chatspace_projection_cap", None)
         if isinstance(cap_config, _ProjectionCapConfig):
-            debug_hook = _capture_cap_debug if capture_enabled else None
-            output = _apply_projection_cap_to_output(
-                output,
-                cap_config,
-                debug_hook=debug_hook,
-            )
+            output = _apply_projection_cap_to_output(output, cap_config, debug_hook=None)
         ablation_config = getattr(self, "_chatspace_ablation", None)
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
 
-        # Capture hidden state after steering if requested (old-style global capture)
-        if capture_enabled:
-            try:
-                captured_after: torch.Tensor | None = None
-                if capture_config.capture_after:
-                    captured_after = _extract_hidden_from_output(output)
-                if captured_before is not None or captured_after is not None:
-                    capture_entry: dict[str, Any] = {}
-                    state = getattr(self, "_chatspace_steering_state", None)
-                    layer_idx = getattr(self, "_chatspace_layer_index", None)
-                    if captured_before is not None:
-                        _queue_capture_tensor(
-                            captured_before,
-                            entry=capture_entry,
-                            key="before",
-                            layer_idx=layer_idx,
-                            state=state,
-                            capture_config=capture_config,
-                        )
-                    if captured_after is not None:
-                        _queue_capture_tensor(
-                            captured_after,
-                            entry=capture_entry,
-                            key="after",
-                            layer_idx=layer_idx,
-                            state=state,
-                            capture_config=capture_config,
-                        )
-                    counter = getattr(self, "_chatspace_capture_counter", None)
-                    reference_tensor = captured_after if captured_after is not None else captured_before
-                    metadata = _prepare_capture_metadata(counter, reference_tensor)
-                    if metadata:
-                        capture_entry["meta"] = metadata
-                    if cap_debug_payload is not None:
-                        projected_delta = cap_debug_payload.get("projected_delta")
-                        if isinstance(projected_delta, torch.Tensor):
-                            capture_entry["cap_delta"] = projected_delta
-                        cap_meta = {
-                            key: str(value)
-                            for key, value in cap_debug_payload.items()
-                            if key in {
-                                "target_dtype",
-                                "input_delta_dtype",
-                                "residual_dtype",
-                                "hidden_before_dtype",
-                                "hidden_after_dtype",
-                            }
-                            and value is not None
-                        }
-                        if cap_meta:
-                            capture_entry["cap_meta"] = cap_meta
-                        cap_debug_payload = None
-                    if ("before" in capture_entry or "after" in capture_entry or capture_entry.get("_pending")):
-                        _finalize_capture_entry(state, layer_idx, capture_entry)
-            except Exception:  # pragma: no cover - graceful degradation
-                pass
-        cap_debug_payload = None
-
-        # Per-request activation capture (metadata-based)
+        # Per-request activation capture
         try:
             state = getattr(self, "_chatspace_steering_state", None)
             if state is not None and state.active_capture_requests:
@@ -1310,14 +999,6 @@ def initialize_worker_state(
         layer_vectors={},
         projection_caps={},
         ablations={},
-        capture_configs={},
-        captured_states={},
-        capture_counters={},
-        capture_task_queue=None,
-        capture_worker=None,
-        capture_stream=None,
-        capture_lock=None,
-        capture_pending={},
         active_capture_requests={},
         request_captures={},
         request_prefill_buffers={},
@@ -1328,7 +1009,6 @@ def initialize_worker_state(
         current_step_context=None,
     )
     worker._chatspace_steering = state
-    _setup_async_capture_infrastructure(state)
 
     # Patch model runner to capture batch metadata for per-request activation tracking
     logger.info(f"About to patch model runner. worker.model_runner type: {type(worker.model_runner).__name__}")
