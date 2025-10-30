@@ -287,24 +287,23 @@ async def test_vllm_decode_steering_matches_hf_prefill():
 
     # Generate tokens
     sampling = SamplingParams(temperature=0.0, max_tokens=5, logprobs=0, ignore_eos=True)
-    outputs = texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
     # Get the generated text (outputs is list[str] of completion only)
-    generated_text = outputs[0]
+    generated_text = texts[0]
     full_text = prompt + generated_text
 
     # Fetch vLLM hidden states (decode mode)
-    vllm_states = await vllm_model.fetch_hidden_states()
-    vllm_target_captures = vllm_states[0][target_layer]
-    vllm_downstream_captures = vllm_states[0][downstream_layer]
+    await vllm_model.fetch_captures_batch(handles)
 
-    # vLLM captures: [0] = prefill, [1:] = decode steps
-    num_decode_steps = len(vllm_target_captures) - 1
-    assert num_decode_steps >= 3, f"Need at least 3 decode steps, got {num_decode_steps}"
+    # New API: captures are concatenated tensors [seq_len, hidden_size]
+    vllm_target_hidden_full = handles[0].captures[target_layer][0]["hidden"]  # [seq_len, hidden_size]
+    vllm_downstream_hidden_full = handles[0].captures[downstream_layer][0]["hidden"]  # [seq_len, hidden_size]
 
     print(f"\nGenerated text: {repr(generated_text)}")
     print(f"Full text: {repr(full_text)}")
-    print(f"vLLM captures: {len(vllm_target_captures)} (1 prefill + {num_decode_steps} decode)")
+    print(f"vLLM target capture shape: {vllm_target_hidden_full.shape}")
+    print(f"vLLM downstream capture shape: {vllm_downstream_hidden_full.shape}")
 
     # -------------------------------------------------------------------------
     # Step 2: HF forward pass with full text (prefill mode with steering)
@@ -315,8 +314,22 @@ async def test_vllm_decode_steering_matches_hf_prefill():
 
     prompt_len = prompt_inputs.input_ids.shape[1]
     full_len = full_inputs.input_ids.shape[1]
+    generated_len = full_len - prompt_len
 
-    print(f"Prompt tokens: {prompt_len}, Full tokens: {full_len}")
+    # Account for autoregressive generation: vLLM captures prompt + (generated - 1) tokens
+    # The final sampled token never flows through the model
+    expected_capture_len = prompt_len + (generated_len - 1)
+
+    print(f"Prompt tokens: {prompt_len}, Full tokens: {full_len}, Generated: {generated_len}")
+    print(f"Expected vLLM capture length: {expected_capture_len} (prompt + generated-1)")
+
+    assert vllm_target_hidden_full.shape[0] == expected_capture_len, (
+        f"vLLM capture length {vllm_target_hidden_full.shape[0]} != expected {expected_capture_len}"
+    )
+
+    # We can compare the first (generated - 1) decode tokens
+    num_decode_steps = generated_len - 1
+    assert num_decode_steps >= 3, f"Need at least 3 decode steps to compare, got {num_decode_steps}"
 
     # Capture hidden states from HF with steering
     captured_hf_hiddens: dict[int, torch.Tensor] = {}
@@ -365,8 +378,15 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     # -------------------------------------------------------------------------
     print(f"\nComparing vLLM decode (steered) vs HF prefill (steered):")
 
+    # Convert to float32 for comparison
+    vllm_target_hidden_full = vllm_target_hidden_full.to(dtype=torch.float32)
+    vllm_downstream_hidden_full = vllm_downstream_hidden_full.to(dtype=torch.float32)
+
     for decode_idx in range(num_decode_steps):
-        # HF: token position in the full sequence
+        # Token position in the full sequence
+        # vLLM: token is at position (prompt_len + decode_idx) in the concatenated captures
+        # HF: same position in HF's captures
+        vllm_token_idx = prompt_len + decode_idx
         hf_token_idx = prompt_len + decode_idx
 
         if hf_token_idx >= hf_target_hidden_full.shape[0]:
@@ -376,10 +396,8 @@ async def test_vllm_decode_steering_matches_hf_prefill():
         # -------------------------------------------------------------------------
         # Target layer comparison
         # -------------------------------------------------------------------------
-        # vLLM: hidden state from decode step (after steering)
-        vllm_target_hidden = vllm_target_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
-        if vllm_target_hidden.dim() > 1:
-            vllm_target_hidden = vllm_target_hidden.squeeze(0)  # [hidden_size]
+        # vLLM: hidden state at this token position (slice the concatenated tensor)
+        vllm_target_hidden = vllm_target_hidden_full[vllm_token_idx]  # [hidden_size]
 
         # HF: hidden state from prefill at the corresponding token position
         hf_target_hidden = hf_target_hidden_full[hf_token_idx]  # [hidden_size]
@@ -394,11 +412,8 @@ async def test_vllm_decode_steering_matches_hf_prefill():
         # -------------------------------------------------------------------------
         # Downstream layer comparison (verify steering propagates)
         # -------------------------------------------------------------------------
-        vllm_downstream_hidden = vllm_downstream_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
-        if vllm_downstream_hidden.dim() > 1:
-            vllm_downstream_hidden = vllm_downstream_hidden.squeeze(0)
-
-        hf_downstream_hidden = hf_downstream_hidden_full[hf_token_idx]
+        vllm_downstream_hidden = vllm_downstream_hidden_full[vllm_token_idx]  # [hidden_size]
+        hf_downstream_hidden = hf_downstream_hidden_full[hf_token_idx]  # [hidden_size]
 
         hf_downstream_flat = hf_downstream_hidden.reshape(-1)
         vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
@@ -1378,7 +1393,7 @@ async def test_delta_vs_residual_instrumented():
             await vllm_model.set_layer_vector(target_layer, steering_vector)
         
             sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer])
 
             await vllm_model.fetch_captures_batch(handles)
             hidden = handles[0].captures[target_layer][0]["hidden"]
@@ -1688,19 +1703,16 @@ async def test_vllm_hf_multi_layer_steering_float32():
 
     # Apply steering to every layer
     for layer_idx, vector in every_layer_vectors.items():
-        vllm_every_model.set_layer_vector(layer_idx, vector)
+        await vllm_every_model.set_layer_vector(layer_idx, vector)
 
-    # Enable capture
-    for layer_idx in all_every_check:
-        vllm_every_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
-
-    vllm_every_model.generate([prompt], sampling_params=sampling)
-    states_every = vllm_every_model.fetch_hidden_states()
+    # Generate with capture on all layers
+    texts, handles = await vllm_every_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_every_check))
+    await vllm_every_model.fetch_captures_batch(handles)
 
     print("\nvLLM results (sample layers):")
     for layer_idx in [0, 5, 9, 10, 11]:
         if layer_idx in all_every_check:
-            vllm_hidden = states_every[0][layer_idx][0]["after"]
+            vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
             print(f"  Layer {layer_idx}: mean={vllm_hidden.mean().item():.6f}, "
                   f"norm={torch.norm(vllm_hidden).item():.2f}")
 
@@ -1712,7 +1724,7 @@ async def test_vllm_hf_multi_layer_steering_float32():
     every_pass = True
     for layer_idx in all_every_check:
         hf_hidden = hf_every_captured[layer_idx]
-        vllm_hidden = states_every[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
 
         cos_sim = F.cosine_similarity(
             hf_hidden.flatten().unsqueeze(0),
@@ -1929,9 +1941,9 @@ async def test_bf16_degradation_hf_vs_vllm():
             await vllm_model.set_layer_vector(layer_idx, vector)
 
         # Enable capture at check layer
-    
+
         sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[check_layer])
 
         await vllm_model.fetch_captures_batch(handles)
         vllm_bf16_hidden = handles[0].captures[check_layer][0]["hidden"]
