@@ -1195,3 +1195,68 @@ Added early-exit guards to skip metadata extraction machinery when capture is no
 - All-layer capture generation: 175s → 125s (+159% → +41% overhead)
 
 **Open question:** All-layer case improved unexpectedly (175s→125s) despite optimization targeting zero-layer case. Need isolated profiling with separate Python invocations per config to avoid cross-contamination and understand true overhead sources.
+
+---
+
+## 2025-10-31 (Continued)
+
+### Capture Hook Hot-Path Optimization - Major Performance Win
+
+**Branch:** `optimize-capture-hotpath`
+
+Ran isolated benchmarks and discovered severe performance degradation in unoptimized capture code.
+
+#### Problem Discovered
+
+**Isolated benchmark revealed catastrophic degradation:**
+- Baseline (no capture): 36.53s
+- Zero-layer (metadata only): 37.21s (+1.9% ✓ optimization working)
+- All-layers unoptimized:
+  - Iteration 1: 57.24s
+  - Iteration 2: 85.63s (+49%)
+  - Iteration 3: 112.90s (+97% worse than iter 1!)
+  - Mean: 85.26s (+133% vs baseline)
+
+**Root cause:** `torch.cat()` called per decode token = 147,456 operations (128 decode × 36 layers × 32 batch)
+- Each cat creates new tensor, old becomes garbage
+- Memory fragmentation increases exponentially
+- Performance degrades with each iteration
+
+#### Optimizations Implemented
+
+1. **Dictionary lookup caching** - use `.get()` instead of `in` + lookup
+2. **Remove debug logging** - even at DEBUG level, string formatting has overhead
+3. **Boolean phase** - use `is_prefill` boolean instead of string comparison
+4. **Direct hook call** - avoid dict lookup for variant selection
+5. **Decode buffer batching** (the big win):
+   - Buffer 32 decode tokens before concatenating
+   - Reduces cat operations by 32x (147k → 4.6k)
+   - Batches memory allocations
+   - Eliminates fragmentation
+
+#### Results After Optimization
+
+**All-layers optimized:**
+- Iteration 1: 41.63s
+- Iteration 2: 42.40s (+1.8%)
+- Iteration 3: 41.33s
+- Mean: 41.79s (deviation <2.6% - **consistent!**)
+
+**Improvement:**
+- **51% faster** vs unoptimized (85.26s → 41.79s = 2.04x speedup)
+- **Eliminated degradation** (was +97% across iterations, now +1.8%)
+- **Only +14.4% overhead vs baseline** (was +133%)
+- **~0.4% per layer** (was ~2.6% per layer)
+
+**Commits:**
+- `c5544fb` - Dictionary lookup optimizations, debug logging removal
+- `938ca89` - Decode buffer batching (32-token batches)
+- `4d20a8c` - Fix NoneType error for state migration
+
+**Files:**
+- `chatspace/vllm_steering/runtime.py` - Optimized `_capture_hook_full()`, `_patched_forward()`, added decode buffers
+- `scripts/isolated_capture_bench.py` - Single-config isolated benchmark
+- `scripts/run_isolated_benchmarks.sh` - Benchmark orchestrator
+- `OPTIMIZATION_FINDINGS.md` - Detailed analysis
+
+**Conclusion:** Capture overhead is now acceptable for production use. The 14% overhead for all-layer capture is reasonable, and per-layer cost scales linearly at ~0.4% per layer.
