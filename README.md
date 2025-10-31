@@ -223,7 +223,7 @@ await model.clear_layer_projection_cap(6)
 - Constrain steering vector effects
 - Stabilize generation under strong steering
 
-**Note**: Projection capping operates on the full hidden state (after adding steering vectors), computing `hidden � direction` and clamping to `[min, max]`.
+**Note**: Projection capping operates on the full hidden state (after adding steering vectors), computing `hidden @ direction` and clamping to `[min, max]`.
 
 #### Component Ablation
 
@@ -473,20 +473,20 @@ uv run pytest tests/ --cov=chatspace --cov-report=html
 
 ```
 chatspace/
-   chatspace/
-      vllm_steering/       # vLLM steering runtime
-         runtime.py       # Worker-side patching & RPC handlers
-      generation/
-         vllm_steer_model.py  # Client-side steering API
-         base.py          # Abstract base classes
-      hf_embed/            # SentenceTransformer embedding pipeline
-      cli.py               # Command-line interface
-   scripts/
-      steering_smoke.py    # Quick steering verification
-   tests/
-      test_vllm_comprehensive_integration.py  # End-to-end tests
-      test_*.py            # Unit tests
-   README.md                # This file
+  chatspace/
+    vllm_steering/       # vLLM steering runtime
+      runtime.py       # Worker-side patching & RPC handlers
+    generation/
+      vllm_steer_model.py  # Client-side steering API
+      base.py          # Abstract base classes
+    hf_embed/            # SentenceTransformer embedding pipeline
+    cli.py               # Command-line interface
+  scripts/
+    steering_smoke.py    # Quick steering verification
+  tests/
+    test_vllm_comprehensive_integration.py  # End-to-end tests
+    test_*.py            # Unit tests
+  README.md                # This file
 ```
 
 ---
