@@ -20,17 +20,15 @@ verified the steering patch still executes inside compiled graphs.
 
 from __future__ import annotations
 
-import json
 import math
 import asyncio
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, field, fields
-from pathlib import Path
-from typing import Any, Iterator, Literal, Sequence, cast, overload
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Literal, Sequence, cast, overload
 import logging
 
 import torch
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 
 from chatspace.vllm_steering import runtime as steering_runtime
 from .base import SteerableModel
@@ -351,7 +349,7 @@ class VLLMSteerModel(SteerableModel):
         steering_runtime.ensure_collective_rpc_gateway_installed()
 
         # Use AsyncLLMEngine for async API
-        from vllm import AsyncEngineArgs, AsyncLLMEngine
+        from vllm import AsyncEngineArgs
         import asyncio
 
         engine_args = AsyncEngineArgs(
@@ -1086,109 +1084,6 @@ class VLLMSteerModel(SteerableModel):
 
         return results
 
-    def save_pretrained(self, save_directory: str | Path, **_) -> None:
-        path = Path(save_directory)
-        path.mkdir(parents=True, exist_ok=True)
-
-        vector_path = path / "steering_vector.pt"
-        serialized_vectors = {
-            int(layer_idx): spec.add.materialize().detach().cpu().clone()
-            for layer_idx, spec in self._layer_specs.items()
-            if spec.add is not None
-        }
-        serialized_caps = {
-            int(layer_idx): {
-                "vector": spec.projection_cap.vector.detach().cpu().clone(),
-                "min": spec.projection_cap.min,
-                "max": spec.projection_cap.max,
-            }
-            for layer_idx, spec in self._layer_specs.items()
-            if spec.projection_cap is not None
-        }
-        serialized_ablations = {
-            int(layer_idx): {
-                "vector": spec.ablation.vector.detach().cpu().clone(),
-                "scale": float(spec.ablation.scale),
-            }
-            for layer_idx, spec in self._layer_specs.items()
-            if spec.ablation is not None
-        }
-        torch.save(
-            {
-                "layer_vectors": serialized_vectors,
-                "steering_vector": (
-                    next(iter(serialized_vectors.values())).clone()
-                    if serialized_vectors
-                    else None
-                ),
-                "projection_caps": serialized_caps,
-                "ablations": serialized_ablations,
-            },
-            vector_path,
-        )
-
-        config_path = path / "steering_config.json"
-        with config_path.open("w", encoding="utf-8") as fh:
-            json.dump(asdict(self.cfg), fh, indent=2)
-
-    @classmethod
-    def from_pretrained(
-        cls, save_directory: str | Path, **vllm_kwargs: Any
-    ) -> "VLLMSteerModel":
-        path = Path(save_directory)
-        config_path = path / "steering_config.json"
-        if not config_path.exists():
-            raise FileNotFoundError(f"Missing steering configuration at {config_path}")
-        with config_path.open("r", encoding="utf-8") as fh:
-            cfg_dict = json.load(fh)
-
-        allowed_keys = {f.name for f in fields(VLLMSteeringConfig)}
-        filtered_cfg = {
-            key: value for key, value in cfg_dict.items() if key in allowed_keys
-        }
-        cfg = VLLMSteeringConfig(**filtered_cfg)
-
-        model = cls(cfg, **vllm_kwargs)
-
-        vector_path = path / "steering_vector.pt"
-        if vector_path.exists():
-            state = torch.load(vector_path, map_location="cpu")
-            layer_vectors = state.get("layer_vectors")
-            if isinstance(layer_vectors, dict) and layer_vectors:
-                for layer_idx, tensor in layer_vectors.items():
-                    model.set_layer_vector(int(layer_idx), tensor)
-            else:
-                tensor = state.get("steering_vector")
-                if tensor is None:
-                    raise ValueError(
-                        f"steering_vector.pt missing steering data at {vector_path}"
-                    )
-                model.set_layer_vector(0, tensor)
-            projection_caps = state.get("projection_caps") or {}
-            if isinstance(projection_caps, dict):
-                for layer_idx, payload in projection_caps.items():
-                    vector = payload.get("vector")
-                    if vector is None:
-                        continue
-                    model.set_layer_projection_cap(
-                        int(layer_idx),
-                        vector,
-                        min=payload.get("min"),
-                        max=payload.get("max"),
-                    )
-            ablations = state.get("ablations") or {}
-            if isinstance(ablations, dict):
-                for layer_idx, payload in ablations.items():
-                    vector = payload.get("vector")
-                    scale = payload.get("scale")
-                    if vector is None or scale is None:
-                        continue
-                    model.set_layer_ablation(
-                        int(layer_idx),
-                        vector,
-                        float(scale),
-                    )
-        return model
 
     # ------------------------------------------------------------------
     # Sync wrappers for backward compatibility (deprecated)
