@@ -1789,7 +1789,9 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
                 # Non-blocking transfer if CUDA available
                 if state.transfer_stream is not None:
                     with torch.cuda.stream(state.transfer_stream):
-                        cpu_tensor = tensor.detach().cpu(non_blocking=True).contiguous()
+                        # Make contiguous on GPU before async transfer
+                        gpu_tensor = tensor.detach().contiguous()
+                        cpu_tensor = gpu_tensor.to('cpu', non_blocking=True)
                         event = torch.cuda.Event()
                         event.record(state.transfer_stream)
                         transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
