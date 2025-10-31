@@ -417,16 +417,153 @@ results_baseline = await model.generate(prompts, sampling)
 
 #### Chat-style Generation
 
+The `chat()` method provides a convenient interface for OpenAI-style conversation generation with automatic chat template formatting.
+
+**Basic usage:**
+
 ```python
+from vllm import SamplingParams
+
 messages = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "What is the capital of France?"},
 ]
 
+sampling = SamplingParams(temperature=0.7, max_tokens=128)
 responses = await model.chat(
     messages,
     sampling_params=sampling,
 )
+print(responses[0])  # Single conversation returns list[str]
+```
+
+**Batched conversations:**
+
+```python
+# Multiple conversations at once
+conversations = [
+    [
+        {"role": "user", "content": "What is 2+2?"},
+    ],
+    [
+        {"role": "system", "content": "You are a math tutor."},
+        {"role": "user", "content": "Explain the Pythagorean theorem."},
+    ],
+]
+
+responses = await model.chat(
+    conversations,  # list[list[dict]] for batch
+    temperature=0.7,
+    max_tokens=256,
+)
+# Returns list[str] with one response per conversation
+for i, response in enumerate(responses):
+    print(f"Conversation {i}: {response}")
+```
+
+**Using sampling keyword arguments:**
+
+```python
+# Can pass sampling params directly as kwargs
+responses = await model.chat(
+    messages,
+    temperature=0.8,
+    top_p=0.95,
+    max_tokens=100,
+    # sampling_params=...  # OR provide SamplingParams object
+)
+```
+
+**Custom chat template options:**
+
+```python
+responses = await model.chat(
+    messages,
+    sampling_params=sampling,
+    chat_options={
+        "add_generation_prompt": True,
+        "chat_template": "custom_template",
+        # Other tokenizer chat template options
+    },
+)
+```
+
+**Reasoning block prefilling (for hybrid models):**
+
+```python
+# Inject empty reasoning block before generation
+responses = await model.chat(
+    messages,
+    sampling_params=sampling,
+    prefill_assistant=True,  # Adds <think>\n\n</think>\n\n
+)
+
+# Custom reasoning prefix
+responses = await model.chat(
+    messages,
+    sampling_params=sampling,
+    prefill_assistant="<think>\nLet me think about this...\n</think>\n",
+)
+# The prefix is automatically stripped from outputs
+```
+
+**Accessing token-level details:**
+
+```python
+# Get full RequestOutput objects with token IDs and logprobs
+outputs = await model.chat(
+    messages,
+    sampling_params=sampling,
+    raw_output=True,
+)
+
+for output in outputs:
+    # output is a RequestOutput object
+    text = output.outputs[0].text
+    token_ids = output.outputs[0].token_ids
+    logprobs = output.outputs[0].logprobs
+    print(f"Generated {len(token_ids)} tokens")
+```
+
+**Combining chat with steering:**
+
+```python
+# Apply steering and use chat API
+await model.set_layer_vector(4, steering_vec)
+
+messages = [
+    {"role": "user", "content": "Write a formal email."},
+]
+
+# Chat API respects current steering configuration
+responses = await model.chat(
+    messages,
+    sampling_params=sampling,
+)
+
+# Clear steering after
+await model.clear_all_vectors()
+```
+
+**Multi-turn conversations:**
+
+```python
+# Build conversation history
+conversation = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is Python?"},
+]
+
+# First turn
+responses = await model.chat(conversation, sampling_params=sampling)
+assistant_reply = responses[0]
+
+# Add assistant's reply to history
+conversation.append({"role": "assistant", "content": assistant_reply})
+conversation.append({"role": "user", "content": "Tell me more about it."})
+
+# Continue conversation
+responses = await model.chat(conversation, sampling_params=sampling)
 print(responses[0])
 ```
 
