@@ -389,6 +389,62 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
+def compute_message_boundaries(
+    messages: list[dict[str, Any]],
+    tokenizer: Any,
+    chat_kwargs: dict[str, Any],
+) -> tuple[MessageBoundary, ...]:
+    """Compute token boundaries for each message in a conversation.
+
+    Uses incremental tokenization to determine where each message starts and
+    ends in the formatted prompt. This allows slicing activations by message
+    for interpretability analysis.
+
+    Parameters
+    ----------
+    messages : list[dict[str, Any]]
+        Conversation messages in OpenAI format (role, content).
+    tokenizer : Any
+        Tokenizer with apply_chat_template() method.
+    chat_kwargs : dict[str, Any]
+        Keyword arguments passed to apply_chat_template().
+
+    Returns
+    -------
+    tuple[MessageBoundary, ...]
+        Boundary information for each message with token ranges.
+    """
+    boundaries: list[MessageBoundary] = []
+    current_offset = 0
+
+    for i, msg in enumerate(messages):
+        # Build partial conversation up to and including this message
+        partial_conv = messages[:i + 1]
+
+        # Apply chat template to get formatted text
+        partial_text = tokenizer.apply_chat_template(
+            partial_conv,
+            tokenize=False,
+            **chat_kwargs,
+        )
+
+        # Tokenize to get total length up to this message
+        partial_tokens = tokenizer(partial_text, return_tensors="pt")
+        total_len = partial_tokens.input_ids.shape[1]
+
+        # This message spans from current_offset to total_len
+        boundary = MessageBoundary(
+            role=msg.get("role", "unknown"),
+            content=msg.get("content", ""),
+            start_token=current_offset,
+            end_token=total_len,
+        )
+        boundaries.append(boundary)
+        current_offset = total_len
+
+    return tuple(boundaries)
+
+
 class VLLMSteerModel(SteerableModel):
     """Steerable wrapper around ``vllm.LLM`` for Qwen and Llama models.
 
@@ -1019,7 +1075,6 @@ class VLLMSteerModel(SteerableModel):
         *,
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
-        prefill_assistant: str | bool | None = None,
         capture_layers: None = None,
         raw_output: Literal[False] = False,
         **sampling_kwargs: Any,
@@ -1033,7 +1088,6 @@ class VLLMSteerModel(SteerableModel):
         *,
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
-        prefill_assistant: str | bool | None = None,
         capture_layers: None = None,
         raw_output: Literal[True] = True,
         **sampling_kwargs: Any,
@@ -1047,7 +1101,6 @@ class VLLMSteerModel(SteerableModel):
         *,
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
-        prefill_assistant: str | bool | None = None,
         capture_layers: int | Sequence[int],
         raw_output: Literal[False] = False,
         **sampling_kwargs: Any,
@@ -1061,7 +1114,6 @@ class VLLMSteerModel(SteerableModel):
         *,
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
-        prefill_assistant: str | bool | None = None,
         capture_layers: int | Sequence[int],
         raw_output: Literal[True] = True,
         **sampling_kwargs: Any,
@@ -1074,7 +1126,6 @@ class VLLMSteerModel(SteerableModel):
         *,
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
-        prefill_assistant: str | bool | None = None,
         capture_layers: int | Sequence[int] | None = None,
         raw_output: bool = False,
         **sampling_kwargs: Any,
@@ -1093,16 +1144,8 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm : bool, default False
             Whether to display the progress bar during generation.
         chat_options : dict[str, Any] | None
-            Additional keyword arguments forwarded to ``LLM.chat`` (for
-            example ``chat_template`` or ``add_generation_prompt``).
-        prefill_assistant : str | bool | None, default None
-            Optional prefix inserted as the final assistant message before
-            generation. When set to ``True`` the helper injects an empty
-            ``<think></think>`` block compatible with the hybrid chat template.
-            String inputs allow custom prefixes; any whitespace-only think blocks
-            are normalized to match template formatting. The helper automatically
-            strips the prefix (including the sentinel) from returned outputs. Set
-            to ``None`` or ``False`` to disable prefilling.
+            Additional keyword arguments forwarded to tokenizer.apply_chat_template()
+            (for example ``chat_template`` or ``add_generation_prompt``).
         capture_layers : int | Sequence[int] | None
             Layer indices to capture activations from. If provided, returns
             (texts, handles) instead of just texts.
@@ -1127,6 +1170,7 @@ class VLLMSteerModel(SteerableModel):
                 "Provide either sampling_params or sampling keyword overrides, not both."
             )
 
+        # Normalize to batch format
         single_conversation = isinstance(messages, list) and (
             len(messages) == 0 or isinstance(messages[0], dict)
         )
@@ -1135,94 +1179,11 @@ class VLLMSteerModel(SteerableModel):
         else:
             batched_messages = cast(list[list[dict[str, Any]]], messages)
 
-        prepared_messages: list[list[dict[str, Any]]]
+        # Setup chat template options
         chat_kwargs = dict(chat_options or {})
         chat_kwargs.setdefault("chat_template_content_format", "string")
 
-        sentinel = "ASSISTANT_PREFILL:"
-        trim_prefix: str | None = None
-
-        def _normalize_prefill(raw: str) -> str:
-            stripped = raw.strip()
-            if stripped.startswith("<think>") and "</think>" in stripped:
-                head, tail = stripped.split("</think>", 1)
-                inside = head[len("<think>") :].strip()
-                if not inside:
-                    tail = tail.lstrip("\n")
-                    return "<think>\n\n</think>\n\n" + tail
-            return raw
-
-        prefill_base: str | None
-        if isinstance(prefill_assistant, bool):
-            prefill_base = "<think>\n\n</think>\n\n" if prefill_assistant else None
-        elif isinstance(prefill_assistant, str):
-            prefill_base = _normalize_prefill(prefill_assistant)
-        else:
-            prefill_base = None
-
-        if prefill_base is not None:
-            prefill_payload = f"{prefill_base}{sentinel}"
-            trim_prefix = prefill_payload
-            if chat_kwargs.get("add_generation_prompt", False):
-                raise ValueError(
-                    "Cannot prefill assistant when add_generation_prompt=True. "
-                    "Disable prefilling or override chat_options."
-                )
-            if chat_kwargs.get("continue_final_message") is False:
-                raise ValueError(
-                    "Cannot prefill assistant when continue_final_message=False. "
-                    "Disable prefilling or override chat_options."
-                )
-            chat_kwargs.setdefault("add_generation_prompt", False)
-            chat_kwargs.setdefault("continue_final_message", True)
-
-            prepared_messages = []
-            for conv in batched_messages:
-                conv_copy = [dict(msg) for msg in conv]
-                conv_copy.append({"role": "assistant", "content": prefill_payload})
-                prepared_messages.append(conv_copy)
-        elif prefill_assistant not in (None, False):
-            raise TypeError("prefill_assistant must be a string, boolean, or None.")
-        else:
-            prepared_messages = batched_messages
-
         await self._ensure_engine_initialized()
-
-        # Helper to compute message boundaries for a conversation
-        def _compute_message_boundaries(
-            messages_conv: list[dict[str, Any]],
-        ) -> tuple[MessageBoundary, ...]:
-            """Compute token boundaries for each message in the conversation."""
-            boundaries: list[MessageBoundary] = []
-            current_offset = 0
-
-            # Tokenize each message prefix to find boundaries
-            for i, msg in enumerate(messages_conv):
-                # Build partial conversation up to and including this message
-                partial_conv = messages_conv[:i+1]
-
-                # Apply chat template to get formatted text
-                partial_text = self.tokenizer.apply_chat_template(
-                    partial_conv,
-                    tokenize=False,
-                    **chat_kwargs,
-                )
-
-                # Tokenize to get total length up to this message
-                partial_tokens = self.tokenizer(partial_text, return_tensors="pt")
-                total_len = partial_tokens.input_ids.shape[1]
-
-                # This message spans from current_offset to total_len
-                boundary = MessageBoundary(
-                    role=msg.get("role", "unknown"),
-                    content=msg.get("content", ""),
-                    start_token=current_offset,
-                    end_token=total_len,
-                )
-                boundaries.append(boundary)
-                current_offset = total_len
-
-            return tuple(boundaries)
 
         # Acquire read lock for the duration of generation
         # This prevents steering changes while requests are in flight
@@ -1238,15 +1199,17 @@ class VLLMSteerModel(SteerableModel):
 
                 # Register captures for each conversation
                 handles = []
-                for i in range(len(prepared_messages)):
+                for i in range(len(batched_messages)):
                     import uuid
                     req_id = f"chat_capture_{uuid.uuid4().hex}"
                     await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
 
-                    # Compute message boundaries (use original messages, not prepared with prefill)
-                    # to get accurate user-visible message boundaries
-                    original_messages = batched_messages[i]
-                    message_boundaries = _compute_message_boundaries(original_messages)
+                    # Compute message boundaries for this conversation
+                    message_boundaries = compute_message_boundaries(
+                        batched_messages[i],
+                        self.tokenizer,
+                        chat_kwargs,
+                    )
 
                     handle = CaptureHandle(
                         request_id=req_id,
@@ -1260,7 +1223,7 @@ class VLLMSteerModel(SteerableModel):
             import uuid
             results: list[str] | list[Any] = []
 
-            for i, messages_conv in enumerate(prepared_messages):
+            for i, messages_conv in enumerate(batched_messages):
                 # Apply chat template to convert messages to prompt string
                 prompt = self.tokenizer.apply_chat_template(
                     messages_conv,
@@ -1289,8 +1252,6 @@ class VLLMSteerModel(SteerableModel):
                     results.append(final_output)
                 else:
                     text = final_output.outputs[0].text
-                    if trim_prefix and text.startswith(trim_prefix):
-                        text = text[len(trim_prefix) :].lstrip()
                     results.append(text)
 
             # Return with or without handles

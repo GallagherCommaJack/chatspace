@@ -13,6 +13,7 @@ from .vllm_steer_model import (
     SteeringSpec,
     VLLMSteerModel,
     VLLMSteeringConfig,
+    compute_message_boundaries,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "SteeringSpec",
     "CaptureHandle",
     "MessageBoundary",
+    "compute_message_boundaries",
     "LegacyExperiment",
     "load_legacy_role_trait_config",
 ]
