@@ -257,7 +257,9 @@ await model.clear_layer_ablation(8)
 
 ## Activation Capture
 
-Capture hidden states during generation for analysis:
+Capture hidden states during generation for analysis, interpretability research, and debugging.
+
+### Basic Usage
 
 ```python
 # Capture activations from layers 2, 4, 6
@@ -281,16 +283,61 @@ for i, handle in enumerate(handles):
         print(f"  Layer {layer_idx}: {hidden.shape}")
 ```
 
-**Capture behavior:**
-- **Concatenated format**: Returns a single tensor per layer containing all tokens processed (prefill + decode)
-- **Length calculation**: Captured length is `prompt_tokens + (generated_tokens - 1)` because the final generated token is sampled but never processed through the model
-- **Isolation**: Concurrent requests with capture enabled maintain proper per-request isolation
-- **Thread safety**: Captures are accumulated during generation and fetched after completion
+### Capture Format and Behavior
 
-**Example: Analyze steering effects**
+**Concatenated tensor format:**
+- Returns a single tensor per layer containing all tokens processed
+- Format: `[prefill_tokens + decode_tokens, hidden_size]`
+- Both prefill (prompt) and decode (generated) tokens are concatenated in sequence order
+
+**Length calculation:**
+- Captured length = `prompt_tokens + (generated_tokens - 1)`
+- The final generated token is sampled but never processed through the model
+- Example: 15-token prompt generating 10 tokens → 24 captured activations (15 + 9)
+
+**Isolation and thread safety:**
+- Concurrent requests with capture enabled maintain proper per-request isolation
+- Each request's captures are tracked independently via request IDs
+- Captures are accumulated during generation and fetched after completion
+
+### Slicing Captured Activations
 
 ```python
-# Capture without steering
+# Generate with capture
+results, handles = await model.generate(
+    prompt,
+    sampling_params=SamplingParams(max_tokens=50),
+    capture_layers=[4],
+)
+await model.fetch_captures_batch(handles)
+
+# Extract the full concatenated tensor
+full_hidden = handles[0].captures[4][0]["hidden"]  # [seq_len, hidden_size]
+
+# Tokenize to get prompt length
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained(model.model_name)
+prompt_tokens = tokenizer(prompt, return_tensors="pt")
+prompt_len = prompt_tokens.input_ids.shape[1]
+
+# Slice into prefill and decode phases
+prefill_acts = full_hidden[:prompt_len]  # Prompt processing
+decode_acts = full_hidden[prompt_len:]   # Generated tokens (excluding final)
+
+print(f"Prefill shape: {prefill_acts.shape}")  # [prompt_len, hidden_size]
+print(f"Decode shape: {decode_acts.shape}")    # [generated_tokens - 1, hidden_size]
+
+# Analyze specific tokens
+first_generated = decode_acts[0]  # First generated token's activations
+last_captured = decode_acts[-1]   # Last captured token (second-to-last generated)
+```
+
+### Analyzing Steering Effects
+
+```python
+import torch.nn.functional as F
+
+# Capture baseline (no steering)
 baseline_results, baseline_handles = await model.generate(
     prompt,
     sampling,
@@ -300,7 +347,9 @@ await model.fetch_captures_batch(baseline_handles)
 baseline_acts = baseline_handles[0].captures[4][0]["hidden"]
 
 # Apply steering and capture again
+steering_vec = torch.randn(model.hidden_size) * 50.0
 await model.set_layer_vector(4, steering_vec)
+
 steered_results, steered_handles = await model.generate(
     prompt,
     sampling,
@@ -313,6 +362,137 @@ steered_acts = steered_handles[0].captures[4][0]["hidden"]
 delta = steered_acts - baseline_acts
 print(f"Mean activation change: {delta.mean().item():.4f}")
 print(f"Max activation change: {delta.abs().max().item():.4f}")
+
+# Compute cosine similarity for each token
+for i in range(min(5, baseline_acts.shape[0])):
+    cos_sim = F.cosine_similarity(
+        baseline_acts[i].unsqueeze(0),
+        steered_acts[i].unsqueeze(0),
+        dim=-1
+    ).item()
+    print(f"Token {i} cosine similarity: {cos_sim:.6f}")
+```
+
+### Concurrent Capture (Isolation)
+
+```python
+import asyncio
+
+async def analyze_multiple_prompts():
+    """Capture activations for multiple prompts concurrently."""
+    prompts = [
+        "What is the capital of France?",
+        "Explain quantum computing.",
+        "Write a haiku about programming.",
+    ]
+
+    # Create concurrent tasks
+    tasks = [
+        model.generate(
+            [prompt],
+            sampling,
+            capture_layers=[2, 4, 6],
+        )
+        for prompt in prompts
+    ]
+
+    # Run all captures concurrently
+    results = await asyncio.gather(*tasks)
+
+    # Unpack results (each is a (texts, handles) tuple)
+    all_handles = [handles[0] for texts, handles in results]
+
+    # Fetch all captures in one batch RPC
+    await model.fetch_captures_batch(all_handles)
+
+    # Analyze each prompt's captures
+    for i, handle in enumerate(all_handles):
+        print(f"\nPrompt {i}: {prompts[i][:50]}...")
+        for layer in [2, 4, 6]:
+            hidden = handle.captures[layer][0]["hidden"]
+            norm = torch.norm(hidden, dim=-1).mean().item()
+            print(f"  Layer {layer}: mean norm = {norm:.4f}")
+
+# Run concurrent analysis
+await analyze_multiple_prompts()
+```
+
+### Multi-Layer Analysis
+
+```python
+# Capture all layers for deep analysis
+all_layers = list(range(model.layer_count))
+results, handles = await model.generate(
+    prompt,
+    sampling,
+    capture_layers=all_layers,
+)
+await model.fetch_captures_batch(handles)
+
+# Compute activation norms across layers
+layer_norms = {}
+for layer_idx in all_layers:
+    hidden = handles[0].captures[layer_idx][0]["hidden"]
+    # Average norm across all tokens and hidden dimensions
+    layer_norms[layer_idx] = torch.norm(hidden, dim=-1).mean().item()
+
+# Plot layer-wise activation magnitudes
+import matplotlib.pyplot as plt
+plt.plot(list(layer_norms.keys()), list(layer_norms.values()))
+plt.xlabel("Layer")
+plt.ylabel("Mean Activation Norm")
+plt.title("Activation Magnitude Across Layers")
+plt.show()
+```
+
+### Validating Against HuggingFace
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Load HuggingFace model for ground truth
+hf_model = AutoModelForCausalLM.from_pretrained(
+    model.model_name,
+    torch_dtype=torch.float32,
+    device_map="cuda",
+)
+hf_tokenizer = AutoTokenizer.from_pretrained(model.model_name)
+
+# Generate with vLLM and capture
+vllm_results, vllm_handles = await model.generate(
+    prompt,
+    sampling,
+    capture_layers=[4],
+)
+await model.fetch_captures_batch(vllm_handles)
+vllm_acts = vllm_handles[0].captures[4][0]["hidden"]
+
+# Generate same sequence with HuggingFace and capture
+full_text = prompt + vllm_results[0]
+inputs = hf_tokenizer(full_text, return_tensors="pt").to("cuda")
+
+hf_captures = {}
+def capture_hook(module, args, output):
+    hidden = output[0] if isinstance(output, tuple) else output
+    hf_captures[4] = hidden.detach().cpu()
+
+handle = hf_model.model.layers[4].register_forward_hook(capture_hook)
+with torch.no_grad():
+    hf_model(**inputs)
+handle.remove()
+
+hf_acts = hf_captures[4].squeeze(0)  # [seq_len, hidden_size]
+
+# Compare (should be very similar if using same precision)
+cos_sim = F.cosine_similarity(
+    vllm_acts.flatten().unsqueeze(0),
+    hf_acts.flatten().unsqueeze(0),
+    dim=-1
+).item()
+mae = torch.mean(torch.abs(vllm_acts - hf_acts)).item()
+
+print(f"Cosine similarity: {cos_sim:.6f}")  # Should be ~1.0
+print(f"Mean absolute error: {mae:.6f}")     # Should be very small
 ```
 
 ---
