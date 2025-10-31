@@ -70,7 +70,7 @@ def _json_ready(obj: Any) -> Any:
     if hasattr(obj, "item"):
         try:
             return _json_ready(obj.item())
-        except Exception:  # pragma: no cover - defensive fallback
+        except Exception:
             return str(obj)
     if isinstance(obj, (int, str, bool)) or obj is None:
         return obj
@@ -179,7 +179,7 @@ def _run_single_dataset(
             tokenizer=shared_tokenizer_arg,
             reset_vector=True,
         )
-    except Exception as exc:  # pragma: no cover - requires failing training
+    except Exception as exc:
         duration = time.monotonic() - start_time
         error_payload = {
             "status": "failed",
@@ -279,5 +279,5 @@ def _load_shared_components(args: argparse.Namespace):
     return model, tokenizer
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

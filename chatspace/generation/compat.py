@@ -37,7 +37,7 @@ def _prepare_vector(name: str, payload: Mapping[str, object]) -> tuple[int, torc
     try:
         vector = payload["vector"]
         layer = payload["layer"]
-    except KeyError as exc:  # pragma: no cover - malformed legacy payload
+    except KeyError as exc:
         raise KeyError(f"Legacy vector entry '{name}' missing key: {exc}") from exc
 
     if not isinstance(vector, torch.Tensor):

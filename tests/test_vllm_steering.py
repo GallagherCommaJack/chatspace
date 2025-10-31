@@ -33,7 +33,7 @@ async def test_vllm_steering_vector_round_trip():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     hidden_size = model.hidden_size
@@ -124,7 +124,7 @@ async def test_vllm_chat_respects_steering():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     prompt = "State the color of a clear daytime sky."

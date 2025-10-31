@@ -58,7 +58,7 @@ class EarlyStopCallback(TrainerCallback):
         self.wait = 0
         self.best_vector: torch.Tensor | None = None
 
-    def on_evaluate(self, args, state, control, **kwargs):  # type: ignore[override]
+    def on_evaluate(self, args, state, control, **kwargs):
         if self.trainer.eval_dataset is None:
             return
 
@@ -281,23 +281,22 @@ def build_trainer(
         "unused_tokens": split_result.remaining_tokens,
     }
 
-    # Avoid Hugging Face model card writes that can fail on quota-restricted filesystems.
     trainer.create_model_card = lambda *_, **__: None
-    # Persist only the steering vector + config to keep checkpoints small and resumable.
+
     def _save_model(output_dir: str | None = None, _internal_call: bool = False) -> None:
         target_dir = Path(output_dir) if output_dir is not None else args.output_dir
         model.save_pretrained(target_dir)
 
-    trainer.save_model = _save_model  # type: ignore[assignment]
-    trainer._val_dataset = val_dataset  # type: ignore[attr-defined]
-    trainer._tokenizer = tokenizer  # type: ignore[attr-defined]
+    trainer.save_model = _save_model
+    trainer._val_dataset = val_dataset
+    trainer._tokenizer = tokenizer
 
     if val_dataset is not None and args.early_stop_patience > 0:
         stop_callback = EarlyStopCallback(trainer, args.early_stop_patience, args.early_stop_threshold)
         trainer.add_callback(stop_callback)
-        trainer._early_stop_callback = stop_callback  # type: ignore[attr-defined]
+        trainer._early_stop_callback = stop_callback
     else:
-        trainer._early_stop_callback = None  # type: ignore[attr-defined]
+        trainer._early_stop_callback = None
 
     return trainer
 

@@ -25,7 +25,7 @@ async def test_hidden_state_capture_basic():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Generate with capture
@@ -76,7 +76,7 @@ async def test_hidden_state_capture_multiple_layers():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=layers)
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Generate with capture on multiple layers
@@ -120,7 +120,7 @@ async def test_hidden_state_capture_batch_fetch():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Generate multiple requests with capture
@@ -156,7 +156,7 @@ async def test_hidden_state_capture_no_capture():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True)
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Generate without capture
@@ -197,7 +197,7 @@ async def test_hidden_states_match_hf():
             device_map="cuda",
             attn_implementation="eager",
         )
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load HF model ({exc}). Ensure weights are cached.")
 
     hf_model.eval()
@@ -231,7 +231,7 @@ async def test_hidden_states_match_hf():
 
     try:
         vllm_model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load vLLM model ({exc}). Ensure weights are cached.")
 
     # Generate with capture
@@ -327,7 +327,7 @@ async def test_hidden_states_with_steering_applied():
             device_map="cuda",
             attn_implementation="eager",
         )
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load HF model ({exc}). Ensure weights are cached.")
 
     hf_model.eval()
@@ -380,7 +380,7 @@ async def test_hidden_states_with_steering_applied():
 
     try:
         vllm_model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load vLLM model ({exc}). Ensure weights are cached.")
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)

@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
-try:  # pragma: no cover - import guard for CPU-only environments
+try:
     import torch
-except Exception:  # pragma: no cover
+except Exception:
     torch = None  # type: ignore[assignment]
 
 

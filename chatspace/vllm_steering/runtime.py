@@ -57,14 +57,15 @@ try:
     logger = init_logger(__name__)
 except ImportError:
     logger = logging.getLogger(__name__)
-try:  # pragma: no cover - torch._dynamo optional at runtime
+
+try:
     import torch._dynamo as _dynamo
-except Exception:  # pragma: no cover - fallback when unavailable
+except ImportError:
     _dynamo = None
 
-try:  # pragma: no cover - profiler optional depending on torch build
+try:
     from torch.profiler import ProfilerActivity, profile as torch_profile
-except Exception:  # pragma: no cover - profiler unavailable
+except ImportError:
     ProfilerActivity = None
     torch_profile = None
 
@@ -160,12 +161,8 @@ def _export_profiler_trace(prof: Any, metadata: dict[str, Any]) -> str | None:
     trace_dir = Path(_PROFILE_FETCH_TRACE_DIR).expanduser()
     try:
         trace_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:  # pragma: no cover - filesystem errors
-        logger.warning(
-            "Unable to create profiler trace directory %s; skipping export.",
-            trace_dir,
-            exc_info=True,
-        )
+    except Exception:
+        logger.warning("Unable to create profiler trace directory %s", trace_dir)
         return None
 
     timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
@@ -174,10 +171,8 @@ def _export_profiler_trace(prof: Any, metadata: dict[str, Any]) -> str | None:
     path = trace_dir / filename
     try:
         prof.export_chrome_trace(str(path))
-    except Exception:  # pragma: no cover - torch profiler export errors
-        logger.warning(
-            "Failed to export torch profiler trace to %s", path, exc_info=True
-        )
+    except Exception:
+        logger.warning("Failed to export torch profiler trace to %s", path)
         return None
     if metadata is not None:
         metadata.setdefault("trace_path", str(path))
@@ -235,10 +230,7 @@ def _profile_fetch_batch(
 
     # Mutate metadata in-place so caller updates propagate into the summary
     metadata = metadata or {}
-    try:
-        metadata["activities"] = [activity.name.lower() for activity in activities]
-    except AttributeError:  # pragma: no cover - older torch enums
-        metadata["activities"] = [str(activity) for activity in activities]
+    metadata["activities"] = [activity.name.lower() for activity in activities]
 
     with torch_profile(
         activities=activities,
@@ -328,15 +320,12 @@ class _SteeredModelWrapper(nn.Module):
         object.__setattr__(self, "_wrapped_model", model)
         self._steering_state = state
 
-    def __getattr__(self, name: str) -> Any:  # pragma: no cover - passthrough
+    def __getattr__(self, name: str) -> Any:
         if name in {"_wrapped_model", "_steering_state"}:
             return object.__getattribute__(self, name)
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self._wrapped_model, name)
+        return getattr(self._wrapped_model, name)
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self._wrapped_model(*args, **kwargs)
 
     def unwrap(self) -> nn.Module:
@@ -389,7 +378,7 @@ def ensure_collective_rpc_gateway_installed() -> None:
         return
     try:
         from vllm.worker.worker_base import WorkerWrapperBase
-    except Exception:  # pragma: no cover - vLLM not available
+    except ImportError:
         return
     if hasattr(WorkerWrapperBase, STEERING_RPC_METHOD):
         _RPC_GATEWAY_INSTALLED = True
@@ -446,7 +435,7 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
     if isinstance(output, dict) and "last_hidden_state" in output:
         return output["last_hidden_state"]
     if hasattr(output, "last_hidden_state"):
-        hidden = output.last_hidden_state  # type: ignore[assignment]
+        hidden = output.last_hidden_state
         if isinstance(hidden, torch.Tensor):
             return hidden
     return None
@@ -488,7 +477,7 @@ def _extract_hidden_from_output_timed(output: Any) -> tuple[torch.Tensor | None,
         return output["last_hidden_state"], 0.0, time_total
 
     if hasattr(output, "last_hidden_state"):
-        hidden = output.last_hidden_state  # type: ignore[assignment]
+        hidden = output.last_hidden_state
         if isinstance(hidden, torch.Tensor):
             time_total = time.perf_counter() - start_total
             return hidden, 0.0, time_total
@@ -596,8 +585,8 @@ def _transform_output(
         patched["last_hidden_state"] = transform(patched["last_hidden_state"])
         return patched
     if hasattr(output, "last_hidden_state"):
-        hidden = output.last_hidden_state  # type: ignore[assignment]
-        output.last_hidden_state = transform(hidden)  # type: ignore[assignment]
+        hidden = output.last_hidden_state
+        output.last_hidden_state = transform(hidden)
         return output
     if fallback is not None:
         return fallback(output)
@@ -730,15 +719,15 @@ def _apply_ablation(hidden: torch.Tensor, config: _AblationConfig) -> torch.Tens
 
 
 if _dynamo is not None:
-    _apply_projection_cap = _dynamo.disable(_apply_projection_cap)  # type: ignore[assignment]
-    _apply_ablation = _dynamo.disable(_apply_ablation)  # type: ignore[assignment]
+    _apply_projection_cap = _dynamo.disable(_apply_projection_cap)
+    _apply_ablation = _dynamo.disable(_apply_ablation)
 
 
 if _dynamo is not None:
-    _transform_output = _dynamo.disable(_transform_output)  # type: ignore[assignment]
-    _apply_vector_to_output = _dynamo.disable(_apply_vector_to_output)  # type: ignore[assignment]
-    _apply_projection_cap_to_output = _dynamo.disable(_apply_projection_cap_to_output)  # type: ignore[assignment]
-    _apply_ablation_to_output = _dynamo.disable(_apply_ablation_to_output)  # type: ignore[assignment]
+    _transform_output = _dynamo.disable(_transform_output)
+    _apply_vector_to_output = _dynamo.disable(_apply_vector_to_output)
+    _apply_projection_cap_to_output = _dynamo.disable(_apply_projection_cap_to_output)
+    _apply_ablation_to_output = _dynamo.disable(_apply_ablation_to_output)
 
 
 # ============================================================================
@@ -971,7 +960,6 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
     def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
         output = original_forward(self, *args, **kwargs)
 
-        # Apply steering operations
         vector = getattr(self, "_chatspace_steering_vector", None)
         if vector is not None:
             output = _apply_vector_to_output(output, vector)
@@ -982,44 +970,37 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
 
-        # Per-request activation capture (fast path)
-        try:
-            state = getattr(self, "_chatspace_steering_state", None)
-            if state is None or not state.active_capture_requests:
-                return output
+        state = getattr(self, "_chatspace_steering_state", None)
+        if state is None or not state.active_capture_requests:
+            return output
 
-            # Get current step metadata (fast path - no debug logging)
-            current_step = state.global_step - 1  # Most recent step
-            if current_step < 0:
-                return output
+        current_step = state.global_step - 1
+        if current_step < 0:
+            return output
 
-            metadata = state.step_metadata.get(current_step)
-            if metadata is None:
-                return output
+        metadata = state.step_metadata.get(current_step)
+        if metadata is None:
+            return output
 
-            request_ids = metadata.get("request_ids")
-            if not request_ids:
-                return output
+        request_ids = metadata.get("request_ids")
+        if not request_ids:
+            return output
 
-            layer_idx = getattr(self, "_chatspace_layer_index", None)
-            if layer_idx is None:
-                return output
+        layer_idx = getattr(self, "_chatspace_layer_index", None)
+        if layer_idx is None:
+            return output
 
-            # Extract hidden state (after steering)
-            hidden = _extract_hidden_from_output(output)
-            if hidden is None or hidden.dim() != 2:
-                return output
+        hidden = _extract_hidden_from_output(output)
+        if hidden is None or hidden.dim() != 2:
+            return output
 
-            # Call capture hook directly (avoid dict lookup in hot path)
-            seq_lens = metadata.get("seq_lens")
-            _capture_hook_full(state, layer_idx, hidden, request_ids, seq_lens)
-        except Exception:  # pragma: no cover - graceful degradation
-            pass
+        seq_lens = metadata.get("seq_lens")
+        _capture_hook_full(state, layer_idx, hidden, request_ids, seq_lens)
 
         return output
 
-    layer_cls.__init__ = _patched_init  # type: ignore[assignment]
-    layer_cls.forward = _patched_forward  # type: ignore[assignment]
+    layer_cls.__init__ = _patched_init
+    layer_cls.forward = _patched_forward
     _PATCHED_CLASSES.add(layer_cls)
 
 
@@ -1287,7 +1268,6 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
             if hasattr(model_input, "scheduled_new_reqs") and hasattr(model_input, "scheduled_cached_reqs"):
                 logger.debug("Found scheduled_new_reqs and scheduled_cached_reqs attributes")
                 
-                # Extract from NEW requests (prefill phase)
                 new_reqs_val = model_input.scheduled_new_reqs
                 if new_reqs_val:
                     new_reqs = new_reqs_val
@@ -1301,11 +1281,9 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                         logger.debug(f"Processing new_req: type={type(req).__name__}, has req_id={hasattr(req, 'req_id')}, has prompt_token_ids={hasattr(req, 'prompt_token_ids')}")
                         if hasattr(req, "req_id"):
                             request_ids.append(req.req_id)
-                        # For NewRequestData, use len(prompt_token_ids)
                         if hasattr(req, "prompt_token_ids"):
                             seq_lens.append(len(req.prompt_token_ids))
 
-                # Also handle CACHED requests (decode phase)
                 cached_reqs_val = model_input.scheduled_cached_reqs
                 if cached_reqs_val and hasattr(cached_reqs_val, "req_ids"):
                     cached = cached_reqs_val
@@ -1316,7 +1294,6 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                             request_ids = []
                             seq_lens = []
 
-                        # Cached requests are generating 1 token each (decode)
                         request_ids.extend(cached.req_ids)
                         seq_lens.extend([1] * len(cached.req_ids))
             else:
@@ -1634,10 +1611,7 @@ def inspect_layer_vector(worker: Any, layer_idx: int | None = None) -> dict[str,
     with torch.no_grad():
         norm = float(vector.norm().item())
         sum_val = float(vector.sum().item())
-    try:
-        forward_name = type(layer.forward).__name__
-    except AttributeError:  # pragma: no cover - callable without __name__
-        forward_name = layer.forward.__class__.__name__
+    forward_name = type(layer.forward).__name__
     has_instance_forward = "forward" in layer.__dict__
     projection_cap = getattr(layer, "_chatspace_projection_cap", None)
     if isinstance(projection_cap, _ProjectionCapConfig):

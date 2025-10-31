@@ -25,7 +25,7 @@ class _DummyEngineClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[object, ...], dict[str, object] | None]] = []
 
-    async def collective_rpc(  # pragma: no cover - simple stub
+    async def collective_rpc(
         self,
         method,
         timeout: float | None = None,

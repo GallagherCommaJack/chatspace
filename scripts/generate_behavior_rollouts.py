@@ -349,7 +349,7 @@ async def _judge_call(client, prompt: str, args, rate_limiter: RateLimiter):
             max_completion_tokens=args.judge_max_tokens,
             temperature=args.judge_temperature,
         )
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         print(f"Judge call failed: {exc}")
         return None
 

@@ -24,7 +24,7 @@ async def test_chat_basic_activation_capture():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Single-turn conversation
@@ -78,7 +78,7 @@ async def test_chat_message_boundaries_single_turn():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [{"role": "user", "content": "Hello"}]
@@ -122,7 +122,7 @@ async def test_chat_message_boundaries_multi_turn():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [
@@ -183,7 +183,7 @@ async def test_chat_get_message_activations():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [
@@ -254,7 +254,7 @@ async def test_chat_get_message_activations_with_generated():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [
@@ -322,7 +322,7 @@ async def test_chat_batch_with_captures():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Multiple conversations
@@ -386,7 +386,7 @@ async def test_chat_multiple_layers_capture():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=layers)
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [{"role": "user", "content": "Hello"}]
@@ -429,7 +429,7 @@ async def test_chat_without_capture_has_no_boundaries():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True)
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [{"role": "user", "content": "Hello"}]
@@ -465,7 +465,7 @@ async def test_chat_get_message_activations_errors():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [{"role": "user", "content": "Hello"}]
@@ -512,7 +512,7 @@ async def test_chat_compare_user_messages():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [
@@ -576,7 +576,7 @@ async def test_chat_raw_output_with_captures():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     messages = [{"role": "user", "content": "Hello"}]
@@ -616,7 +616,7 @@ async def test_chat_assistant_prefill():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True)
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Test JSON format prefilling
@@ -700,7 +700,7 @@ async def test_chat_assistant_prefill_with_capture():
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc: 
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     prefill_text = "Sure, "

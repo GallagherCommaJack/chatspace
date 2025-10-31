@@ -1207,9 +1207,9 @@ class VLLMSteerModel(SteerableModel):
             len(messages) == 0 or isinstance(messages[0], dict)
         )
         if single_conversation:
-            batched_messages = [cast(list[dict[str, Any]], messages)]
+            batched_messages = [messages]
         else:
-            batched_messages = cast(list[list[dict[str, Any]]], messages)
+            batched_messages = messages
 
         # Setup chat template options
         chat_kwargs = dict(chat_options or {})

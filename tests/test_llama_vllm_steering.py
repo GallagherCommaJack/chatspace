@@ -38,7 +38,7 @@ def test_llama_vllm_steering_vector_round_trip(model_name: str):
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     hidden_size = model.hidden_size
@@ -146,7 +146,7 @@ def test_llama_vllm_chat_respects_steering(model_name: str):
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     prompt = "The capital of France is"
@@ -234,7 +234,7 @@ async def test_llama_hidden_state_capture(model_name: str):
 
     try:
         model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover - allows offline environments
+    except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     # Apply steering and generate with capture
@@ -280,7 +280,7 @@ def test_llama_vllm_matches_hf_logprob_shift(model_name: str):
 
     try:
         config = AutoConfig.from_pretrained(model_name)
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load config ({exc}). Ensure weights are cached.")
 
     hidden_size = int(config.hidden_size)
@@ -306,9 +306,9 @@ def test_llama_vllm_matches_hf_logprob_shift(model_name: str):
             device_map="auto",
             attn_implementation="flash_attention_2",
         )
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load HF model ({exc}). Ensure weights are cached.")
-    except ImportError as exc:  # pragma: no cover
+    except ImportError as exc:
         pytest.skip(f"Missing optional dependency ({exc}).")
 
     with torch.no_grad():
@@ -339,7 +339,7 @@ def test_llama_vllm_matches_hf_logprob_shift(model_name: str):
 
     try:
         vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         pytest.skip(f"Unable to load vLLM model ({exc}). Ensure weights are cached.")
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=100)

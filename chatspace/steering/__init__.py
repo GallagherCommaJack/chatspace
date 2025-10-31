@@ -18,12 +18,12 @@ __all__ = [
     "list_trained_datasets",
 ]
 
-try:  # pragma: no cover - optional dependencies (datasets, transformers)
+try:
     from .data import PersonaSteeringDatasetConfig, load_persona_steering_dataset, prepare_persona_token_budget
     from .model import QwenSteerModel, SteeringVectorConfig, TransformerSteerModel
-except ImportError:  # pragma: no cover - gracefully degrade when optional deps missing
+except ImportError:
     pass
-else:  # pragma: no cover - executed when optional deps available
+else:
     __all__.extend(
         [
             "PersonaSteeringDatasetConfig",

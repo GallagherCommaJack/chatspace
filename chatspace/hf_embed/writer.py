@@ -66,13 +66,9 @@ class _ShardWriter:
             if shard_metadata_queue is not None:
                 shard_metadata_queue.put(self._shards)
 
-        except BaseException as exc:  # noqa: BLE001
-            # Propagate error to parent process
-            if error_queue is not None and isinstance(exc, Exception):
-                try:
-                    error_queue.put(("writer", exc))
-                except Exception:
-                    pass  # Best effort
+        except Exception as exc:
+            if error_queue is not None:
+                error_queue.put(("writer", exc))
 
     def _append_batch(self, batch: EmbeddedBatch) -> None:
         """Append a batch to the current accumulator."""

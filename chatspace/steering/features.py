@@ -8,10 +8,10 @@ from typing import Iterable, Sequence
 import numpy as np
 import torch
 
-try:  # optional dependency
+try:
     from tqdm import tqdm
-except ImportError:  # pragma: no cover
-    tqdm = None  # type: ignore[assignment]
+except ImportError:
+    tqdm = None
 
 
 class _StopForward(RuntimeError):
