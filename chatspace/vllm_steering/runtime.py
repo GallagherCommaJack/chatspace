@@ -837,13 +837,18 @@ def _capture_hook_full(
 ) -> None:
     """Full hook: complete capture implementation (slice + clone + store)."""
     start_idx = 0
+    active_reqs = state.active_capture_requests  # Cache dict reference
+
     for i, req_id in enumerate(request_ids):
-        if req_id not in state.active_capture_requests:
+        # Check if request has any active captures (single lookup)
+        req_layers = active_reqs.get(req_id)
+        if req_layers is None:
             if seq_lens and i < len(seq_lens):
                 start_idx += seq_lens[i]
             continue
 
-        if layer_idx not in state.active_capture_requests[req_id]:
+        # Check if this layer is captured for this request
+        if layer_idx not in req_layers:
             if seq_lens and i < len(seq_lens):
                 start_idx += seq_lens[i]
             continue
@@ -857,31 +862,32 @@ def _capture_hook_full(
         else:
             req_hidden = hidden
 
-        # Determine phase
+        # Determine phase (using shape check - prefill=seq_len>1, decode=seq_len==1)
         req_seq_len = req_hidden.shape[0]
-        phase = "prefill" if req_seq_len > 1 else "decode"
-        last_phase = state.request_last_phase.get(req_id, "prefill")
+        is_prefill = req_seq_len > 1
 
-        if phase == "prefill":
+        if is_prefill:
             # Buffer chunks during prefill
             state.request_prefill_buffers[req_id][layer_idx].append(
                 req_hidden.detach().clone()
             )
+            state.request_last_phase[req_id] = "prefill"
         else:
-            # Coalesce prefill when transitioning to decode
-            if last_phase == "prefill":
+            # Check if transitioning from prefill to decode
+            if state.request_last_phase.get(req_id) == "prefill":
                 _coalesce_prefill_chunks(state, req_id)
+                state.request_last_phase[req_id] = "decode"
 
-            # Append decode token
-            if layer_idx in state.request_captures[req_id]:
-                existing = state.request_captures[req_id][layer_idx]
-                state.request_captures[req_id][layer_idx] = torch.cat(
+            # Append decode token (cached layer dict reference)
+            req_captures = state.request_captures[req_id]
+            if layer_idx in req_captures:
+                # Avoid repeated dict lookup - use cached ref
+                existing = req_captures[layer_idx]
+                req_captures[layer_idx] = torch.cat(
                     [existing, req_hidden.detach().clone()], dim=0
                 )
             else:
-                state.request_captures[req_id][layer_idx] = req_hidden.detach().clone()
-
-        state.request_last_phase[req_id] = phase
+                req_captures[layer_idx] = req_hidden.detach().clone()
 
 
 # Hook variant registry
@@ -953,50 +959,37 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if isinstance(ablation_config, _AblationConfig):
             output = _apply_ablation_to_output(output, ablation_config)
 
-        # Per-request activation capture
+        # Per-request activation capture (fast path)
         try:
             state = getattr(self, "_chatspace_steering_state", None)
-            if state is not None and state.active_capture_requests:
-                # Get current step metadata
-                current_step = state.global_step - 1  # Most recent step
-                logger.debug(
-                    f"Forward hook: layer_idx={getattr(self, '_chatspace_layer_index', None)}, "
-                    f"global_step={state.global_step}, current_step={current_step}, "
-                    f"step_metadata keys={list(state.step_metadata.keys())}"
-                )
-                if current_step < 0:
-                    logger.debug("Forward hook: current_step < 0, skipping capture")
-                    return output
+            if state is None or not state.active_capture_requests:
+                return output
 
-                metadata = state.step_metadata.get(current_step)
-                if metadata is None:
-                    logger.debug(
-                        f"Forward hook: No metadata found for step {current_step}. "
-                        f"Available steps: {list(state.step_metadata.keys())}"
-                    )
-                    return output
+            # Get current step metadata (fast path - no debug logging)
+            current_step = state.global_step - 1  # Most recent step
+            if current_step < 0:
+                return output
 
-                request_ids = metadata.get("request_ids", [])
-                seq_lens = metadata.get("seq_lens")
+            metadata = state.step_metadata.get(current_step)
+            if metadata is None:
+                return output
 
-                layer_idx = getattr(self, "_chatspace_layer_index", None)
-                if layer_idx is None:
-                    return output
+            request_ids = metadata.get("request_ids")
+            if not request_ids:
+                return output
 
-                # Dispatch to selected hook variant
-                hook_fn = _HOOK_VARIANTS[_HOOK_VARIANT]
+            layer_idx = getattr(self, "_chatspace_layer_index", None)
+            if layer_idx is None:
+                return output
 
-                # For noop_notiming, skip extraction entirely to measure pure metadata overhead
-                if _HOOK_VARIANT == "noop_notiming":
-                    # Pass dummy tensor - hook doesn't use it anyway
-                    dummy = output[0] if isinstance(output, (tuple, list)) else output
-                    hook_fn(state, layer_idx, dummy, request_ids, seq_lens)
-                else:
-                    # Extract hidden state (after steering)
-                    hidden = _extract_hidden_from_output(output)
-                    if hidden is None or hidden.dim() != 2:
-                        return output
-                    hook_fn(state, layer_idx, hidden, request_ids, seq_lens)
+            # Extract hidden state (after steering)
+            hidden = _extract_hidden_from_output(output)
+            if hidden is None or hidden.dim() != 2:
+                return output
+
+            # Call capture hook directly (avoid dict lookup in hot path)
+            seq_lens = metadata.get("seq_lens")
+            _capture_hook_full(state, layer_idx, hidden, request_ids, seq_lens)
         except Exception:  # pragma: no cover - graceful degradation
             pass
 
