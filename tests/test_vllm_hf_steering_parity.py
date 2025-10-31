@@ -15,6 +15,19 @@ from vllm import SamplingParams
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
 
+async def _get_final_output(model, prompt, sampling_params):
+    """Helper to get final output from async generator."""
+    import uuid
+    # Ensure engine is initialized before accessing model.llm
+    await model._ensure_engine_initialized()
+    final_output = None
+    request_id = f"test_{uuid.uuid4().hex}"
+    async for output in model.llm.generate(prompt, sampling_params, request_id=request_id):
+        final_output = output
+    return final_output
+
+
+
 @dataclass
 class ProjectionCapParams:
     vector: torch.Tensor
@@ -62,7 +75,8 @@ def _apply_ablation(hidden: torch.Tensor, unit: torch.Tensor, *, scale: float) -
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_steering_combinations_match():
+@pytest.mark.asyncio
+async def test_vllm_hf_steering_combinations_match():
     torch.manual_seed(123)
 
     model_name = "Qwen/Qwen3-0.6B"
@@ -107,7 +121,6 @@ def test_vllm_hf_steering_combinations_match():
         dtype="float16",
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
@@ -165,33 +178,31 @@ def test_vllm_hf_steering_combinations_match():
             # ------------------------------------------------------------------
             # vLLM path
             # ------------------------------------------------------------------
-            vllm_model.clear_all_vectors()
-            vllm_model.clear_layer_projection_cap(target_layer)
-            vllm_model.clear_layer_ablation(target_layer)
-            vllm_model.clear_hidden_states(target_layer)
-            vllm_model.clear_hidden_states(downstream_layer)
-
+            await vllm_model.clear_all_vectors()
+            await vllm_model.clear_layer_projection_cap(target_layer)
+            await vllm_model.clear_layer_ablation(target_layer)
+                
             # Only set steering at target layer
             if case["vector"] is not None:
-                vllm_model.set_layer_vector(target_layer, case["vector"])
+                await vllm_model.set_layer_vector(target_layer, case["vector"])
             if case["cap"] is not None:
-                vllm_model.set_layer_projection_cap(
+                await vllm_model.set_layer_projection_cap(
                     target_layer,
                     case["cap"].vector,
                     min=case["cap"].min,
                     max=case["cap"].max,
                 )
             if case["ablation"] is not None:
-                vllm_model.set_layer_ablation(
+                await vllm_model.set_layer_ablation(
                     target_layer,
                     case["ablation"].vector,
                     scale=case["ablation"].scale,
                 )
 
-            vllm_model.generate([prompt], sampling_params=sampling)
-            states = vllm_model.fetch_hidden_states()
-            vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-            vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+            await vllm_model.fetch_captures_batch(handles)
+            vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+            vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
             # ------------------------------------------------------------------
             # Comparison
@@ -219,7 +230,8 @@ def test_vllm_hf_steering_combinations_match():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_decode_steering_matches_hf_prefill():
+@pytest.mark.asyncio
+async def test_vllm_decode_steering_matches_hf_prefill():
     """Test that vLLM decode-time steering matches HF prefill-time steering.
 
     This validates that steering applied during vLLM's autoregressive decode phase
@@ -269,31 +281,29 @@ def test_vllm_decode_steering_matches_hf_prefill():
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
     # Set steering vector (only at target layer)
-    vllm_model.set_layer_vector(target_layer, steering_vector)
+    await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     # Generate tokens
     sampling = SamplingParams(temperature=0.0, max_tokens=5, logprobs=0, ignore_eos=True)
-    outputs = vllm_model.generate([prompt], sampling_params=sampling)
+    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
     # Get the generated text (outputs is list[str] of completion only)
-    generated_text = outputs[0]
+    generated_text = texts[0]
     full_text = prompt + generated_text
 
     # Fetch vLLM hidden states (decode mode)
-    vllm_states = vllm_model.fetch_hidden_states()
-    vllm_target_captures = vllm_states[0][target_layer]
-    vllm_downstream_captures = vllm_states[0][downstream_layer]
+    await vllm_model.fetch_captures_batch(handles)
 
-    # vLLM captures: [0] = prefill, [1:] = decode steps
-    num_decode_steps = len(vllm_target_captures) - 1
-    assert num_decode_steps >= 3, f"Need at least 3 decode steps, got {num_decode_steps}"
+    # New API: captures are concatenated tensors [seq_len, hidden_size]
+    vllm_target_hidden_full = handles[0].captures[target_layer][0]["hidden"]  # [seq_len, hidden_size]
+    vllm_downstream_hidden_full = handles[0].captures[downstream_layer][0]["hidden"]  # [seq_len, hidden_size]
 
     print(f"\nGenerated text: {repr(generated_text)}")
     print(f"Full text: {repr(full_text)}")
-    print(f"vLLM captures: {len(vllm_target_captures)} (1 prefill + {num_decode_steps} decode)")
+    print(f"vLLM target capture shape: {vllm_target_hidden_full.shape}")
+    print(f"vLLM downstream capture shape: {vllm_downstream_hidden_full.shape}")
 
     # -------------------------------------------------------------------------
     # Step 2: HF forward pass with full text (prefill mode with steering)
@@ -304,8 +314,22 @@ def test_vllm_decode_steering_matches_hf_prefill():
 
     prompt_len = prompt_inputs.input_ids.shape[1]
     full_len = full_inputs.input_ids.shape[1]
+    generated_len = full_len - prompt_len
 
-    print(f"Prompt tokens: {prompt_len}, Full tokens: {full_len}")
+    # Account for autoregressive generation: vLLM captures prompt + (generated - 1) tokens
+    # The final sampled token never flows through the model
+    expected_capture_len = prompt_len + (generated_len - 1)
+
+    print(f"Prompt tokens: {prompt_len}, Full tokens: {full_len}, Generated: {generated_len}")
+    print(f"Expected vLLM capture length: {expected_capture_len} (prompt + generated-1)")
+
+    assert vllm_target_hidden_full.shape[0] == expected_capture_len, (
+        f"vLLM capture length {vllm_target_hidden_full.shape[0]} != expected {expected_capture_len}"
+    )
+
+    # We can compare the first (generated - 1) decode tokens
+    num_decode_steps = generated_len - 1
+    assert num_decode_steps >= 3, f"Need at least 3 decode steps to compare, got {num_decode_steps}"
 
     # Capture hidden states from HF with steering
     captured_hf_hiddens: dict[int, torch.Tensor] = {}
@@ -354,8 +378,15 @@ def test_vllm_decode_steering_matches_hf_prefill():
     # -------------------------------------------------------------------------
     print(f"\nComparing vLLM decode (steered) vs HF prefill (steered):")
 
+    # Convert to float32 for comparison
+    vllm_target_hidden_full = vllm_target_hidden_full.to(dtype=torch.float32)
+    vllm_downstream_hidden_full = vllm_downstream_hidden_full.to(dtype=torch.float32)
+
     for decode_idx in range(num_decode_steps):
-        # HF: token position in the full sequence
+        # Token position in the full sequence
+        # vLLM: token is at position (prompt_len + decode_idx) in the concatenated captures
+        # HF: same position in HF's captures
+        vllm_token_idx = prompt_len + decode_idx
         hf_token_idx = prompt_len + decode_idx
 
         if hf_token_idx >= hf_target_hidden_full.shape[0]:
@@ -365,10 +396,8 @@ def test_vllm_decode_steering_matches_hf_prefill():
         # -------------------------------------------------------------------------
         # Target layer comparison
         # -------------------------------------------------------------------------
-        # vLLM: hidden state from decode step (after steering)
-        vllm_target_hidden = vllm_target_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
-        if vllm_target_hidden.dim() > 1:
-            vllm_target_hidden = vllm_target_hidden.squeeze(0)  # [hidden_size]
+        # vLLM: hidden state at this token position (slice the concatenated tensor)
+        vllm_target_hidden = vllm_target_hidden_full[vllm_token_idx]  # [hidden_size]
 
         # HF: hidden state from prefill at the corresponding token position
         hf_target_hidden = hf_target_hidden_full[hf_token_idx]  # [hidden_size]
@@ -383,11 +412,8 @@ def test_vllm_decode_steering_matches_hf_prefill():
         # -------------------------------------------------------------------------
         # Downstream layer comparison (verify steering propagates)
         # -------------------------------------------------------------------------
-        vllm_downstream_hidden = vllm_downstream_captures[decode_idx + 1]["after"].to(dtype=torch.float32)
-        if vllm_downstream_hidden.dim() > 1:
-            vllm_downstream_hidden = vllm_downstream_hidden.squeeze(0)
-
-        hf_downstream_hidden = hf_downstream_hidden_full[hf_token_idx]
+        vllm_downstream_hidden = vllm_downstream_hidden_full[vllm_token_idx]  # [hidden_size]
+        hf_downstream_hidden = hf_downstream_hidden_full[hf_token_idx]  # [hidden_size]
 
         hf_downstream_flat = hf_downstream_hidden.reshape(-1)
         vllm_downstream_flat = vllm_downstream_hidden.reshape(-1)
@@ -420,14 +446,15 @@ def test_vllm_decode_steering_matches_hf_prefill():
     print(f"\n✓ vLLM decode-time steering matches HF prefill-time steering (target + downstream layers)")
 
     # Cleanup
-    vllm_model.clear_all_vectors()
+    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_high_magnitude_steering():
+@pytest.mark.asyncio
+async def test_vllm_hf_high_magnitude_steering():
     """Test that steering works correctly at high magnitudes (10x).
 
     This test validates that the fix works under aggressive steering conditions.
@@ -510,19 +537,18 @@ def test_vllm_hf_high_magnitude_steering():
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
     # Set high-magnitude steering vector
-    vllm_model.set_layer_vector(target_layer, steering_vector)
+    await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
         # -------------------------------------------------------------------------
         # Comparison
@@ -574,14 +600,15 @@ def test_vllm_hf_high_magnitude_steering():
         print(f"\n✓ High-magnitude steering (10x) works correctly at target and downstream layers")
 
     finally:
-        vllm_model.clear_all_vectors()
+        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_high_magnitude_ablation_and_capping():
+@pytest.mark.asyncio
+async def test_vllm_hf_high_magnitude_ablation_and_capping():
     """Test that ablation and projection capping work correctly at high magnitudes.
 
     This test validates that the dual-mode transform system (mode="hidden" for
@@ -685,30 +712,29 @@ def test_vllm_hf_high_magnitude_ablation_and_capping():
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
     # Set high-magnitude steering operations
-    vllm_model.set_layer_vector(target_layer, steering_vector)
-    vllm_model.set_layer_projection_cap(
+    await vllm_model.set_layer_vector(target_layer, steering_vector)
+    await vllm_model.set_layer_projection_cap(
         target_layer,
         cap_direction,
         min=projection_spec.min,
         max=projection_spec.max,
     )
-    vllm_model.set_layer_ablation(
+    await vllm_model.set_layer_ablation(
         target_layer,
         ablation_direction,
         scale=ablation_spec.scale,
     )
 
     # Enable capture on both layers
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
         # -------------------------------------------------------------------------
         # Comparison
@@ -761,16 +787,17 @@ def test_vllm_hf_high_magnitude_ablation_and_capping():
         print(f"\n✓ High-magnitude ablation and projection capping work correctly")
 
     finally:
-        vllm_model.clear_all_vectors()
-        vllm_model.clear_layer_projection_cap(target_layer)
-        vllm_model.clear_layer_ablation(target_layer)
+        await vllm_model.clear_all_vectors()
+        await vllm_model.clear_layer_projection_cap(target_layer)
+        await vllm_model.clear_layer_ablation(target_layer)
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_multi_magnitude_steering():
+@pytest.mark.asyncio
+async def test_vllm_hf_multi_magnitude_steering():
     """Test that steering works correctly across a wide spectrum of magnitudes.
 
     This test validates the fix works from very subtle (0.001) to very aggressive (10.0)
@@ -811,7 +838,6 @@ def test_vllm_hf_multi_magnitude_steering():
         dtype="float16",
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
@@ -861,18 +887,16 @@ def test_vllm_hf_multi_magnitude_steering():
             # -------------------------------------------------------------------------
             # vLLM path
             # -------------------------------------------------------------------------
-            vllm_model.clear_all_vectors()
-            vllm_model.clear_hidden_states(target_layer)
-            vllm_model.clear_hidden_states(downstream_layer)
-
+            await vllm_model.clear_all_vectors()
+                
             # Set steering vector at this magnitude
-            vllm_model.set_layer_vector(target_layer, steering_vector)
+            await vllm_model.set_layer_vector(target_layer, steering_vector)
 
-            vllm_model.generate([prompt], sampling_params=sampling)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-            states = vllm_model.fetch_hidden_states()
-            vllm_target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-            vllm_downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+            await vllm_model.fetch_captures_batch(handles)
+            vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+            vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
             # -------------------------------------------------------------------------
             # Comparison
@@ -913,14 +937,15 @@ def test_vllm_hf_multi_magnitude_steering():
         print(f"\n✓ All {len(magnitudes)} magnitudes (0.001 - 10.0) work correctly")
 
     finally:
-        vllm_model.clear_all_vectors()
+        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_high_precision_steering():
+@pytest.mark.asyncio
+async def test_vllm_hf_high_precision_steering():
     """Test steering with float32 precision to check for subtle numerical issues.
 
     If there's a bug in the residual stream handling, running both models in
@@ -1003,19 +1028,18 @@ def test_vllm_hf_high_precision_steering():
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
     # Set steering vector
-    vllm_model.set_layer_vector(target_layer, steering_vector)
+    await vllm_model.set_layer_vector(target_layer, steering_vector)
 
     # Enable capture on both layers
-    vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-        states = vllm_model.fetch_hidden_states()
-        vllm_target_hidden = states[0][target_layer][0]["after"]
-        vllm_downstream_hidden = states[0][downstream_layer][0]["after"]
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"]
+        vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"]
 
         # -------------------------------------------------------------------------
         # Comparison (everything in float32)
@@ -1068,7 +1092,7 @@ def test_vllm_hf_high_precision_steering():
         )
 
     finally:
-        vllm_model.clear_all_vectors()
+        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
@@ -1077,7 +1101,8 @@ def test_vllm_hf_high_precision_steering():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_delta_vs_residual_numerics():
+@pytest.mark.asyncio
+async def test_delta_vs_residual_numerics():
     """Compare numerical precision of adding steering to delta vs residual.
 
     Tests both float16 and bfloat16, comparing delta vs residual approaches.
@@ -1177,15 +1202,14 @@ def test_delta_vs_residual_numerics():
                     dtype=dtype_name,
                 )
                 vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-                vllm_model.set_layer_vector(target_layer, steering_vector)
-                vllm_model.enable_hidden_state_capture([target_layer, downstream_layer], capture_before=False, capture_after=True)
-
+                await vllm_model.set_layer_vector(target_layer, steering_vector)
+            
                 sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-                vllm_model.generate([prompt], sampling_params=sampling)
+                texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
 
-                states = vllm_model.fetch_hidden_states()
-                target_hidden = states[0][target_layer][0]["after"].to(dtype=torch.float32)
-                downstream_hidden = states[0][downstream_layer][0]["after"].to(dtype=torch.float32)
+                await vllm_model.fetch_captures_batch(handles)
+                target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
+                downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
                 # Compute errors vs ground truth
                 target_error = torch.mean(torch.abs(target_hidden.reshape(-1) - ground_truth_target.reshape(-1))).item()
@@ -1198,7 +1222,7 @@ def test_delta_vs_residual_numerics():
                     "avg_error": avg_error,
                 }
 
-                vllm_model.clear_all_vectors()
+                await vllm_model.clear_all_vectors()
                 del vllm_model
                 torch.cuda.empty_cache()
 
@@ -1269,7 +1293,8 @@ def test_delta_vs_residual_numerics():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_delta_vs_residual_instrumented():
+@pytest.mark.asyncio
+async def test_delta_vs_residual_instrumented():
     """Instrument code paths to verify delta vs residual approaches are actually different.
     
     The previous test showed identical results, but we need to verify we're actually
@@ -1365,14 +1390,13 @@ def test_delta_vs_residual_instrumented():
                 dtype="float32",
             )
             vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-            vllm_model.set_layer_vector(target_layer, steering_vector)
-            vllm_model.enable_hidden_state_capture(target_layer, capture_before=False, capture_after=True)
-
+            await vllm_model.set_layer_vector(target_layer, steering_vector)
+        
             sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-            vllm_model.generate([prompt], sampling_params=sampling)
+            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer])
 
-            states = vllm_model.fetch_hidden_states()
-            hidden = states[0][target_layer][0]["after"]
+            await vllm_model.fetch_captures_batch(handles)
+            hidden = handles[0].captures[target_layer][0]["hidden"]
 
             results[approach_name] = {
                 "hidden": hidden,
@@ -1391,7 +1415,7 @@ def test_delta_vs_residual_instrumented():
             results[approach_name]["error_vs_hf"] = error
             print(f"  Error vs HF: {error:.6e}")
 
-            vllm_model.clear_all_vectors()
+            await vllm_model.clear_all_vectors()
             del vllm_model
             torch.cuda.empty_cache()
 
@@ -1428,7 +1452,8 @@ def test_delta_vs_residual_instrumented():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_vllm_hf_multi_layer_steering_float32():
+@pytest.mark.asyncio
+async def test_vllm_hf_multi_layer_steering_float32():
     """Test multi-layer steering in float32 to verify logic correctness.
 
     This test addresses real-world observations of performance degradation that gets worse
@@ -1537,20 +1562,17 @@ def test_vllm_hf_multi_layer_steering_float32():
 
     # Apply steering vectors to each layer
     for layer_idx, vector in steering_vectors.items():
-        vllm_model.set_layer_vector(layer_idx, vector)
+        await vllm_model.set_layer_vector(layer_idx, vector)
 
-    # Enable capture on all layers we want to check
-    for layer_idx in all_check_layers:
-        vllm_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
-
+    # Generate with capture on all layers we want to check
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    vllm_model.generate([prompt], sampling_params=sampling)
+    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_check_layers))
 
-    states = vllm_model.fetch_hidden_states()
+    await vllm_model.fetch_captures_batch(handles)
 
     print("\nvLLM results:")
     for layer_idx in all_check_layers:
-        vllm_hidden = states[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
         print(f"  Layer {layer_idx}: shape={vllm_hidden.shape}, mean={vllm_hidden.mean().item():.6f}, "
               f"std={vllm_hidden.std().item():.6f}, norm={torch.norm(vllm_hidden).item():.2f}")
 
@@ -1562,7 +1584,7 @@ def test_vllm_hf_multi_layer_steering_float32():
     all_pass = True
     for layer_idx in all_check_layers:
         hf_hidden = hf_captured[layer_idx]
-        vllm_hidden = states[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
 
         cos_sim = F.cosine_similarity(
             hf_hidden.flatten().unsqueeze(0),
@@ -1589,7 +1611,7 @@ def test_vllm_hf_multi_layer_steering_float32():
         else:
             print(f"  ✓ PASS: cosine similarity {cos_sim:.9f} >= {threshold}")
 
-    vllm_model.clear_all_vectors()
+    await vllm_model.clear_all_vectors()
     del vllm_model
     torch.cuda.empty_cache()
 
@@ -1681,19 +1703,16 @@ def test_vllm_hf_multi_layer_steering_float32():
 
     # Apply steering to every layer
     for layer_idx, vector in every_layer_vectors.items():
-        vllm_every_model.set_layer_vector(layer_idx, vector)
+        await vllm_every_model.set_layer_vector(layer_idx, vector)
 
-    # Enable capture
-    for layer_idx in all_every_check:
-        vllm_every_model.enable_hidden_state_capture(layer_idx, capture_before=False, capture_after=True)
-
-    vllm_every_model.generate([prompt], sampling_params=sampling)
-    states_every = vllm_every_model.fetch_hidden_states()
+    # Generate with capture on all layers
+    texts, handles = await vllm_every_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_every_check))
+    await vllm_every_model.fetch_captures_batch(handles)
 
     print("\nvLLM results (sample layers):")
     for layer_idx in [0, 5, 9, 10, 11]:
         if layer_idx in all_every_check:
-            vllm_hidden = states_every[0][layer_idx][0]["after"]
+            vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
             print(f"  Layer {layer_idx}: mean={vllm_hidden.mean().item():.6f}, "
                   f"norm={torch.norm(vllm_hidden).item():.2f}")
 
@@ -1705,7 +1724,7 @@ def test_vllm_hf_multi_layer_steering_float32():
     every_pass = True
     for layer_idx in all_every_check:
         hf_hidden = hf_every_captured[layer_idx]
-        vllm_hidden = states_every[0][layer_idx][0]["after"]
+        vllm_hidden = handles[0].captures[layer_idx][0]["hidden"]
 
         cos_sim = F.cosine_similarity(
             hf_hidden.flatten().unsqueeze(0),
@@ -1728,7 +1747,7 @@ def test_vllm_hf_multi_layer_steering_float32():
         else:
             print(f"  ✓ PASS")
 
-    vllm_every_model.clear_all_vectors()
+    await vllm_every_model.clear_all_vectors()
     del vllm_every_model
     torch.cuda.empty_cache()
 
@@ -1745,7 +1764,8 @@ def test_vllm_hf_multi_layer_steering_float32():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-def test_bf16_degradation_hf_vs_vllm():
+@pytest.mark.asyncio
+async def test_bf16_degradation_hf_vs_vllm():
     """Compare bfloat16 degradation patterns between HuggingFace and vLLM.
 
     This test measures how numerical errors accumulate differently in HF vs vLLM
@@ -1918,16 +1938,15 @@ def test_bf16_degradation_hf_vs_vllm():
 
         # Apply steering
         for layer_idx, vector in steering_vectors.items():
-            vllm_model.set_layer_vector(layer_idx, vector)
+            await vllm_model.set_layer_vector(layer_idx, vector)
 
         # Enable capture at check layer
-        vllm_model.enable_hidden_state_capture(check_layer, capture_before=False, capture_after=True)
 
         sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-        vllm_model.generate([prompt], sampling_params=sampling)
+        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[check_layer])
 
-        states = vllm_model.fetch_hidden_states()
-        vllm_bf16_hidden = states[0][check_layer][0]["after"]
+        await vllm_model.fetch_captures_batch(handles)
+        vllm_bf16_hidden = handles[0].captures[check_layer][0]["hidden"]
 
         vllm_bf16_mae = torch.mean(torch.abs(vllm_bf16_hidden.cpu().float() - hf_fp32_hidden)).item()
         vllm_bf16_cos = F.cosine_similarity(
@@ -1937,7 +1956,7 @@ def test_bf16_degradation_hf_vs_vllm():
 
         print(f"  vLLM bf16 vs fp32: MAE={vllm_bf16_mae:.6e}, cos={vllm_bf16_cos:.9f}")
 
-        vllm_model.clear_all_vectors()
+        await vllm_model.clear_all_vectors()
         del vllm_model
         torch.cuda.empty_cache()
 

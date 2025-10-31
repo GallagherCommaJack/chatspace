@@ -25,7 +25,7 @@ class _DummyEngineClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[object, ...], dict[str, object] | None]] = []
 
-    def collective_rpc(  # pragma: no cover - simple stub
+    async def collective_rpc(  # pragma: no cover - simple stub
         self,
         method,
         timeout: float | None = None,
@@ -45,6 +45,8 @@ class _DummyEngineClient:
 
 
 def _make_dummy_model(hidden_size: int = 8, layer_count: int = 12) -> VLLMSteerModel:
+    import asyncio
+    from chatspace.generation.vllm_steer_model import AsyncRWLock
     model = object.__new__(VLLMSteerModel)
     model.cfg = VLLMSteeringConfig()
     model.hidden_size = hidden_size
@@ -54,6 +56,9 @@ def _make_dummy_model(hidden_size: int = 8, layer_count: int = 12) -> VLLMSteerM
     model._engine_client = _DummyEngineClient()
     model._layer_specs = {}
     model._steering_stack = []
+    model._steering_rwlock = AsyncRWLock()
+    model._engine_init_lock = asyncio.Lock()
+    model._engine_initialized = True  # Skip lazy init for dummy model
     return model
 
 
@@ -102,7 +107,8 @@ def _assert_spec_eq(left: SteeringSpec, right: SteeringSpec) -> None:
             assert left_layer.ablation.scale == pytest.approx(right_layer.ablation.scale)
 
 
-def test_export_and_apply_steering_spec_roundtrip():
+@pytest.mark.asyncio
+async def test_export_and_apply_steering_spec_roundtrip():
     model = _make_dummy_model(hidden_size=6)
 
     layer = 3
@@ -110,9 +116,9 @@ def test_export_and_apply_steering_spec_roundtrip():
     cap_vector = torch.arange(model.hidden_size, dtype=torch.float32) + 1
     ablation_vector = torch.ones(model.hidden_size, dtype=torch.float32) * 2
 
-    model.set_layer_vector(layer, vector)
-    model.set_layer_projection_cap(layer, cap_vector, min=-0.5, max=0.75)
-    model.set_layer_ablation(layer, ablation_vector, scale=0.4)
+    await model.set_layer_vector(layer, vector)
+    await model.set_layer_projection_cap(layer, cap_vector, min=-0.5, max=0.75)
+    await model.set_layer_ablation(layer, ablation_vector, scale=0.4)
 
     exported = model.export_steering_spec()
     assert list(exported.layers.keys()) == [layer]
@@ -129,10 +135,10 @@ def test_export_and_apply_steering_spec_roundtrip():
     assert torch.allclose(layer_spec.ablation.vector, ablation_unit)
     assert layer_spec.ablation.scale == pytest.approx(0.4)
 
-    model.clear_all_vectors()
+    await model.clear_all_vectors()
     assert not model._layer_specs
 
-    model.apply_steering_spec(exported)
+    await model.apply_steering_spec(exported)
 
     restored_vector = model.current_vector(layer)
     assert torch.allclose(restored_vector, vector.to(dtype=torch.float32))
@@ -147,11 +153,12 @@ def test_export_and_apply_steering_spec_roundtrip():
     assert restored_ablation.scale == pytest.approx(0.4)
 
 
-def test_steering_context_manager_restores_state():
+@pytest.mark.asyncio
+async def test_steering_context_manager_restores_state():
     model = _make_dummy_model(hidden_size=4)
 
     base_vector = torch.tensor([1.0, -1.0, 0.5, -0.5])
-    model.set_layer_vector(2, base_vector)
+    await model.set_layer_vector(2, base_vector)
     baseline = model.export_steering_spec()
 
     new_spec = SteeringSpec(
@@ -180,7 +187,7 @@ def test_steering_context_manager_restores_state():
         }
     )
 
-    with model.steering(new_spec):
+    async with model.steering(new_spec):
         applied = model.export_steering_spec()
         _assert_spec_eq(applied, new_spec)
         assert len(model._steering_stack) == 1
@@ -190,7 +197,8 @@ def test_steering_context_manager_restores_state():
     assert not model._steering_stack
 
 
-def test_pop_without_push_raises():
+@pytest.mark.asyncio
+async def test_pop_without_push_raises():
     model = _make_dummy_model()
     with pytest.raises(RuntimeError):
-        model.pop_steering_spec()
+        await model.pop_steering_spec()
