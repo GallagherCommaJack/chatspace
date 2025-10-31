@@ -1697,7 +1697,7 @@ def _flush_decode_buffers(state: _SteeringState, request_id: str, start_async_tr
         If True and CUDA stream available, immediately start async GPU→CPU transfer.
         This allows transfers to overlap with generation for Phase 2 streaming.
     """
-    if request_id not in state.request_decode_buffers:
+    if state.request_decode_buffers is None or request_id not in state.request_decode_buffers:
         return
 
     decode_buffers = state.request_decode_buffers[request_id]
