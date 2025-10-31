@@ -826,7 +826,12 @@ responses = await model.chat(
     messages,
     sampling_params=sampling,
 )
-print(responses[0])  # Single conversation returns list[str]
+
+# Responses are ChatResponse objects with .prefill and .generated attributes
+response = responses[0]
+print(response.full_text())  # Get complete response text
+print(f"Generated: {response.generated}")  # Just the generated part
+print(f"Has prefill: {response.has_prefill}")  # False unless using continue_final_message
 ```
 
 **Batched conversations:**
@@ -898,8 +903,15 @@ responses = await model.chat(
         "continue_final_message": True,   # Enable prefill mode
     },
 )
-# Note: responses[0] contains only the generated text (e.g., 'Quantum computing uses..."')
-# For the full assistant message, prepend the prefill: prefill + responses[0]
+
+# ChatResponse objects separate prefill from generated text
+response = responses[0]
+print(f"Prefill: {response.prefill}")  # '{"explanation": "'
+print(f"Generated: {response.generated}")  # 'Quantum computing uses quantum bits..."}'
+print(f"Full text: {response.full_text()}")  # Complete response
+
+# Build conversation history easily
+messages.append(response.to_message())  # Adds {"role": "assistant", "content": "..."}
 
 # Force reasoning blocks (for hybrid models like Qwen)
 reasoning_prefill = "<think>\n"
@@ -908,7 +920,7 @@ messages_with_reasoning = [
     {"role": "assistant", "content": reasoning_prefill}  # Start reasoning block
 ]
 
-responses = await model.chat(
+reasoning_responses = await model.chat(
     messages_with_reasoning,
     sampling_params=sampling,
     chat_options={
@@ -916,7 +928,9 @@ responses = await model.chat(
         "continue_final_message": True,
     },
 )
-# Model continues with reasoning content, full output: reasoning_prefill + responses[0]
+
+# Access the complete reasoning output
+print(reasoning_responses[0].full_text())  # "<think>\n...reasoning..."
 ```
 
 **Accessing token-level details:**
@@ -968,15 +982,15 @@ conversation = [
 
 # First turn
 responses = await model.chat(conversation, sampling_params=sampling)
-assistant_reply = responses[0]
+first_response = responses[0]
 
-# Add assistant's reply to history
-conversation.append({"role": "assistant", "content": assistant_reply})
+# Add assistant's reply to history using .to_message()
+conversation.append(first_response.to_message())
 conversation.append({"role": "user", "content": "Tell me more about it."})
 
 # Continue conversation
 responses = await model.chat(conversation, sampling_params=sampling)
-print(responses[0])
+print(responses[0].full_text())
 ```
 
 #### Tensor Parallel Support

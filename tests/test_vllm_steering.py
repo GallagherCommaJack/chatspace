@@ -10,6 +10,7 @@ from transformers import AutoConfig, AutoTokenizer
 from vllm import SamplingParams
 
 from chatspace.generation import (
+    ChatResponse,
     VLLMSteerModel,
     VLLMSteeringConfig,
 )
@@ -180,7 +181,8 @@ async def test_vllm_chat_respects_steering():
     assert torch.isclose(
         torch.tensor(baseline_logprob), torch.tensor(reset_logprob)
     ), "Clearing the steering vector should restore baseline behaviour."
-    assert isinstance(chat_output, str) and len(chat_output) > 0, "Chat should return non-empty string."
+    assert isinstance(chat_output, ChatResponse), "Chat should return ChatResponse."
+    assert len(chat_output.full_text()) > 0, "Chat response should have non-empty text."
 
     del model
 

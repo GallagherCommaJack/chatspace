@@ -6,7 +6,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import ChatResponse, VLLMSteerModel, VLLMSteeringConfig
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
@@ -40,7 +40,8 @@ async def test_chat_basic_activation_capture():
 
     # Verify response and handle
     assert len(responses) == 1, "Expected one response"
-    assert isinstance(responses[0], str), "Response should be a string"
+    assert isinstance(responses[0], ChatResponse), "Response should be a ChatResponse"
+    assert len(responses[0].full_text()) > 0, "Response should have text"
     assert len(handles) == 1, "Expected one capture handle"
 
     handle = handles[0]
@@ -443,7 +444,8 @@ async def test_chat_without_capture_has_no_boundaries():
     # Should return just responses, not a tuple
     assert isinstance(result, list), "Without capture_layers, should return list of responses"
     assert len(result) == 1
-    assert isinstance(result[0], str)
+    assert isinstance(result[0], ChatResponse), "Response should be ChatResponse"
+    assert len(result[0].full_text()) > 0, "Response should have text"
 
     del model
 
@@ -635,23 +637,22 @@ async def test_chat_assistant_prefill():
         },
     )
 
-    # Verify response (vLLM returns only the generated text, not the prefill)
+    # Verify response structure
     assert len(responses) == 1, "Expected one response"
     response = responses[0]
-    assert isinstance(response, str), "Response should be a string"
-    assert len(response) > 0, "Response should contain generated text"
+    assert isinstance(response, ChatResponse), "Response should be a ChatResponse"
 
-    # When continuing from prefill, full response should include both
-    # Note: vLLM's .text only contains generated tokens, so prepend manually
-    full_response = prefill_text + response
+    # Verify prefill and generated separation
+    assert response.has_prefill, "Response should have prefill"
+    assert response.prefill == prefill_text, f"Prefill mismatch. Expected: {prefill_text!r}, got: {response.prefill!r}"
+    assert len(response.generated) > 0, "Response should have generated text"
 
-    # Verify the full response looks like valid JSON
+    # Verify full_text() combines both
+    full_response = response.full_text()
     assert full_response.startswith('{"answer":'), (
         f"Full response should look like JSON. Got: {full_response}"
     )
-
-    # Verify it contains a closing quote after the generated content
-    assert '"' in response, "Generated text should contain at least a closing quote"
+    assert '"' in response.generated, "Generated text should contain at least a closing quote"
 
     # Test with reasoning block prefill
     reasoning_prefill = "<think>\n"
@@ -669,13 +670,16 @@ async def test_chat_assistant_prefill():
         },
     )
 
-    # Verify reasoning response (again, vLLM returns only generated text)
+    # Verify reasoning response with prefill
     assert len(responses_reasoning) == 1
     reasoning_response = responses_reasoning[0]
-    assert len(reasoning_response) > 0, "Should have generated reasoning content"
+    assert isinstance(reasoning_response, ChatResponse), "Should be ChatResponse"
+    assert reasoning_response.has_prefill, "Should have reasoning prefill"
+    assert reasoning_response.prefill == reasoning_prefill, "Prefill should match"
+    assert len(reasoning_response.generated) > 0, "Should have generated reasoning content"
 
-    # Full reasoning would be prefill + generated
-    full_reasoning = reasoning_prefill + reasoning_response
+    # Verify full_text() starts with think tag
+    full_reasoning = reasoning_response.full_text()
     assert full_reasoning.startswith("<think>"), "Should start with think tag"
 
     del model
@@ -717,9 +721,13 @@ async def test_chat_assistant_prefill_with_capture():
         },
     )
 
-    # Verify response (vLLM returns only generated text, not prefill)
+    # Verify response with prefill
     assert len(responses) == 1
-    assert len(responses[0]) > 0, "Should have generated text"
+    response = responses[0]
+    assert isinstance(response, ChatResponse), "Should be ChatResponse"
+    assert response.has_prefill, "Should have prefill"
+    assert response.prefill == prefill_text, "Prefill should match"
+    assert len(response.generated) > 0, "Should have generated text"
 
     # Verify message boundaries
     await model.fetch_captures_batch(handles)
