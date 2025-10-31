@@ -6,11 +6,15 @@ from .config import GenerationConfig
 from .vllm_steer_model import (
     AddSpec,
     AblationSpec,
+    CaptureHandle,
+    ChatResponse,
     LayerSteeringSpec,
+    MessageBoundary,
     ProjectionCapSpec,
     SteeringSpec,
     VLLMSteerModel,
     VLLMSteeringConfig,
+    compute_message_boundaries,
 )
 
 __all__ = [
@@ -23,6 +27,10 @@ __all__ = [
     "ProjectionCapSpec",
     "AblationSpec",
     "SteeringSpec",
+    "CaptureHandle",
+    "ChatResponse",
+    "MessageBoundary",
+    "compute_message_boundaries",
     "LegacyExperiment",
     "load_legacy_role_trait_config",
 ]

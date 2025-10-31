@@ -2,6 +2,63 @@
 
 ## 2025-10-31
 
+### Chat API Activation Capture Tests
+
+**Timestamp:** 2025-10-31 16:40 UTC
+
+**Branch:** `claude/add-activation-examples-011CUehR16cqMaPbtrS2Mxc8`
+
+Added comprehensive test coverage for the new chat() API activation capture functionality with message-level boundary tracking.
+
+**Summary of Draft Functionality (from branch):**
+- Extended `chat()` API to support `capture_layers` parameter for activation capture
+- Added `MessageBoundary` dataclass to track token boundaries for each message in a conversation
+- Extended `CaptureHandle` with `message_boundaries` field and `get_message_activations()` method
+- Added `_compute_message_boundaries()` helper to compute token spans for each message
+- Message boundaries allow slicing activations by individual messages (system, user, assistant)
+- Support for `include_generated=True` to include generated tokens for the last message
+
+**Test Coverage (11 tests in `test_vllm_chat_activation_capture.py`):**
+1. `test_chat_basic_activation_capture` - Basic chat with capture
+2. `test_chat_message_boundaries_single_turn` - Boundary computation for single message
+3. `test_chat_message_boundaries_multi_turn` - Sequential boundary tracking across multi-turn
+4. `test_chat_get_message_activations` - Extract activations per message
+5. `test_chat_get_message_activations_with_generated` - Test `include_generated` parameter
+6. `test_chat_batch_with_captures` - Batch chat with multiple conversations
+7. `test_chat_multiple_layers_capture` - Multiple layer capture with message slicing
+8. `test_chat_without_capture_has_no_boundaries` - Verify no handles without capture
+9. `test_chat_get_message_activations_errors` - Error handling validation
+10. `test_chat_compare_user_messages` - Activation comparison between messages
+11. `test_chat_raw_output_with_captures` - Raw RequestOutput with captures
+
+**Test Results:**
+- All 11 new tests pass (2m 3s runtime)
+- All existing activation capture tests pass (6/6 in `test_vllm_hidden_state_capture.py`)
+- Comprehensive integration test passes
+- Existing chat steering tests pass
+
+**Key Test Validations:**
+- Message boundaries are correctly computed and sequential
+- `get_message_activations()` correctly slices activations by message index
+- Concatenating all message activations equals the prefill portion of full capture
+- Message + generated activations equals full capture for single-turn conversations
+- Batch chat correctly tracks boundaries for each conversation independently
+- Error handling for invalid indices and unfetched captures
+
+**README Enhancements (from branch):**
+- Added comprehensive activation capture examples section
+- Usage examples for `generate()` and `chat()` with captures
+- Message-level activation splitting examples
+- Batch capture and multi-layer analysis patterns
+- HuggingFace validation pattern
+
+**Next Steps:**
+- Branch is ready for review
+- Consider adding performance benchmarks for message boundary computation
+- May want to add example notebook demonstrating message-level analysis
+
+---
+
 ### Async Fetch Optimization - Streaming GPU→CPU Transfers
 
 **Timestamp:** 2025-10-31 02:22 UTC
