@@ -295,6 +295,9 @@ class _SteeringState:
     # Future: current_step_context for optimized routing
     current_step_context: _StepContext | None = None
 
+    # Async transfer infrastructure
+    transfer_stream: torch.cuda.Stream | None = None  # Stream for non-blocking GPU→CPU transfers
+
     # Profiling summaries
     last_fetch_profile: dict[str, Any] | None = None
 
@@ -1376,6 +1379,7 @@ def initialize_worker_state(
         step_metadata={},
         global_step=0,
         current_step_context=None,
+        transfer_stream=torch.cuda.Stream(device=device) if device.type == 'cuda' else None,
     )
     worker._chatspace_steering = state
 
@@ -1764,23 +1768,49 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
     }
 
     with _profile_fetch_batch(state, profiling_metadata) as profiler:
+        # Phase 1: Coalesce all captures
+        t_coalesce_start = time.perf_counter()
         for req_id in request_ids:
-            # Time coalescing
-            t_coalesce_start = time.perf_counter()
             _coalesce_prefill_chunks(state, req_id)
-            _flush_decode_buffers(state, req_id)  # Flush remaining decode tokens
-            total_coalesce_time += time.perf_counter() - t_coalesce_start
+            _flush_decode_buffers(state, req_id)
+        total_coalesce_time = time.perf_counter() - t_coalesce_start
 
-            # Serialize captures with detailed timing
-            captures = state.request_captures.pop(req_id, {})
-            serialized = {}
+        # Phase 2: Start all GPU→CPU transfers asynchronously
+        transfer_data: dict[tuple[str, int], tuple[torch.Tensor, torch.cuda.Event | None, int]] = {}
+
+        for req_id in request_ids:
+            captures = state.request_captures.get(req_id, {})
 
             for layer_idx, tensor in captures.items():
                 layer_count += 1
                 tensor_bytes = tensor.numel() * tensor.element_size()
                 total_bytes += tensor_bytes
 
-                cpu_tensor = tensor.detach().cpu().contiguous()
+                # Non-blocking transfer if CUDA available
+                if state.transfer_stream is not None:
+                    with torch.cuda.stream(state.transfer_stream):
+                        cpu_tensor = tensor.detach().cpu(non_blocking=True).contiguous()
+                        event = torch.cuda.Event()
+                        event.record(state.transfer_stream)
+                        transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
+                else:
+                    # Fallback for non-CUDA devices
+                    cpu_tensor = tensor.detach().cpu().contiguous()
+                    transfer_data[(req_id, layer_idx)] = (cpu_tensor, None, tensor_bytes)
+
+        # Phase 3: Synchronize all events before serialization
+        if state.transfer_stream is not None:
+            for cpu_tensor, event, _ in transfer_data.values():
+                if event is not None:
+                    event.synchronize()
+
+        # Phase 4: Serialize all transferred tensors
+        for req_id in request_ids:
+            captures = state.request_captures.pop(req_id, {})
+            serialized = {}
+
+            for layer_idx in captures.keys():
+                cpu_tensor, _, tensor_bytes = transfer_data[(req_id, layer_idx)]
 
                 # Time numpy serialization
                 t_numpy_start = time.perf_counter()
@@ -1814,6 +1844,7 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             state.request_prefill_buffers.pop(req_id, None)
             state.request_last_phase.pop(req_id, None)
             state.request_token_counts.pop(req_id, None)
+            state.request_decode_buffers.pop(req_id, None)
 
             result[req_id] = serialized
 
