@@ -1823,7 +1823,7 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
 
         for req_id in request_ids:
             # First check for pre-transferred data from Phase 2 streaming
-            pending = state.request_pending_transfers.get(req_id, {})
+            pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
 
             # Get current captures (may include data not yet transferred)
             captures = state.request_captures.get(req_id, {})
@@ -1899,8 +1899,10 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             state.request_prefill_buffers.pop(req_id, None)
             state.request_last_phase.pop(req_id, None)
             state.request_token_counts.pop(req_id, None)
-            state.request_decode_buffers.pop(req_id, None)
-            state.request_pending_transfers.pop(req_id, None)
+            if state.request_decode_buffers is not None:
+                state.request_decode_buffers.pop(req_id, None)
+            if state.request_pending_transfers is not None:
+                state.request_pending_transfers.pop(req_id, None)
 
             result[req_id] = serialized
 
@@ -1944,10 +1946,12 @@ def unregister_capture_request(worker: Any, request_id: str) -> None:
     state.request_captures.pop(request_id, None)
     state.active_capture_requests.pop(request_id, None)
     state.request_prefill_buffers.pop(request_id, None)
-    state.request_decode_buffers.pop(request_id, None)
+    if state.request_decode_buffers is not None:
+        state.request_decode_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
-    state.request_pending_transfers.pop(request_id, None)
+    if state.request_pending_transfers is not None:
+        state.request_pending_transfers.pop(request_id, None)
 
 
 def fetch_last_profile(worker: Any) -> dict[str, Any]:
