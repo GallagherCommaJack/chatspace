@@ -38,10 +38,12 @@ from __future__ import annotations
 import importlib
 import logging
 import math
+import os
 import queue
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Sequence
@@ -60,11 +62,199 @@ try:  # pragma: no cover - torch._dynamo optional at runtime
 except Exception:  # pragma: no cover - fallback when unavailable
     _dynamo = None
 
+try:  # pragma: no cover - profiler optional depending on torch build
+    from torch.profiler import ProfilerActivity, profile as torch_profile
+except Exception:  # pragma: no cover - profiler unavailable
+    ProfilerActivity = None
+    torch_profile = None
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Helper to parse integer environment variables safely."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Normalize truthy environment flags."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
+
+_PROFILE_FETCH_ENABLED = _env_flag("CHATSPACE_PROFILE_FETCH", False)
+_PROFILE_FETCH_TOPK = _get_env_int("CHATSPACE_PROFILE_FETCH_TOPK", 5)
+_PROFILE_FETCH_EVENT_LIMIT = _get_env_int("CHATSPACE_PROFILE_FETCH_EVENT_LIMIT", 32)
+_PROFILE_FETCH_TRACE_DIR = os.getenv("CHATSPACE_PROFILE_FETCH_TRACE_DIR")
+_PROFILE_FETCH_TRACE_PREFIX = os.getenv("CHATSPACE_PROFILE_FETCH_TRACE_PREFIX", "fetch_trace")
+_CAPTURE_METADATA_ENABLED = _env_flag("CHATSPACE_CAPTURE_METADATA", True)
+
 LayerLike = Any
 
 # Optional override for projection cap math precision. When set the cap
 # operations are evaluated in the requested dtype before casting back.
 _PROJECTION_CAP_PRECISION: torch.dtype | None = None
+
+_PROFILE_FETCH_WARNED = False
+
+_TRANSFER_EVENT_TOKENS = ("::copy", "::_to", "::to")
+
+
+def _is_transfer_event(name: str) -> bool:
+    """Heuristic to detect GPU→CPU transfer ops in profiler output."""
+    lowered = name.lower()
+    return any(token in lowered for token in _TRANSFER_EVENT_TOKENS)
+
+
+def _summarize_profiler(
+    prof: Any, metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Convert a torch profiler session into structured summary data."""
+    rows: list[dict[str, Any]] = []
+    total_cpu = 0.0
+    total_cuda = 0.0
+    for event in prof.key_averages():
+        name = getattr(event, "key", getattr(event, "name", "unknown"))
+        cpu_total = getattr(event, "cpu_time_total", 0.0) / 1_000_000.0
+        cpu_self = getattr(event, "self_cpu_time_total", 0.0) / 1_000_000.0
+        cuda_total = getattr(event, "cuda_time_total", 0.0) / 1_000_000.0
+        cuda_self = getattr(event, "self_cuda_time_total", 0.0) / 1_000_000.0
+        row = {
+            "name": name,
+            "count": int(getattr(event, "count", 0)),
+            "cpu_time_s": cpu_total,
+            "self_cpu_time_s": cpu_self,
+            "cuda_time_s": cuda_total,
+            "self_cuda_time_s": cuda_self,
+        }
+        rows.append(row)
+        total_cpu += cpu_total
+        total_cuda += cuda_total
+
+    rows.sort(key=lambda item: item["self_cuda_time_s"], reverse=True)
+    event_count = len(rows)
+    limited_rows = rows[: max(_PROFILE_FETCH_EVENT_LIMIT, _PROFILE_FETCH_TOPK)]
+    transfer_cuda_s = sum(
+        row["self_cuda_time_s"] for row in rows if _is_transfer_event(row["name"])
+    )
+    summary = {
+        "metadata": dict(metadata or {}),
+        "events": limited_rows,
+        "top_events": limited_rows[: _PROFILE_FETCH_TOPK],
+        "event_count": event_count,
+        "total_cpu_s": total_cpu,
+        "total_cuda_s": total_cuda,
+        "transfer_cuda_s": transfer_cuda_s,
+    }
+    return summary
+
+
+def _export_profiler_trace(prof: Any, metadata: dict[str, Any]) -> str | None:
+    """Persist profiler trace to disk when configured."""
+    if not _PROFILE_FETCH_TRACE_DIR:
+        return None
+    trace_dir = Path(_PROFILE_FETCH_TRACE_DIR).expanduser()
+    try:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # pragma: no cover - filesystem errors
+        logger.warning(
+            "Unable to create profiler trace directory %s; skipping export.",
+            trace_dir,
+            exc_info=True,
+        )
+        return None
+
+    timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    suffix = f"{time.time():.6f}".replace(".", "")
+    filename = f"{_PROFILE_FETCH_TRACE_PREFIX}_{timestamp}_{suffix}.json"
+    path = trace_dir / filename
+    try:
+        prof.export_chrome_trace(str(path))
+    except Exception:  # pragma: no cover - torch profiler export errors
+        logger.warning(
+            "Failed to export torch profiler trace to %s", path, exc_info=True
+        )
+        return None
+    if metadata is not None:
+        metadata.setdefault("trace_path", str(path))
+    return str(path)
+
+
+def _log_profiler_summary(summary: dict[str, Any]) -> None:
+    """Emit a concise log entry for profiler sessions."""
+    top_events = summary.get("top_events") or []
+    if not top_events:
+        logger.info(
+            "[Torch Profiler] fetch_batch_captures events=%d total_cuda=%.4fs total_cpu=%.4fs (no hot ops)",
+            summary.get("event_count", 0),
+            summary.get("total_cuda_s", 0.0),
+            summary.get("total_cpu_s", 0.0),
+        )
+        return
+
+    preview = ", ".join(
+        f"{row['name']}:{row['self_cuda_time_s']:.4f}s"
+        for row in top_events[: min(3, len(top_events))]
+    )
+    logger.info(
+        "[Torch Profiler] fetch_batch_captures events=%d total_cuda=%.4fs total_cpu=%.4fs top_cuda=%s",
+        summary.get("event_count", 0),
+        summary.get("total_cuda_s", 0.0),
+        summary.get("total_cpu_s", 0.0),
+        preview,
+    )
+
+
+@contextmanager
+def _profile_fetch_batch(
+    state: "_SteeringState | None", metadata: dict[str, Any] | None = None
+) -> Any:
+    """Profile fetch_batch_captures with torch.profiler when enabled."""
+    global _PROFILE_FETCH_WARNED
+
+    if not _PROFILE_FETCH_ENABLED:
+        yield None
+        return
+    if torch_profile is None or ProfilerActivity is None:
+        if not _PROFILE_FETCH_WARNED:
+            logger.warning(
+                "Torch profiler instrumentation requested but torch.profiler is unavailable; "
+                "set CHATSPACE_PROFILE_FETCH=0 to disable profiling."
+            )
+            _PROFILE_FETCH_WARNED = True
+        yield None
+        return
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    # Mutate metadata in-place so caller updates propagate into the summary
+    metadata = metadata or {}
+    try:
+        metadata["activities"] = [activity.name.lower() for activity in activities]
+    except AttributeError:  # pragma: no cover - older torch enums
+        metadata["activities"] = [str(activity) for activity in activities]
+
+    with torch_profile(
+        activities=activities,
+        record_shapes=False,
+        profile_memory=True,
+    ) as prof:
+        yield prof
+
+    summary = _summarize_profiler(prof, metadata)
+    trace_path = _export_profiler_trace(prof, summary["metadata"])
+    if trace_path:
+        summary["trace_path"] = trace_path
+    setattr(prof, "_chatspace_summary", summary)
+    if state is not None:
+        state.last_fetch_profile = summary
+    _log_profiler_summary(summary)
 
 
 
@@ -103,6 +293,9 @@ class _SteeringState:
 
     # Future: current_step_context for optimized routing
     current_step_context: _StepContext | None = None
+
+    # Profiling summaries
+    last_fetch_profile: dict[str, Any] | None = None
 
 
 @dataclass
@@ -238,6 +431,7 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
             second = output[1]
             if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
                 # Combine residual stream with delta to match HF hidden state
+                # NOTE: This tensor addition happens on every forward pass when capturing!
                 return second + first
         if len(output) > 0:
             # Single element or fallback: return first element
@@ -251,6 +445,51 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
         if isinstance(hidden, torch.Tensor):
             return hidden
     return None
+
+
+def _extract_hidden_from_output_timed(output: Any) -> tuple[torch.Tensor | None, float, float]:
+    """Timed version of _extract_hidden_from_output for profiling.
+
+    Returns:
+        (hidden_tensor, time_spent_in_addition, time_spent_total)
+    """
+    import time
+    start_total = time.perf_counter()
+
+    if isinstance(output, torch.Tensor):
+        return output, 0.0, time.perf_counter() - start_total
+
+    if isinstance(output, (tuple, list)):
+        if len(output) >= 2:
+            first = output[0]
+            second = output[1]
+            if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+                # Time the tensor addition specifically
+                start_add = time.perf_counter()
+                result = second + first
+                time_add = time.perf_counter() - start_add
+
+                time_total = time.perf_counter() - start_total
+                return result, time_add, time_total
+
+        if len(output) > 0:
+            hidden = output[0]
+            if isinstance(hidden, torch.Tensor):
+                time_total = time.perf_counter() - start_total
+                return hidden, 0.0, time_total
+
+    if isinstance(output, dict) and "last_hidden_state" in output:
+        time_total = time.perf_counter() - start_total
+        return output["last_hidden_state"], 0.0, time_total
+
+    if hasattr(output, "last_hidden_state"):
+        hidden = output.last_hidden_state  # type: ignore[assignment]
+        if isinstance(hidden, torch.Tensor):
+            time_total = time.perf_counter() - start_total
+            return hidden, 0.0, time_total
+
+    time_total = time.perf_counter() - start_total
+    return None, 0.0, time_total
 
 
 def _is_qwen_layer_output(output: Any) -> bool:
@@ -497,6 +736,173 @@ if _dynamo is not None:
     _apply_ablation_to_output = _dynamo.disable(_apply_ablation_to_output)  # type: ignore[assignment]
 
 
+# ============================================================================
+# Hook Variant System for Profiling
+# ============================================================================
+# Environment variable to select hook variant for performance testing
+_HOOK_VARIANT = os.environ.get("CHATSPACE_HOOK_VARIANT", "full")
+
+
+def _capture_hook_noop(
+    state: _SteeringState,
+    layer_idx: int,
+    hidden: torch.Tensor,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> None:
+    """No-op hook: measures baseline overhead of hook invocation."""
+    pass
+
+
+def _capture_hook_noop_notiming(
+    state: _SteeringState,
+    layer_idx: int,
+    hidden: torch.Tensor,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> None:
+    """No-op hook with NO hidden extraction: measures pure metadata lookup overhead."""
+    pass
+
+
+def _capture_hook_slice_only(
+    state: _SteeringState,
+    layer_idx: int,
+    hidden: torch.Tensor,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> None:
+    """Slice-only hook: performs slicing but no clone/store."""
+    start_idx = 0
+    for i, req_id in enumerate(request_ids):
+        if req_id not in state.active_capture_requests:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        if layer_idx not in state.active_capture_requests[req_id]:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        # Slice but don't clone
+        if seq_lens and i < len(seq_lens):
+            seq_len = seq_lens[i]
+            end_idx = start_idx + seq_len
+            req_hidden = hidden[start_idx:end_idx]  # SLICE ONLY
+            start_idx = end_idx
+        else:
+            req_hidden = hidden  # noqa: F841
+
+
+def _capture_hook_clone_only(
+    state: _SteeringState,
+    layer_idx: int,
+    hidden: torch.Tensor,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> None:
+    """Clone-only hook: slices and clones but doesn't store."""
+    start_idx = 0
+    for i, req_id in enumerate(request_ids):
+        if req_id not in state.active_capture_requests:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        if layer_idx not in state.active_capture_requests[req_id]:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        # Slice and clone but don't store
+        if seq_lens and i < len(seq_lens):
+            seq_len = seq_lens[i]
+            end_idx = start_idx + seq_len
+            req_hidden = hidden[start_idx:end_idx]
+            start_idx = end_idx
+        else:
+            req_hidden = hidden
+
+        # Clone but discard immediately
+        _ = req_hidden.detach().clone()  # CLONE ONLY
+
+
+def _capture_hook_full(
+    state: _SteeringState,
+    layer_idx: int,
+    hidden: torch.Tensor,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> None:
+    """Full hook: complete capture implementation (slice + clone + store)."""
+    start_idx = 0
+    for i, req_id in enumerate(request_ids):
+        if req_id not in state.active_capture_requests:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        if layer_idx not in state.active_capture_requests[req_id]:
+            if seq_lens and i < len(seq_lens):
+                start_idx += seq_lens[i]
+            continue
+
+        # Determine slice for this request
+        if seq_lens and i < len(seq_lens):
+            seq_len = seq_lens[i]
+            end_idx = start_idx + seq_len
+            req_hidden = hidden[start_idx:end_idx]
+            start_idx = end_idx
+        else:
+            req_hidden = hidden
+
+        # Determine phase
+        req_seq_len = req_hidden.shape[0]
+        phase = "prefill" if req_seq_len > 1 else "decode"
+        last_phase = state.request_last_phase.get(req_id, "prefill")
+
+        if phase == "prefill":
+            # Buffer chunks during prefill
+            state.request_prefill_buffers[req_id][layer_idx].append(
+                req_hidden.detach().clone()
+            )
+        else:
+            # Coalesce prefill when transitioning to decode
+            if last_phase == "prefill":
+                _coalesce_prefill_chunks(state, req_id)
+
+            # Append decode token
+            if layer_idx in state.request_captures[req_id]:
+                existing = state.request_captures[req_id][layer_idx]
+                state.request_captures[req_id][layer_idx] = torch.cat(
+                    [existing, req_hidden.detach().clone()], dim=0
+                )
+            else:
+                state.request_captures[req_id][layer_idx] = req_hidden.detach().clone()
+
+        state.request_last_phase[req_id] = phase
+
+
+# Hook variant registry
+_HOOK_VARIANTS: dict[str, Callable] = {
+    "noop_notiming": _capture_hook_noop_notiming,
+    "noop": _capture_hook_noop,
+    "slice_only": _capture_hook_slice_only,
+    "clone_only": _capture_hook_clone_only,
+    "full": _capture_hook_full,
+}
+
+# Log selected variant for debugging
+if _HOOK_VARIANT not in _HOOK_VARIANTS:
+    logger.warning(
+        f"Invalid CHATSPACE_HOOK_VARIANT='{_HOOK_VARIANT}'. "
+        f"Valid options: {list(_HOOK_VARIANTS.keys())}. Defaulting to 'full'."
+    )
+    _HOOK_VARIANT = "full"
+logger.info(f"Activation capture hook variant: {_HOOK_VARIANT}")
+
+
 def _patch_decoder_layer_class(layer_cls: type) -> None:
     if layer_cls in _PATCHED_CLASSES:
         return
@@ -577,61 +983,20 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                 if layer_idx is None:
                     return output
 
-                # Extract hidden state (after steering)
-                hidden = _extract_hidden_from_output(output)
-                if hidden is None or hidden.dim() != 2:
-                    return output
+                # Dispatch to selected hook variant
+                hook_fn = _HOOK_VARIANTS[_HOOK_VARIANT]
 
-                # For each request in the batch that wants this layer
-                start_idx = 0
-                for i, req_id in enumerate(request_ids):
-                    if req_id not in state.active_capture_requests:
-                        # Skip this request, advance index
-                        if seq_lens and i < len(seq_lens):
-                            start_idx += seq_lens[i]
-                        continue
-
-                    if layer_idx not in state.active_capture_requests[req_id]:
-                        # This request doesn't want this layer
-                        if seq_lens and i < len(seq_lens):
-                            start_idx += seq_lens[i]
-                        continue
-
-                    # Determine slice for this request
-                    if seq_lens and i < len(seq_lens):
-                        seq_len = seq_lens[i]
-                        end_idx = start_idx + seq_len
-                        req_hidden = hidden[start_idx:end_idx]
-                        start_idx = end_idx
-                    else:
-                        # No seq_lens available, assume single request owns full batch
-                        req_hidden = hidden
-
-                    # Determine phase
-                    req_seq_len = req_hidden.shape[0]
-                    phase = "prefill" if req_seq_len > 1 else "decode"
-                    last_phase = state.request_last_phase.get(req_id, "prefill")
-
-                    if phase == "prefill":
-                        # Buffer chunks during prefill
-                        state.request_prefill_buffers[req_id][layer_idx].append(
-                            req_hidden.detach().clone()
-                        )
-                    else:
-                        # Coalesce prefill when transitioning to decode
-                        if last_phase == "prefill":
-                            _coalesce_prefill_chunks(state, req_id)
-
-                        # Append decode token
-                        if layer_idx in state.request_captures[req_id]:
-                            existing = state.request_captures[req_id][layer_idx]
-                            state.request_captures[req_id][layer_idx] = torch.cat(
-                                [existing, req_hidden.detach().clone()], dim=0
-                            )
-                        else:
-                            state.request_captures[req_id][layer_idx] = req_hidden.detach().clone()
-
-                    state.request_last_phase[req_id] = phase
+                # For noop_notiming, skip extraction entirely to measure pure metadata overhead
+                if _HOOK_VARIANT == "noop_notiming":
+                    # Pass dummy tensor - hook doesn't use it anyway
+                    dummy = output[0] if isinstance(output, (tuple, list)) else output
+                    hook_fn(state, layer_idx, dummy, request_ids, seq_lens)
+                else:
+                    # Extract hidden state (after steering)
+                    hidden = _extract_hidden_from_output(output)
+                    if hidden is None or hidden.dim() != 2:
+                        return output
+                    hook_fn(state, layer_idx, hidden, request_ids, seq_lens)
         except Exception:  # pragma: no cover - graceful degradation
             pass
 
@@ -856,6 +1221,9 @@ def _record_step_context(
 
 def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
     """Patch GPUModelRunner.execute_model to capture per-step batch metadata."""
+    if not _CAPTURE_METADATA_ENABLED:
+        logger.info("CHATSPACE_CAPTURE_METADATA=0; skipping model runner patch.")
+        return
     model_runner = worker.model_runner
     logger.info(
         f"_patch_model_runner: model_runner type={type(model_runner).__name__}, "
@@ -881,6 +1249,8 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
 
     def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
         """Intercept execute_model to capture batch metadata."""
+        if not state.active_capture_requests:
+            return original_execute(model_input, *args, **kwargs)
         logger.debug(
             f"patched_execute_model called: model_input type={type(model_input).__name__}, "
             f"has scheduled_new_reqs={hasattr(model_input, 'scheduled_new_reqs')}, "
@@ -1303,6 +1673,8 @@ def register_capture_request(
     worker: Any, request_id: str, layer_indices: list[int]
 ) -> None:
     """Register request and prepare buffers for per-request capture."""
+    if not layer_indices:
+        return
     state = _ensure_state(worker)
     logger.debug(f"register_capture_request: request_id={request_id}, layer_indices={layer_indices}")
     state.active_capture_requests[request_id] = set(layer_indices)
@@ -1348,27 +1720,105 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
     dict[str, dict[int, Any]]
         Mapping of request_id to layer captures. Each capture is a serialized tensor.
     """
+    import time
+
     state = _ensure_state(worker)
     result: dict[str, dict[int, Any]] = {}
 
-    for req_id in request_ids:
-        # Coalesce any prefill chunks
-        _coalesce_prefill_chunks(state, req_id)
+    # Timing accumulators
+    total_coalesce_time = 0.0
+    total_numpy_time = 0.0
+    total_bytes = 0
+    layer_count = 0
 
-        # Serialize captures
-        captures = state.request_captures.pop(req_id, {})
-        serialized = {
-            layer_idx: serialize_tensor(tensor)
-            for layer_idx, tensor in captures.items()
-        }
+    profiling_metadata: dict[str, Any] = {
+        "request_count": len(request_ids),
+        "device": str(state.device),
+    }
 
-        # Cleanup
-        state.active_capture_requests.pop(req_id, None)
-        state.request_prefill_buffers.pop(req_id, None)
-        state.request_last_phase.pop(req_id, None)
-        state.request_token_counts.pop(req_id, None)
+    with _profile_fetch_batch(state, profiling_metadata) as profiler:
+        for req_id in request_ids:
+            # Time coalescing
+            t_coalesce_start = time.perf_counter()
+            _coalesce_prefill_chunks(state, req_id)
+            total_coalesce_time += time.perf_counter() - t_coalesce_start
 
-        result[req_id] = serialized
+            # Serialize captures with detailed timing
+            captures = state.request_captures.pop(req_id, {})
+            serialized = {}
+
+            for layer_idx, tensor in captures.items():
+                layer_count += 1
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                total_bytes += tensor_bytes
+
+                cpu_tensor = tensor.detach().cpu().contiguous()
+
+                # Time numpy serialization
+                t_numpy_start = time.perf_counter()
+                dtype_name = str(cpu_tensor.dtype).removeprefix("torch.")
+                storage = cpu_tensor
+                storage_dtype_name = dtype_name
+                if cpu_tensor.numel() == 0:
+                    buffer = b""
+                else:
+                    try:
+                        buffer = storage.numpy().tobytes()
+                    except TypeError:
+                        storage = cpu_tensor.to(dtype=torch.float32)
+                        storage_dtype_name = str(storage.dtype).removeprefix("torch.")
+                        buffer = storage.numpy().tobytes()
+                total_numpy_time += time.perf_counter() - t_numpy_start
+
+                payload: dict[str, Any] = {
+                    "dtype": dtype_name,
+                    "shape": list(cpu_tensor.shape),
+                    "data": buffer,
+                    "encoding": "bytes",
+                }
+                if storage_dtype_name != dtype_name:
+                    payload["storage_dtype"] = storage_dtype_name
+
+                serialized[layer_idx] = payload
+
+            # Cleanup
+            state.active_capture_requests.pop(req_id, None)
+            state.request_prefill_buffers.pop(req_id, None)
+            state.request_last_phase.pop(req_id, None)
+            state.request_token_counts.pop(req_id, None)
+
+            result[req_id] = serialized
+
+        # Populate profiling metadata for summary/logging
+        profiling_metadata["layer_count"] = layer_count
+        profiling_metadata["total_bytes"] = total_bytes
+        profiling_metadata["total_numpy_time_s"] = total_numpy_time
+        profiling_metadata["total_coalesce_time_s"] = total_coalesce_time
+
+    profile_summary = (
+        getattr(profiler, "_chatspace_summary", None) if profiler is not None else None
+    )
+    transfer_cuda_s = (
+        float(profile_summary.get("transfer_cuda_s", 0.0))
+        if profile_summary
+        else 0.0
+    )
+
+    # Log detailed timing breakdown
+    if layer_count > 0:
+        total_mb = total_bytes / (1024 * 1024)
+        log_parts = [
+            f"Requests={len(request_ids)}",
+            f"Layers={layer_count}",
+            f"Data={total_mb:.1f}MB",
+            f"Coalesce={total_coalesce_time:.4f}s",
+            f"NumPy={total_numpy_time:.4f}s",
+        ]
+        if transfer_cuda_s > 0.0:
+            log_parts.append(f"GPU→CPU(cuda)={transfer_cuda_s:.4f}s")
+            if total_mb > 0:
+                log_parts.append(f"Transfer rate={total_mb/transfer_cuda_s:.1f}MB/s")
+        logger.info("[Fetch Timing] " + ", ".join(log_parts))
 
     return result
 
@@ -1381,6 +1831,15 @@ def unregister_capture_request(worker: Any, request_id: str) -> None:
     state.request_prefill_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
+
+
+def fetch_last_profile(worker: Any) -> dict[str, Any]:
+    """Return the most recent torch profiler summary, if available."""
+    state = _ensure_state(worker)
+    summary = state.last_fetch_profile
+    if summary is None:
+        return {}
+    return summary
 
 
 for _rpc_fn in (
@@ -1398,6 +1857,7 @@ for _rpc_fn in (
     register_capture_request,
     fetch_request_activations,
     fetch_batch_captures,
+    fetch_last_profile,
     unregister_capture_request,
 ):
     _register_rpc(_rpc_fn.__name__, _rpc_fn)

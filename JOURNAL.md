@@ -1173,3 +1173,25 @@ captures = handles[0].captures[4]  # layer 4
 4. Update any external documentation/examples
 
 **Commit:** [pending]
+
+---
+
+## 2025-10-30
+
+### Activation Capture Metadata Overhead Optimization
+
+**Timestamp:** 2025-10-30 UTC
+
+Added early-exit guards to skip metadata extraction machinery when capture is not active:
+
+**Changes:**
+1. `CHATSPACE_CAPTURE_METADATA` environment flag to disable model runner patching entirely
+2. Early return in `register_capture_request()` when `layer_indices` is empty
+3. Early return in `patched_execute_model()` when no active capture requests
+4. Added profiling infrastructure for fetch operations (`CHATSPACE_PROFILE_FETCH`)
+
+**Results (batch=32, prefill=512, decode=128):**
+- Zero-layer capture: 169s → 86.2s (matches baseline)
+- All-layer capture generation: 175s → 125s (+159% → +41% overhead)
+
+**Open question:** All-layer case improved unexpectedly (175s→125s) despite optimization targeting zero-layer case. Need isolated profiling with separate Python invocations per config to avoid cross-contamination and understand true overhead sources.

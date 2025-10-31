@@ -1331,3 +1331,8 @@ class VLLMSteerModel(SteerableModel):
             worker_vectors.append(worker_map)
         return worker_vectors
 
+    async def fetch_last_profiler_summaries(self) -> list[dict[str, Any]]:
+        """Retrieve the most recent torch profiler summaries from each worker."""
+        await self._ensure_engine_initialized()
+        payloads = await self._collective_rpc("fetch_last_profile")
+        return payloads
