@@ -284,6 +284,7 @@ class _SteeringState:
     active_capture_requests: dict[str, set[int]] = None  # request_id -> layer indices
     request_captures: dict[str, dict[int, torch.Tensor]] = None  # request_id -> layer -> tensor
     request_prefill_buffers: dict[str, dict[int, list[torch.Tensor]]] = None  # request_id -> layer -> chunks
+    request_decode_buffers: dict[str, dict[int, list[torch.Tensor]]] = None  # request_id -> layer -> decode tokens
     request_last_phase: dict[str, str] = None  # request_id -> "prefill" or "decode"
     request_token_counts: dict[str, int] = None  # request_id -> token count
 
@@ -878,16 +879,20 @@ def _capture_hook_full(
                 _coalesce_prefill_chunks(state, req_id)
                 state.request_last_phase[req_id] = "decode"
 
-            # Append decode token (cached layer dict reference)
-            req_captures = state.request_captures[req_id]
-            if layer_idx in req_captures:
-                # Avoid repeated dict lookup - use cached ref
-                existing = req_captures[layer_idx]
-                req_captures[layer_idx] = torch.cat(
-                    [existing, req_hidden.detach().clone()], dim=0
-                )
-            else:
-                req_captures[layer_idx] = req_hidden.detach().clone()
+            # Buffer decode tokens to reduce concatenation overhead
+            decode_buf = state.request_decode_buffers[req_id][layer_idx]
+            decode_buf.append(req_hidden.detach().clone())
+
+            # Flush buffer every 32 tokens to reduce cat operations
+            if len(decode_buf) >= 32:
+                batched = torch.cat(decode_buf, dim=0)
+                decode_buf.clear()
+
+                req_captures = state.request_captures[req_id]
+                if layer_idx in req_captures:
+                    req_captures[layer_idx] = torch.cat([req_captures[layer_idx], batched], dim=0)
+                else:
+                    req_captures[layer_idx] = batched
 
 
 # Hook variant registry
@@ -1365,6 +1370,7 @@ def initialize_worker_state(
         active_capture_requests={},
         request_captures={},
         request_prefill_buffers={},
+        request_decode_buffers={},
         request_last_phase={},
         request_token_counts={},
         step_metadata={},
@@ -1662,6 +1668,28 @@ def _coalesce_prefill_chunks(state: _SteeringState, request_id: str) -> None:
         chunks.clear()
 
 
+def _flush_decode_buffers(state: _SteeringState, request_id: str) -> None:
+    """Flush any remaining decode tokens from buffers into final captures."""
+    if request_id not in state.request_decode_buffers:
+        return
+
+    decode_buffers = state.request_decode_buffers[request_id]
+    for layer_idx, decode_buf in decode_buffers.items():
+        if not decode_buf:
+            continue
+
+        # Concatenate buffered decode tokens
+        batched = torch.cat(decode_buf, dim=0) if len(decode_buf) > 1 else decode_buf[0]
+        decode_buf.clear()
+
+        # Append to existing captures or create new
+        req_captures = state.request_captures[request_id]
+        if layer_idx in req_captures:
+            req_captures[layer_idx] = torch.cat([req_captures[layer_idx], batched], dim=0)
+        else:
+            req_captures[layer_idx] = batched
+
+
 def register_capture_request(
     worker: Any, request_id: str, layer_indices: list[int]
 ) -> None:
@@ -1673,6 +1701,7 @@ def register_capture_request(
     state.active_capture_requests[request_id] = set(layer_indices)
     state.request_captures[request_id] = {}
     state.request_prefill_buffers[request_id] = {idx: [] for idx in layer_indices}
+    state.request_decode_buffers[request_id] = {idx: [] for idx in layer_indices}
     state.request_last_phase[request_id] = "prefill"
     state.request_token_counts[request_id] = 0
 
@@ -1734,6 +1763,7 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             # Time coalescing
             t_coalesce_start = time.perf_counter()
             _coalesce_prefill_chunks(state, req_id)
+            _flush_decode_buffers(state, req_id)  # Flush remaining decode tokens
             total_coalesce_time += time.perf_counter() - t_coalesce_start
 
             # Serialize captures with detailed timing
@@ -1822,6 +1852,7 @@ def unregister_capture_request(worker: Any, request_id: str) -> None:
     state.request_captures.pop(request_id, None)
     state.active_capture_requests.pop(request_id, None)
     state.request_prefill_buffers.pop(request_id, None)
+    state.request_decode_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
 
