@@ -49,7 +49,7 @@ async def test_tp_additive_steering_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -80,7 +80,7 @@ async def test_tp_additive_steering_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
@@ -137,7 +137,7 @@ async def test_tp_projection_cap_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -164,7 +164,7 @@ async def test_tp_projection_cap_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
@@ -205,7 +205,7 @@ async def test_tp_ablation_matches_single_gpu():
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_single = VLLMSteerModel(cfg_single, enforce_eager=True, bootstrap_layers=(target_layer,))
     hidden_size = model_single.hidden_size
@@ -232,7 +232,7 @@ async def test_tp_ablation_matches_single_gpu():
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,
         max_model_len=128,
-        dtype="float16",
+        dtype="float32",
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
