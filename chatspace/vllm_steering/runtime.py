@@ -1697,6 +1697,11 @@ def register_capture_request(
     if not layer_indices:
         return
     state = _ensure_state(worker)
+
+    # Ensure decode buffers dict exists (migration from older state)
+    if not hasattr(state, 'request_decode_buffers') or state.request_decode_buffers is None:
+        state.request_decode_buffers = {}
+
     logger.debug(f"register_capture_request: request_id={request_id}, layer_indices={layer_indices}")
     state.active_capture_requests[request_id] = set(layer_indices)
     state.request_captures[request_id] = {}
