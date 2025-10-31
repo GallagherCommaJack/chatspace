@@ -599,3 +599,149 @@ async def test_chat_raw_output_with_captures():
     assert target_layer in handles[0].captures
 
     del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+@pytest.mark.asyncio
+async def test_chat_assistant_prefill():
+    """Test assistant response prefilling using continue_final_message."""
+    cfg = VLLMSteeringConfig(
+        model_name="Qwen/Qwen3-0.6B",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=128,
+    )
+
+    try:
+        model = VLLMSteerModel(cfg, enforce_eager=True)
+    except OSError as exc:  # pragma: no cover
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    # Test JSON format prefilling
+    prefill_text = '{"answer": "'
+    messages = [
+        {"role": "user", "content": "What is 2+2? Answer in JSON format."},
+        {"role": "assistant", "content": prefill_text},  # Partial assistant response
+    ]
+    sampling = SamplingParams(temperature=0.0, max_tokens=10)
+
+    # Use chat_options to enable prefill mode
+    responses = await model.chat(
+        messages,
+        sampling_params=sampling,
+        chat_options={
+            "add_generation_prompt": False,  # Required when continuing
+            "continue_final_message": True,   # Enable prefill mode
+        },
+    )
+
+    # Verify response (vLLM returns only the generated text, not the prefill)
+    assert len(responses) == 1, "Expected one response"
+    response = responses[0]
+    assert isinstance(response, str), "Response should be a string"
+    assert len(response) > 0, "Response should contain generated text"
+
+    # When continuing from prefill, full response should include both
+    # Note: vLLM's .text only contains generated tokens, so prepend manually
+    full_response = prefill_text + response
+
+    # Verify the full response looks like valid JSON
+    assert full_response.startswith('{"answer":'), (
+        f"Full response should look like JSON. Got: {full_response}"
+    )
+
+    # Verify it contains a closing quote after the generated content
+    assert '"' in response, "Generated text should contain at least a closing quote"
+
+    # Test with reasoning block prefill
+    reasoning_prefill = "<think>\n"
+    messages_with_reasoning = [
+        {"role": "user", "content": "Solve this step by step: What is 5*6?"},
+        {"role": "assistant", "content": reasoning_prefill},
+    ]
+
+    responses_reasoning = await model.chat(
+        messages_with_reasoning,
+        sampling_params=sampling,
+        chat_options={
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+        },
+    )
+
+    # Verify reasoning response (again, vLLM returns only generated text)
+    assert len(responses_reasoning) == 1
+    reasoning_response = responses_reasoning[0]
+    assert len(reasoning_response) > 0, "Should have generated reasoning content"
+
+    # Full reasoning would be prefill + generated
+    full_reasoning = reasoning_prefill + reasoning_response
+    assert full_reasoning.startswith("<think>"), "Should start with think tag"
+
+    del model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
+@pytest.mark.asyncio
+async def test_chat_assistant_prefill_with_capture():
+    """Test that message boundaries work correctly with assistant prefill."""
+    cfg = VLLMSteeringConfig(
+        model_name="Qwen/Qwen3-0.6B",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.05,
+        max_model_len=128,
+    )
+
+    target_layer = 2
+
+    try:
+        model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
+    except OSError as exc:  # pragma: no cover
+        pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
+
+    prefill_text = "Sure, "
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": prefill_text},
+    ]
+    sampling = SamplingParams(temperature=0.0, max_tokens=5)
+
+    # Generate with capture and prefill
+    responses, handles = await model.chat(
+        messages,
+        sampling_params=sampling,
+        capture_layers=target_layer,
+        chat_options={
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+        },
+    )
+
+    # Verify response (vLLM returns only generated text, not prefill)
+    assert len(responses) == 1
+    assert len(responses[0]) > 0, "Should have generated text"
+
+    # Verify message boundaries
+    await model.fetch_captures_batch(handles)
+    handle = handles[0]
+
+    assert handle.message_boundaries is not None, "Should have message boundaries"
+    assert len(handle.message_boundaries) == 2, "Expected two message boundaries"
+
+    # Verify both messages are tracked
+    assert handle.message_boundaries[0].role == "user"
+    assert handle.message_boundaries[0].content == "Hello"
+    assert handle.message_boundaries[1].role == "assistant"
+    assert handle.message_boundaries[1].content == prefill_text
+
+    # Verify activations can be extracted for both messages
+    user_acts = handle.get_message_activations(0, target_layer)
+    assistant_acts = handle.get_message_activations(1, target_layer)
+
+    assert user_acts.shape[1] == model.hidden_size
+    assert assistant_acts.shape[1] == model.hidden_size
+
+    # Assistant prefill should have some tokens
+    assert assistant_acts.shape[0] > 0, "Assistant prefill should have tokens"
+
+    del model

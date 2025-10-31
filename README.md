@@ -880,23 +880,43 @@ responses = await model.chat(
 )
 ```
 
-**Reasoning block prefilling (for hybrid models):**
+**Assistant response prefilling:**
 
 ```python
-# Inject empty reasoning block before generation
-responses = await model.chat(
-    messages,
-    sampling_params=sampling,
-    prefill_assistant=True,  # Adds <think>\n\n</think>\n\n
-)
+# Guide the model's response format by prefilling assistant content
+prefill = '{"explanation": "'
+messages = [
+    {"role": "user", "content": "Explain quantum computing in JSON format"},
+    {"role": "assistant", "content": prefill}  # Partial response
+]
 
-# Custom reasoning prefix
 responses = await model.chat(
     messages,
     sampling_params=sampling,
-    prefill_assistant="<think>\nLet me think about this...\n</think>\n",
+    chat_options={
+        "add_generation_prompt": False,  # Required when continuing
+        "continue_final_message": True,   # Enable prefill mode
+    },
 )
-# The prefix is automatically stripped from outputs
+# Note: responses[0] contains only the generated text (e.g., 'Quantum computing uses..."')
+# For the full assistant message, prepend the prefill: prefill + responses[0]
+
+# Force reasoning blocks (for hybrid models like Qwen)
+reasoning_prefill = "<think>\n"
+messages_with_reasoning = [
+    {"role": "user", "content": "Solve this problem step by step"},
+    {"role": "assistant", "content": reasoning_prefill}  # Start reasoning block
+]
+
+responses = await model.chat(
+    messages_with_reasoning,
+    sampling_params=sampling,
+    chat_options={
+        "add_generation_prompt": False,
+        "continue_final_message": True,
+    },
+)
+# Model continues with reasoning content, full output: reasoning_prefill + responses[0]
 ```
 
 **Accessing token-level details:**
