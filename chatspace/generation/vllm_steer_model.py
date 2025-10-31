@@ -921,6 +921,7 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
+        capture_layers: None = None,
         raw_output: Literal[False] = False,
         **sampling_kwargs: Any,
     ) -> list[str]: ...
@@ -934,9 +935,38 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
+        capture_layers: None = None,
         raw_output: Literal[True] = True,
         **sampling_kwargs: Any,
     ) -> list[Any]: ...  # RequestOutput not imported, use Any
+
+    @overload
+    async def chat(
+        self,
+        messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        use_tqdm: bool = False,
+        chat_options: dict[str, Any] | None = None,
+        prefill_assistant: str | bool | None = None,
+        capture_layers: int | Sequence[int],
+        raw_output: Literal[False] = False,
+        **sampling_kwargs: Any,
+    ) -> tuple[list[str], list[CaptureHandle]]: ...
+
+    @overload
+    async def chat(
+        self,
+        messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        use_tqdm: bool = False,
+        chat_options: dict[str, Any] | None = None,
+        prefill_assistant: str | bool | None = None,
+        capture_layers: int | Sequence[int],
+        raw_output: Literal[True] = True,
+        **sampling_kwargs: Any,
+    ) -> tuple[list[Any], list[CaptureHandle]]: ...
 
     async def chat(
         self,
@@ -946,10 +976,11 @@ class VLLMSteerModel(SteerableModel):
         use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         prefill_assistant: str | bool | None = None,
+        capture_layers: int | Sequence[int] | None = None,
         raw_output: bool = False,
         **sampling_kwargs: Any,
-    ) -> list[str] | list[Any]:
-        """Execute chat-style generation with optional sampling overrides.
+    ) -> list[str] | list[Any] | tuple[list[str], list[CaptureHandle]] | tuple[list[Any], list[CaptureHandle]]:
+        """Execute chat-style generation with optional sampling overrides and activation capture.
 
         Parameters
         ----------
@@ -973,12 +1004,22 @@ class VLLMSteerModel(SteerableModel):
             are normalized to match template formatting. The helper automatically
             strips the prefix (including the sentinel) from returned outputs. Set
             to ``None`` or ``False`` to disable prefilling.
+        capture_layers : int | Sequence[int] | None
+            Layer indices to capture activations from. If provided, returns
+            (texts, handles) instead of just texts.
         raw_output : bool
             If True, return full RequestOutput objects with token IDs and logprobs.
             If False (default), return just the generated text strings.
         **sampling_kwargs : Any
             Keyword arguments used to build a ``SamplingParams`` instance when
             ``sampling_params`` is not supplied.
+
+        Returns
+        -------
+        list[str] if capture_layers is None and raw_output is False
+        tuple[list[str], list[CaptureHandle]] if capture_layers is not None and raw_output is False
+        list[RequestOutput] if capture_layers is None and raw_output is True
+        tuple[list[RequestOutput], list[CaptureHandle]] if capture_layers is not None and raw_output is True
         """
         if sampling_params is None:
             sampling_params = SamplingParams(**sampling_kwargs)
@@ -1048,41 +1089,73 @@ class VLLMSteerModel(SteerableModel):
 
         await self._ensure_engine_initialized()
 
-        # Convert messages to prompts using tokenizer's chat template
-        import uuid
-        results: list[str] | list[Any] = []
+        # Acquire read lock for the duration of generation
+        # This prevents steering changes while requests are in flight
+        async with self._steering_rwlock.read_lock():
+            # Setup capture if requested
+            handles: list[CaptureHandle] | None = None
+            if capture_layers is not None:
+                # Convert to tuple
+                if isinstance(capture_layers, int):
+                    layers_tuple = (capture_layers,)
+                else:
+                    layers_tuple = tuple(capture_layers)
 
-        for messages_conv in prepared_messages:
-            # Apply chat template to convert messages to prompt string
-            prompt = self.tokenizer.apply_chat_template(
-                messages_conv,
-                tokenize=False,
-                **chat_kwargs,
-            )
+                # Register captures for each conversation
+                handles = []
+                for i in range(len(prepared_messages)):
+                    import uuid
+                    req_id = f"chat_capture_{uuid.uuid4().hex}"
+                    await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
+                    handle = CaptureHandle(
+                        request_id=req_id,
+                        layer_indices=layers_tuple,
+                        _model=self,
+                    )
+                    handles.append(handle)
 
-            # Generate using the formatted prompt
-            request_id = f"chat_{uuid.uuid4().hex}"
-            final_output = None
+            # Convert messages to prompts using tokenizer's chat template
+            import uuid
+            results: list[str] | list[Any] = []
 
-            async for output in self._engine.generate(
-                prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            ):
-                final_output = output
+            for i, messages_conv in enumerate(prepared_messages):
+                # Apply chat template to convert messages to prompt string
+                prompt = self.tokenizer.apply_chat_template(
+                    messages_conv,
+                    tokenize=False,
+                    **chat_kwargs,
+                )
 
-            if final_output is None:
-                raise RuntimeError("No output from chat")
+                # Use capture request_id if capturing, otherwise random
+                if handles:
+                    request_id = handles[i].request_id
+                else:
+                    request_id = f"chat_{uuid.uuid4().hex}"
 
-            if raw_output:
-                results.append(final_output)
+                final_output = None
+                async for output in self._engine.generate(
+                    prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                ):
+                    final_output = output
+
+                if final_output is None:
+                    raise RuntimeError("No output from chat")
+
+                if raw_output:
+                    results.append(final_output)
+                else:
+                    text = final_output.outputs[0].text
+                    if trim_prefix and text.startswith(trim_prefix):
+                        text = text[len(trim_prefix) :].lstrip()
+                    results.append(text)
+
+            # Return with or without handles
+            if handles:
+                return results, handles
             else:
-                text = final_output.outputs[0].text
-                if trim_prefix and text.startswith(trim_prefix):
-                    text = text[len(trim_prefix) :].lstrip()
-                results.append(text)
-
-        return results
+                return results
 
 
     # ------------------------------------------------------------------

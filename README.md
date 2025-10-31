@@ -259,7 +259,11 @@ await model.clear_layer_ablation(8)
 
 Capture hidden states during generation for analysis, interpretability research, and debugging.
 
+Both the `generate()` and `chat()` APIs support activation capture through the `capture_layers` parameter.
+
 ### Basic Usage
+
+**Using `generate()` with raw prompts:**
 
 ```python
 # Capture activations from layers 2, 4, 6
@@ -281,6 +285,52 @@ for i, handle in enumerate(handles):
         captures = handle.captures[layer_idx]
         hidden = captures[0]["hidden"]  # [seq_len, hidden_size]
         print(f"  Layer {layer_idx}: {hidden.shape}")
+```
+
+**Using `chat()` with conversation messages:**
+
+```python
+# Capture activations from chat-style generation
+messages = [
+    {"role": "user", "content": "What is 2+2?"}
+]
+
+responses, handles = await model.chat(
+    messages,
+    sampling_params=sampling,
+    capture_layers=[2, 4, 6],
+)
+
+# Fetch captures
+await model.fetch_captures_batch(handles)
+
+# Access captures
+for layer_idx in handles[0].layer_indices:
+    hidden = handles[0].captures[layer_idx][0]["hidden"]
+    print(f"Layer {layer_idx}: {hidden.shape}")
+```
+
+**Batch chat with captures:**
+
+```python
+# Multiple conversations with capture
+conversations = [
+    [{"role": "user", "content": "What is 2+2?"}],
+    [{"role": "user", "content": "Explain quantum computing."}],
+    [{"role": "user", "content": "Write a haiku."}],
+]
+
+responses, handles = await model.chat(
+    conversations,
+    sampling_params=sampling,
+    capture_layers=[4],
+)
+
+await model.fetch_captures_batch(handles)
+
+for i, (response, handle) in enumerate(zip(responses, handles)):
+    hidden = handle.captures[4][0]["hidden"]
+    print(f"Conversation {i}: {hidden.shape[0]} tokens captured")
 ```
 
 ### Capture Format and Behavior
@@ -334,6 +384,8 @@ last_captured = decode_acts[-1]   # Last captured token (second-to-last generate
 
 ### Analyzing Steering Effects
 
+**Using `generate()`:**
+
 ```python
 import torch.nn.functional as F
 
@@ -373,7 +425,48 @@ for i in range(min(5, baseline_acts.shape[0])):
     print(f"Token {i} cosine similarity: {cos_sim:.6f}")
 ```
 
+**Using `chat()`:**
+
+```python
+import torch.nn.functional as F
+
+messages = [
+    {"role": "user", "content": "Explain the concept of recursion."}
+]
+
+# Capture baseline (no steering)
+baseline_resp, baseline_handles = await model.chat(
+    messages,
+    sampling_params=sampling,
+    capture_layers=[4],
+)
+await model.fetch_captures_batch(baseline_handles)
+baseline_acts = baseline_handles[0].captures[4][0]["hidden"]
+
+# Apply steering
+steering_vec = torch.randn(model.hidden_size) * 50.0
+await model.set_layer_vector(4, steering_vec)
+
+# Capture with steering
+steered_resp, steered_handles = await model.chat(
+    messages,
+    sampling_params=sampling,
+    capture_layers=[4],
+)
+await model.fetch_captures_batch(steered_handles)
+steered_acts = steered_handles[0].captures[4][0]["hidden"]
+
+# Compare activations
+delta = steered_acts - baseline_acts
+print(f"Baseline response: {baseline_resp[0][:100]}...")
+print(f"Steered response: {steered_resp[0][:100]}...")
+print(f"Mean activation Δ: {delta.mean().item():.4f}")
+print(f"Max activation Δ: {delta.abs().max().item():.4f}")
+```
+
 ### Concurrent Capture (Isolation)
+
+**Using `generate()` with concurrent tasks:**
 
 ```python
 import asyncio
@@ -415,6 +508,36 @@ async def analyze_multiple_prompts():
 
 # Run concurrent analysis
 await analyze_multiple_prompts()
+```
+
+**Using `chat()` with batch conversations:**
+
+```python
+# Capture multiple conversations in a single batch
+conversations = [
+    [{"role": "user", "content": "What is the capital of France?"}],
+    [{"role": "user", "content": "Explain quantum computing."}],
+    [{"role": "user", "content": "Write a haiku about programming."}],
+]
+
+# Single call handles all conversations
+responses, handles = await model.chat(
+    conversations,
+    sampling_params=sampling,
+    capture_layers=[2, 4, 6],
+)
+
+# Fetch all captures at once
+await model.fetch_captures_batch(handles)
+
+# Analyze each conversation's captures
+for i, (response, handle) in enumerate(zip(responses, handles)):
+    print(f"\nConversation {i}:")
+    print(f"Response: {response[:50]}...")
+    for layer in [2, 4, 6]:
+        hidden = handle.captures[layer][0]["hidden"]
+        norm = torch.norm(hidden, dim=-1).mean().item()
+        print(f"  Layer {layer}: mean norm = {norm:.4f}")
 ```
 
 ### Multi-Layer Analysis
