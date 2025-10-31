@@ -213,6 +213,33 @@ class LayerSteeringSpec:
 
 
 @dataclass
+class MessageBoundary:
+    """Token boundary information for a single message in a chat conversation.
+
+    Attributes
+    ----------
+    role : str
+        Message role (e.g., "system", "user", "assistant").
+    content : str
+        Original message content.
+    start_token : int
+        Starting token index in the formatted prompt (inclusive).
+    end_token : int
+        Ending token index in the formatted prompt (exclusive).
+    """
+
+    role: str
+    content: str
+    start_token: int
+    end_token: int
+
+    @property
+    def num_tokens(self) -> int:
+        """Number of tokens in this message."""
+        return self.end_token - self.start_token
+
+
+@dataclass
 class CaptureHandle:
     """Handle for lazily fetching activation captures for a single request.
 
@@ -222,12 +249,16 @@ class CaptureHandle:
         Internal request identifier used for fetching captures.
     layer_indices : tuple[int, ...]
         Layer indices that were captured for this request.
+    message_boundaries : tuple[MessageBoundary, ...] | None
+        Optional message boundary information for chat-style captures.
+        When set, allows slicing activations by message via get_message_activations().
     """
 
     request_id: str
     layer_indices: tuple[int, ...]
     _model: "VLLMSteerModel" = field(repr=False)
     _captures: dict[int, list[dict[str, Any]]] | None = field(default=None, repr=False, init=False)
+    message_boundaries: tuple[MessageBoundary, ...] | None = field(default=None, repr=False)
 
     async def fetch(self) -> dict[int, list[dict[str, Any]]]:
         """Fetch captures from workers (idempotent).
@@ -257,6 +288,74 @@ class CaptureHandle:
                 "Call: await handle.fetch()"
             )
         return self._captures
+
+    def get_message_activations(
+        self,
+        message_idx: int,
+        layer_idx: int,
+        *,
+        include_generated: bool = False,
+    ) -> torch.Tensor:
+        """Get activations for a specific message from chat-style captures.
+
+        Parameters
+        ----------
+        message_idx : int
+            Index of the message in the original conversation.
+        layer_idx : int
+            Layer index to extract activations from.
+        include_generated : bool, default False
+            If True and message_idx is the last message, include generated tokens.
+            Otherwise, only return activations for the message content itself.
+
+        Returns
+        -------
+        torch.Tensor
+            Activations for the specified message, shape [num_tokens, hidden_size].
+
+        Raises
+        ------
+        RuntimeError
+            If captures haven't been fetched yet or message boundaries aren't available.
+        ValueError
+            If message_idx or layer_idx is out of range.
+        """
+        if self._captures is None:
+            raise RuntimeError(
+                f"Captures not fetched yet for request {self.request_id}. "
+                "Call: await handle.fetch() or await model.fetch_captures_batch([handle])"
+            )
+
+        if self.message_boundaries is None:
+            raise RuntimeError(
+                "Message boundaries not available for this capture. "
+                "This handle was not created from a chat() call with message tracking."
+            )
+
+        if message_idx < 0 or message_idx >= len(self.message_boundaries):
+            raise ValueError(
+                f"message_idx {message_idx} out of range [0, {len(self.message_boundaries)})"
+            )
+
+        if layer_idx not in self._captures:
+            raise ValueError(
+                f"layer_idx {layer_idx} not in captured layers: {list(self._captures.keys())}"
+            )
+
+        # Get the full concatenated tensor for this layer
+        full_hidden = self._captures[layer_idx][0]["hidden"]
+
+        # Get message boundary
+        boundary = self.message_boundaries[message_idx]
+        start = boundary.start_token
+        end = boundary.end_token
+
+        # If this is the last message and include_generated is True, extend to end of captures
+        if include_generated and message_idx == len(self.message_boundaries) - 1:
+            end = full_hidden.shape[0]
+
+        # Slice the activations
+        return full_hidden[start:end]
 
 
 @dataclass
@@ -1089,6 +1188,42 @@ class VLLMSteerModel(SteerableModel):
 
         await self._ensure_engine_initialized()
 
+        # Helper to compute message boundaries for a conversation
+        def _compute_message_boundaries(
+            messages_conv: list[dict[str, Any]],
+        ) -> tuple[MessageBoundary, ...]:
+            """Compute token boundaries for each message in the conversation."""
+            boundaries: list[MessageBoundary] = []
+            current_offset = 0
+
+            # Tokenize each message prefix to find boundaries
+            for i, msg in enumerate(messages_conv):
+                # Build partial conversation up to and including this message
+                partial_conv = messages_conv[:i+1]
+
+                # Apply chat template to get formatted text
+                partial_text = self.tokenizer.apply_chat_template(
+                    partial_conv,
+                    tokenize=False,
+                    **chat_kwargs,
+                )
+
+                # Tokenize to get total length up to this message
+                partial_tokens = self.tokenizer(partial_text, return_tensors="pt")
+                total_len = partial_tokens.input_ids.shape[1]
+
+                # This message spans from current_offset to total_len
+                boundary = MessageBoundary(
+                    role=msg.get("role", "unknown"),
+                    content=msg.get("content", ""),
+                    start_token=current_offset,
+                    end_token=total_len,
+                )
+                boundaries.append(boundary)
+                current_offset = total_len
+
+            return tuple(boundaries)
+
         # Acquire read lock for the duration of generation
         # This prevents steering changes while requests are in flight
         async with self._steering_rwlock.read_lock():
@@ -1107,10 +1242,17 @@ class VLLMSteerModel(SteerableModel):
                     import uuid
                     req_id = f"chat_capture_{uuid.uuid4().hex}"
                     await self._collective_rpc("register_capture_request", req_id, list(layers_tuple))
+
+                    # Compute message boundaries (use original messages, not prepared with prefill)
+                    # to get accurate user-visible message boundaries
+                    original_messages = batched_messages[i]
+                    message_boundaries = _compute_message_boundaries(original_messages)
+
                     handle = CaptureHandle(
                         request_id=req_id,
                         layer_indices=layers_tuple,
                         _model=self,
+                        message_boundaries=message_boundaries,
                     )
                     handles.append(handle)
 

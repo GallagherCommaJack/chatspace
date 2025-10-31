@@ -333,6 +333,48 @@ for i, (response, handle) in enumerate(zip(responses, handles)):
     print(f"Conversation {i}: {hidden.shape[0]} tokens captured")
 ```
 
+**Splitting activations by message:**
+
+```python
+# Multi-turn conversation with message-level analysis
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"},
+    {"role": "assistant", "content": "The capital of France is Paris."},
+    {"role": "user", "content": "What is its population?"},
+]
+
+responses, handles = await model.chat(
+    messages,
+    sampling_params=sampling,
+    capture_layers=[4],
+)
+
+await model.fetch_captures_batch(handles)
+handle = handles[0]
+
+# Access activations for each message separately
+for i, boundary in enumerate(handle.message_boundaries):
+    # Get activations for this specific message
+    msg_acts = handle.get_message_activations(
+        message_idx=i,
+        layer_idx=4,
+    )
+    print(f"Message {i} ({boundary.role}): {msg_acts.shape}")
+    print(f"  Content: {boundary.content[:50]}...")
+    print(f"  Tokens: {boundary.num_tokens}")
+    print(f"  Mean activation norm: {torch.norm(msg_acts, dim=-1).mean():.4f}")
+
+# Get the last user message's activations including the generated response
+last_user_idx = len(handle.message_boundaries) - 1
+full_acts = handle.get_message_activations(
+    message_idx=last_user_idx,
+    layer_idx=4,
+    include_generated=True,  # Include generated tokens
+)
+print(f"\nLast message + generated: {full_acts.shape}")
+```
+
 ### Capture Format and Behavior
 
 **Concatenated tensor format:**
@@ -380,6 +422,53 @@ print(f"Decode shape: {decode_acts.shape}")    # [generated_tokens - 1, hidden_s
 # Analyze specific tokens
 first_generated = decode_acts[0]  # First generated token's activations
 last_captured = decode_acts[-1]   # Last captured token (second-to-last generated)
+```
+
+### Comparing Messages in a Conversation
+
+```python
+import torch.nn.functional as F
+
+# Capture a multi-turn conversation
+messages = [
+    {"role": "system", "content": "You are a math tutor."},
+    {"role": "user", "content": "What is 2+2?"},
+    {"role": "assistant", "content": "2+2 equals 4."},
+    {"role": "user", "content": "What is 10*10?"},
+]
+
+responses, handles = await model.chat(
+    messages,
+    sampling_params=sampling,
+    capture_layers=[4, 8, 12],
+)
+
+await model.fetch_captures_batch(handles)
+handle = handles[0]
+
+# Compare activation patterns between the two user questions
+user_msg_indices = [i for i, b in enumerate(handle.message_boundaries) if b.role == "user"]
+
+for layer in [4, 8, 12]:
+    acts_1 = handle.get_message_activations(user_msg_indices[0], layer)
+    acts_2 = handle.get_message_activations(user_msg_indices[1], layer)
+
+    # Compute mean representations
+    mean_1 = acts_1.mean(dim=0)
+    mean_2 = acts_2.mean(dim=0)
+
+    # Cosine similarity between questions
+    cos_sim = F.cosine_similarity(mean_1.unsqueeze(0), mean_2.unsqueeze(0)).item()
+    print(f"Layer {layer} - similarity between user questions: {cos_sim:.4f}")
+
+# Analyze how system prompt affects user message processing
+system_acts = handle.get_message_activations(0, layer_idx=4)  # System message
+first_user_acts = handle.get_message_activations(1, layer_idx=4)  # First user msg
+
+print(f"\nSystem message tokens: {system_acts.shape[0]}")
+print(f"First user message tokens: {first_user_acts.shape[0]}")
+print(f"System mean norm: {torch.norm(system_acts, dim=-1).mean():.4f}")
+print(f"User mean norm: {torch.norm(first_user_acts, dim=-1).mean():.4f}")
 ```
 
 ### Analyzing Steering Effects
