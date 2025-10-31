@@ -1,5 +1,78 @@
 # Engineering Journal
 
+## 2025-10-31
+
+### Async Fetch Optimization - Streaming GPU→CPU Transfers
+
+**Timestamp:** 2025-10-31 02:22 UTC
+
+Implemented two-phase async fetch optimization to eliminate GPU→CPU transfer bottleneck during activation capture. Achieved **1.67x fetch speedup** through streaming transfers during generation.
+
+**Motivation:**
+- Fetch latency was ~5s for all-layer capture (5.3GB at ~1 GB/s)
+- Transfer happens synchronously after generation completes
+- Want transfers to overlap with generation for minimal user-facing latency
+
+**Two-Phase Implementation:**
+
+**Phase 1: Non-blocking Batch Transfers**
+- Added CUDA stream infrastructure to `_SteeringState`
+- Initialize dedicated transfer stream in `initialize_worker_state()`
+- Modified `fetch_batch_captures()` to use non-blocking transfers:
+  1. Coalesce all captures
+  2. Start all GPU→CPU transfers with `.to('cpu', non_blocking=True)`
+  3. Batch synchronize all events before serialization
+  4. Serialize transferred tensors
+- **Result:** 1.19x speedup (4.97s → 4.19s)
+
+**Phase 2: Streaming During Generation** (Major win)
+- Added `request_pending_transfers` dict to track in-flight transfers
+- Modified decode buffer flush (every 32 tokens) to start async transfer immediately
+- Modified `fetch_batch_captures()` to:
+  - Collect pre-transferred data from `request_pending_transfers`
+  - Only transfer remaining data (< 32 tokens that didn't reach flush threshold)
+  - Synchronize all events before serialization
+- **Result:** 1.67x speedup vs baseline (4.97s → 2.99s)
+- **Additional gain:** 1.40x over Phase 1
+
+**Benchmark Results** (all-layers, iterations 2-3 steady state):
+```
+Baseline:  Gen=99.3s, Fetch=4.97s
+Phase 1:   Gen=42.6s, Fetch=4.19s  (1.19x fetch speedup)
+Phase 2:   Gen=42.1s, Fetch=2.99s  (1.67x fetch speedup)
+```
+
+**Key Insights:**
+- Phase 1 modest (16%) because still blocking at sync point
+- Phase 2 major win (40%) because transfers complete during generation
+- For 128 decode tokens, 4 flushes at 32-token intervals
+- By fetch time, ~125 tokens already transferred, only ~3 remaining
+- Synchronization overhead minimal when data already transferred
+
+**Implementation Details:**
+- Used `torch.cuda.Stream` for async transfers
+- `torch.cuda.Event` for synchronization tracking
+- Migration checks ensure backward compatibility
+- Cleanup in both `fetch_batch_captures()` and `unregister_capture_request()`
+
+**Testing:**
+- ✅ Comprehensive integration test passed (27.35s)
+- ✅ No regressions in capture functionality
+- ✅ No regressions in concurrent generation
+- ✅ HuggingFace parity maintained
+
+**Files Modified:**
+- `chatspace/vllm_steering/runtime.py`: All async transfer logic
+- Added fields: `transfer_stream`, `request_pending_transfers`
+- Modified: `_flush_decode_buffers()`, `fetch_batch_captures()`, capture hook
+
+**Branch:** `async-fetch-optimization`
+
+**Commits:**
+- `2c544f4`: Phase 1 non-blocking batch transfers
+- `58b2821`: Fix API (use `.to('cpu')` not `.cpu(non_blocking=True)`)
+- `677d589`: Phase 2 streaming transfers during generation
+
 ## 2025-10-29
 
 ### RWLock for vLLM Steering and Comprehensive Integration Test
