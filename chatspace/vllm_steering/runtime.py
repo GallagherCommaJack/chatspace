@@ -1764,6 +1764,8 @@ def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
 
     # Coalesce any remaining prefill chunks
     _coalesce_prefill_chunks(state, request_id)
+    # Flush any remaining decode buffers
+    _flush_decode_buffers(state, request_id)
 
     # Serialize captures
     captures = state.request_captures.pop(request_id, {})
@@ -1775,6 +1777,8 @@ def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
     # Cleanup
     state.active_capture_requests.pop(request_id, None)
     state.request_prefill_buffers.pop(request_id, None)
+    if state.request_decode_buffers is not None:
+        state.request_decode_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
 
