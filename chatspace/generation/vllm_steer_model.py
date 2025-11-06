@@ -22,11 +22,16 @@ from __future__ import annotations
 
 import math
 import asyncio
+import os
+import weakref
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Literal, Sequence, cast, overload
 import logging
 
+import numpy as np
 import torch
 from vllm import SamplingParams
 
@@ -279,7 +284,47 @@ class ChatResponse:
         return {"role": role, "content": self.full_text()}
 
 
-@dataclass
+def _cleanup_capture_handle_and_warn(
+    model_ref: weakref.ref,
+    shm_names: list[str],
+    accessed_container: list[bool],
+) -> None:
+    """Cleanup callback for CaptureHandle finalization.
+
+    Warns if handle held shared memory but was never accessed.
+    Attempts to release shared memory if not already released.
+
+    Parameters
+    ----------
+    model_ref : weakref.ref
+        Weak reference to the VLLMSteerModel.
+    shm_names : list[str]
+        List of shared memory segment names (mutable, updated by handle).
+    accessed_container : list[bool]
+        Mutable container with [accessed] flag.
+    """
+    accessed = accessed_container[0]
+
+    if shm_names and not accessed:
+        warnings.warn(
+            f"CaptureHandle held {len(shm_names)} shared memory regions "
+            f"but was never accessed! This wastes memory. "
+            f"Use 'async with handle:' or call 'await handle.close()' explicitly.",
+            ResourceWarning,
+            stacklevel=2
+        )
+
+    # Attempt cleanup (may fail if model is gone)
+    model = model_ref()
+    if model is not None and shm_names:
+        try:
+            # We're in a finalizer, can't use async/await
+            # The shared memory will be cleaned up by worker-side TTL
+            logger.debug(f"Finalizer: {len(shm_names)} shm segments will be cleaned by TTL")
+        except Exception as e:
+            logger.debug(f"Finalizer cleanup note: {e}")
+
+
 class CaptureHandle:
     """Handle for lazily fetching activation captures for a single request.
 
@@ -292,13 +337,89 @@ class CaptureHandle:
     message_boundaries : tuple[MessageBoundary, ...] | None
         Optional message boundary information for chat-style captures.
         When set, allows slicing activations by message via get_message_activations().
+
+    Usage
+    -----
+    Recommended usage with async context manager for automatic cleanup::
+
+        async with handle:
+            captures = handle.captures
+            # Process captures...
+        # Shared memory automatically released
+
+    Or manual cleanup::
+
+        captures = handle.captures
+        await handle.close()  # Explicit cleanup
     """
 
-    request_id: str
-    layer_indices: tuple[int, ...]
-    _model: "VLLMSteerModel" = field(repr=False)
-    _captures: dict[int, list[dict[str, Any]]] | None = field(default=None, repr=False, init=False)
-    message_boundaries: tuple[MessageBoundary, ...] | None = field(default=None, repr=False)
+    def __init__(
+        self,
+        request_id: str,
+        layer_indices: tuple[int, ...],
+        model: "VLLMSteerModel",
+        message_boundaries: tuple[MessageBoundary, ...] | None = None,
+    ):
+        self.request_id = request_id
+        self.layer_indices = layer_indices
+        self._model_ref = weakref.ref(model)
+        self._captures: dict[int, list[dict[str, Any]]] | None = None
+        self.message_boundaries = message_boundaries
+
+        # Shared memory tracking
+        self._shm_names: list[str] = []
+        self._shm_objects: list[SharedMemory] = []  # Keep SharedMemory objects alive
+        self._accessed = False
+        self._closed = False
+
+        # Use mutable container for accessed flag so finalizer can see updates
+        self._accessed_container = [False]  # [accessed]
+
+        # Register finalize callback for backup cleanup
+        self._finalizer = weakref.finalize(
+            self,
+            _cleanup_capture_handle_and_warn,
+            weakref.ref(model),
+            self._shm_names,  # Direct reference to list (will be updated)
+            self._accessed_container,  # Reference to mutable container
+        )
+
+    async def __aenter__(self):
+        """Enter async context manager."""
+        return self
+
+    async def __aexit__(self, *args):
+        """Exit async context manager and release shared memory."""
+        await self.close()
+
+    async def close(self):
+        """Explicitly release shared memory resources."""
+        if self._closed:
+            return
+
+        self._closed = True
+
+        # Client-side cleanup: unmap shared memory
+        for shm in self._shm_objects:
+            try:
+                shm.close()  # Unmap from client process
+            except Exception as e:
+                logger.warning(f"Failed to close shared memory {shm.name}: {e}")
+
+        # Worker-side cleanup: send RPC to unlink shared memory segments
+        model = self._model_ref()
+        if model is not None and self._shm_names:
+            try:
+                await model._collective_rpc("release_shared_memory", self._shm_names)
+                logger.debug(f"Released {len(self._shm_names)} shared memory segments")
+            except Exception as e:
+                logger.warning(f"Failed to release shared memory: {e}")
+
+        # Clear references
+        self._shm_objects.clear()
+
+        # Detach finalizer since we cleaned up explicitly
+        self._finalizer.detach()
 
     async def fetch(self) -> dict[int, list[dict[str, Any]]]:
         """Fetch captures from workers (idempotent).
@@ -310,7 +431,15 @@ class CaptureHandle:
             contains "before", "after", "meta" keys.
         """
         if self._captures is None:
-            self._captures = await self._model._fetch_request_captures(self.request_id)
+            model = self._model_ref()
+            if model is None:
+                raise RuntimeError("Model has been garbage collected")
+            self._captures = await model._fetch_request_captures(
+                self.request_id,
+                shm_objects_list=self._shm_objects
+            )
+            # Extract names for cleanup RPC
+            self._shm_names = [shm.name for shm in self._shm_objects]
         return self._captures
 
     @property
@@ -327,6 +456,9 @@ class CaptureHandle:
                 f"Captures not fetched yet for request {self.request_id}. "
                 "Call: await handle.fetch()"
             )
+        # Mark as accessed for finalizer tracking
+        self._accessed = True
+        self._accessed_container[0] = True  # Update mutable container
         return self._captures
 
     def get_message_activations(
@@ -507,9 +639,32 @@ class VLLMSteerModel(SteerableModel):
         cfg: VLLMSteeringConfig,
         *,
         bootstrap_layers: Sequence[int] | None = None,
+        use_shared_memory: bool | None = None,
+        shm_threshold_kb: int | None = None,
+        shm_ttl_seconds: int | None = None,
+        shm_max_gb: float | None = None,
         **vllm_kwargs,
     ) -> None:
         self.cfg = cfg
+
+        # Shared memory configuration (default from env vars if not specified)
+        import os
+        self._use_shared_memory = (
+            use_shared_memory if use_shared_memory is not None
+            else bool(int(os.getenv("CHATSPACE_SHARED_MEMORY", "0")))
+        )
+        self._shm_threshold_kb = (
+            shm_threshold_kb if shm_threshold_kb is not None
+            else int(os.getenv("CHATSPACE_SHM_THRESHOLD_KB", "1024"))
+        )
+        self._shm_ttl_seconds = (
+            shm_ttl_seconds if shm_ttl_seconds is not None
+            else int(os.getenv("CHATSPACE_SHM_TTL", "600"))
+        )
+        self._shm_max_gb = (
+            shm_max_gb if shm_max_gb is not None
+            else float(os.getenv("CHATSPACE_MAX_SHM_GB", "128"))
+        )
 
         enforce_eager_raw = vllm_kwargs.get("enforce_eager", True)
         enforce_eager = bool(enforce_eager_raw)
@@ -612,8 +767,15 @@ class VLLMSteerModel(SteerableModel):
             self._engine = AsyncLLMEngine.from_engine_args(self._engine_args)
             self._engine_client = self._engine  # AsyncLLMEngine has collective_rpc directly
 
-            # Initialize worker state
-            setup_info = await self._collective_rpc("initialize_worker_state", self._init_layers)
+            # Initialize worker state with shared memory config
+            setup_info = await self._collective_rpc(
+                "initialize_worker_state",
+                self._init_layers,
+                self._use_shared_memory,
+                self._shm_threshold_kb,
+                self._shm_ttl_seconds,
+                self._shm_max_gb,
+            )
             if not setup_info:
                 raise RuntimeError("Failed to initialize steering state on workers.")
 
@@ -1068,7 +1230,7 @@ class VLLMSteerModel(SteerableModel):
                     handle = CaptureHandle(
                         request_id=req_id,
                         layer_indices=layers_tuple,
-                        _model=self,
+                        model=self,
                     )
                     handles.append(handle)
 
@@ -1245,7 +1407,7 @@ class VLLMSteerModel(SteerableModel):
                     handle = CaptureHandle(
                         request_id=req_id,
                         layer_indices=layers_tuple,
-                        _model=self,
+                        model=self,
                         message_boundaries=message_boundaries,
                     )
                     handles.append(handle)
@@ -1347,9 +1509,15 @@ class VLLMSteerModel(SteerableModel):
 
     async def _fetch_request_captures(
         self,
-        request_id: str
+        request_id: str,
+        shm_objects_list: list[SharedMemory] | None = None
     ) -> dict[int, list[dict[str, Any]]]:
-        """Fetch and deserialize captures for a single request."""
+        """Fetch and deserialize captures for a single request.
+
+        Args:
+            request_id: Request identifier
+            shm_objects_list: Optional list to track SharedMemory objects to keep them alive
+        """
         await self._ensure_engine_initialized()
         payloads = await self._collective_rpc("fetch_request_activations", request_id)
 
@@ -1360,7 +1528,8 @@ class VLLMSteerModel(SteerableModel):
                 tensor = steering_runtime.deserialize_tensor(
                     tensor_data,
                     device=torch.device("cpu"),
-                    dtype=self._vector_dtype
+                    dtype=self._vector_dtype,
+                    shm_objects_list=shm_objects_list
                 )
                 if layer_idx not in decoded:
                     decoded[layer_idx] = []
@@ -1398,25 +1567,72 @@ class VLLMSteerModel(SteerableModel):
         # dict[str, dict[int, Any]] where outer key is request_id
         results_by_request: dict[str, dict[int, list[dict[str, Any]]]] = {}
 
+        # Track SharedMemory objects per handle to keep them alive
+        shm_tracking: dict[str, list[SharedMemory]] = {}  # request_id -> list of SharedMemory objects
+
         for worker_batch in batch_payloads:
             for request_id, layer_data in worker_batch.items():
                 if request_id not in results_by_request:
                     results_by_request[request_id] = {}
+                if request_id not in shm_tracking:
+                    shm_tracking[request_id] = []
 
                 for layer_idx_str, tensor_data in layer_data.items():
                     layer_idx = int(layer_idx_str)
-                    tensor = steering_runtime.deserialize_tensor(
-                        tensor_data,
-                        device=torch.device("cpu"),
-                        dtype=self._vector_dtype
-                    )
+
+                    # Check if this is shared memory or bytes encoding
+                    if tensor_data.get("encoding") == "shm":
+                        # Shared memory path: open shm and create tensor view
+                        shm_name = tensor_data["shm_name"]
+                        shape = tuple(tensor_data["shape"])
+                        dtype_str = tensor_data["dtype"]
+
+                        try:
+                            shm = SharedMemory(name=shm_name)
+
+                            # Handle bfloat16 specially
+                            if dtype_str == "bfloat16":
+                                import ml_dtypes
+                                # Create numpy array view as bfloat16
+                                np_array = np.ndarray(shape, dtype=ml_dtypes.bfloat16, buffer=shm.buf)
+                                # Convert to torch: view as uint16, then reinterpret as bfloat16
+                                tensor = torch.from_numpy(np_array.view(np.uint16)).view(torch.bfloat16)
+                            else:
+                                # Standard dtypes
+                                np_dtype = getattr(np, dtype_str.replace("torch.", ""))
+                                np_array = np.ndarray(shape, dtype=np_dtype, buffer=shm.buf)
+                                tensor = torch.from_numpy(np_array)
+
+                            # Convert to desired dtype
+                            tensor = tensor.to(dtype=self._vector_dtype)
+
+                            # Track SharedMemory object to keep it alive
+                            shm_tracking[request_id].append(shm)
+                        except Exception as e:
+                            logger.error(f"Failed to open shared memory {shm_name}: {e}")
+                            raise
+                    else:
+                        # Bytes encoding: use existing deserialization
+                        tensor = steering_runtime.deserialize_tensor(
+                            tensor_data,
+                            device=torch.device("cpu"),
+                            dtype=self._vector_dtype
+                        )
+
                     if layer_idx not in results_by_request[request_id]:
                         results_by_request[request_id][layer_idx] = []
                     results_by_request[request_id][layer_idx].append({"hidden": tensor})
 
-        # Populate handles
+        # Populate handles with captures and shm tracking
         for handle in to_fetch:
             handle._captures = results_by_request.get(handle.request_id, {})
+            # Store SharedMemory objects to keep them alive
+            shm_objects = shm_tracking.get(handle.request_id, [])
+            handle._shm_objects.clear()
+            handle._shm_objects.extend(shm_objects)
+            # Extract names for cleanup RPC (updates the list in-place that finalizer references)
+            handle._shm_names.clear()
+            handle._shm_names.extend([shm.name for shm in shm_objects])
 
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)
