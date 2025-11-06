@@ -1102,7 +1102,7 @@ def deserialize_tensor(
     *,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
-    shm_names_list: list[str] | None = None
+    shm_objects_list: list[SharedMemory] | None = None
 ) -> torch.Tensor:
     """Best-effort reconstruction of a tensor serialized via msgpack.
 
@@ -1114,9 +1114,10 @@ def deserialize_tensor(
         Target device for the tensor
     dtype : torch.dtype, optional
         Target dtype for the tensor
-    shm_names_list : list[str], optional
+    shm_objects_list : list[SharedMemory], optional
         If provided and payload uses shared memory (encoding=="shm"),
-        the shared memory name will be appended to this list for cleanup tracking
+        the SharedMemory object will be appended to this list to keep it alive
+        and prevent garbage collection that would invalidate tensor views
     """
     if isinstance(payload, torch.Tensor):
         tensor = payload
@@ -1164,9 +1165,9 @@ def deserialize_tensor(
             # Open existing shared memory segment (client-side)
             shm = SharedMemory(name=shm_name)
 
-            # Track segment for cleanup if list provided
-            if shm_names_list is not None:
-                shm_names_list.append(shm_name)
+            # Track SharedMemory object to keep it alive if list provided
+            if shm_objects_list is not None:
+                shm_objects_list.append(shm)
 
             # Handle bfloat16: numpy doesn't support it natively, need ml_dtypes
             if target_dtype == torch.bfloat16:

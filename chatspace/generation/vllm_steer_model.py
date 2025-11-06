@@ -368,6 +368,7 @@ class CaptureHandle:
 
         # Shared memory tracking
         self._shm_names: list[str] = []
+        self._shm_objects: list[SharedMemory] = []  # Keep SharedMemory objects alive
         self._accessed = False
         self._closed = False
 
@@ -393,10 +394,19 @@ class CaptureHandle:
 
     async def close(self):
         """Explicitly release shared memory resources."""
-        if self._closed or not self._shm_names:
+        if self._closed:
             return
 
         self._closed = True
+
+        # Client-side cleanup: unmap shared memory
+        for shm in self._shm_objects:
+            try:
+                shm.close()  # Unmap from client process
+            except Exception as e:
+                logger.warning(f"Failed to close shared memory {shm.name}: {e}")
+
+        # Worker-side cleanup: send RPC to unlink shared memory segments
         model = self._model_ref()
         if model is not None and self._shm_names:
             try:
@@ -404,6 +414,9 @@ class CaptureHandle:
                 logger.debug(f"Released {len(self._shm_names)} shared memory segments")
             except Exception as e:
                 logger.warning(f"Failed to release shared memory: {e}")
+
+        # Clear references
+        self._shm_objects.clear()
 
         # Detach finalizer since we cleaned up explicitly
         self._finalizer.detach()
@@ -423,8 +436,10 @@ class CaptureHandle:
                 raise RuntimeError("Model has been garbage collected")
             self._captures = await model._fetch_request_captures(
                 self.request_id,
-                shm_names_list=self._shm_names
+                shm_objects_list=self._shm_objects
             )
+            # Extract names for cleanup RPC
+            self._shm_names = [shm.name for shm in self._shm_objects]
         return self._captures
 
     @property
@@ -1495,13 +1510,13 @@ class VLLMSteerModel(SteerableModel):
     async def _fetch_request_captures(
         self,
         request_id: str,
-        shm_names_list: list[str] | None = None
+        shm_objects_list: list[SharedMemory] | None = None
     ) -> dict[int, list[dict[str, Any]]]:
         """Fetch and deserialize captures for a single request.
 
         Args:
             request_id: Request identifier
-            shm_names_list: Optional list to track shared memory segment names for cleanup
+            shm_objects_list: Optional list to track SharedMemory objects to keep them alive
         """
         await self._ensure_engine_initialized()
         payloads = await self._collective_rpc("fetch_request_activations", request_id)
@@ -1514,7 +1529,7 @@ class VLLMSteerModel(SteerableModel):
                     tensor_data,
                     device=torch.device("cpu"),
                     dtype=self._vector_dtype,
-                    shm_names_list=shm_names_list
+                    shm_objects_list=shm_objects_list
                 )
                 if layer_idx not in decoded:
                     decoded[layer_idx] = []
@@ -1552,8 +1567,8 @@ class VLLMSteerModel(SteerableModel):
         # dict[str, dict[int, Any]] where outer key is request_id
         results_by_request: dict[str, dict[int, list[dict[str, Any]]]] = {}
 
-        # Track shared memory names per handle for cleanup
-        shm_tracking: dict[str, list[str]] = {}  # request_id -> list of shm_names
+        # Track SharedMemory objects per handle to keep them alive
+        shm_tracking: dict[str, list[SharedMemory]] = {}  # request_id -> list of SharedMemory objects
 
         for worker_batch in batch_payloads:
             for request_id, layer_data in worker_batch.items():
@@ -1591,8 +1606,8 @@ class VLLMSteerModel(SteerableModel):
                             # Convert to desired dtype
                             tensor = tensor.to(dtype=self._vector_dtype)
 
-                            # Track this shm for later cleanup
-                            shm_tracking[request_id].append(shm_name)
+                            # Track SharedMemory object to keep it alive
+                            shm_tracking[request_id].append(shm)
                         except Exception as e:
                             logger.error(f"Failed to open shared memory {shm_name}: {e}")
                             raise
@@ -1611,9 +1626,13 @@ class VLLMSteerModel(SteerableModel):
         # Populate handles with captures and shm tracking
         for handle in to_fetch:
             handle._captures = results_by_request.get(handle.request_id, {})
-            # Update shm_names for cleanup (updates the list in-place that finalizer references)
+            # Store SharedMemory objects to keep them alive
+            shm_objects = shm_tracking.get(handle.request_id, [])
+            handle._shm_objects.clear()
+            handle._shm_objects.extend(shm_objects)
+            # Extract names for cleanup RPC (updates the list in-place that finalizer references)
             handle._shm_names.clear()
-            handle._shm_names.extend(shm_tracking.get(handle.request_id, []))
+            handle._shm_names.extend([shm.name for shm in shm_objects])
 
     # ------------------------------------------------------------------
     # Internal debugging helpers (used in tests)

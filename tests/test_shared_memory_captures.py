@@ -253,15 +253,60 @@ async def test_concurrent_access_isolation(model_factory):
 
 @pytest.mark.asyncio
 async def test_data_integrity(model_factory):
-    """Test that shared memory data matches expected values."""
+    """Test that shared memory data matches HuggingFace baseline."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_name = "Qwen/Qwen3-0.6B"
+    prompt = "The quick brown fox"
+
+    # HuggingFace baseline
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda:0",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
+
+    # Capture activations from HF
+    layer_5_acts = []
+    layer_10_acts = []
+
+    def hook_5(module, input, output):
+        layer_5_acts.append(output[0].detach().cpu())
+
+    def hook_10(module, input, output):
+        layer_10_acts.append(output[0].detach().cpu())
+
+    handle_5 = hf_model.model.layers[5].register_forward_hook(hook_5)
+    handle_10 = hf_model.model.layers[10].register_forward_hook(hook_10)
+
+    with torch.no_grad():
+        outputs = hf_model.generate(
+            **inputs,
+            max_new_tokens=10,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    handle_5.remove()
+    handle_10.remove()
+
+    # Concatenate HF activations
+    hf_layer_5 = torch.cat(layer_5_acts, dim=0)
+    hf_layer_10 = torch.cat(layer_10_acts, dim=0)
+
+    # Clean up HF model
+    del hf_model
+    torch.cuda.empty_cache()
+
+    # vLLM with shared memory
     model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
 
-    prompts = ["The quick brown fox"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
-
-    # Generate with capture
     results, handles = await model.generate(
-        prompts,
+        [prompt],
         sampling_params,
         capture_layers=[5, 10],
     )
@@ -269,12 +314,12 @@ async def test_data_integrity(model_factory):
     handle = handles[0]
     await model.fetch_captures_batch([handle])
 
-    # Verify multiple layers
+    # Verify multiple layers exist
     assert 5 in handle.captures
     assert 10 in handle.captures
 
-    # Verify tensor properties
-    for layer_idx in [5, 10]:
+    # Verify tensor properties and compare to HF baseline
+    for layer_idx, hf_baseline in [(5, hf_layer_5), (10, hf_layer_10)]:
         hidden = handle.captures[layer_idx][0]["hidden"]
 
         # Check shape
@@ -284,12 +329,27 @@ async def test_data_integrity(model_factory):
         # Check dtype
         assert hidden.dtype in [torch.float16, torch.bfloat16, torch.float32]
 
-        # Check no NaN or Inf
-        assert not torch.isnan(hidden).any()
-        assert not torch.isinf(hidden).any()
+        # Check no NaN or Inf (critical safety checks)
+        assert not torch.isnan(hidden).any(), f"Layer {layer_idx} has NaN values"
+        assert not torch.isinf(hidden).any(), f"Layer {layer_idx} has Inf values"
 
-        # Check reasonable value range
-        assert hidden.abs().max() < 1000.0  # Activations shouldn't be huge
+        # Compare against HuggingFace baseline (ground truth)
+        # Trim HF to match vLLM length (vLLM captures N-1 tokens for generation)
+        vllm_len = hidden.shape[0]
+        hf_trimmed = hf_baseline[:vllm_len]
+
+        # Compute cosine similarity
+        cos_sim = torch.nn.functional.cosine_similarity(
+            hidden.float().flatten(),
+            hf_trimmed.float().flatten(),
+            dim=0
+        ).item()
+
+        # Assert high similarity to HF baseline (>0.99 for nearly identical)
+        assert cos_sim > 0.99, (
+            f"Layer {layer_idx} cosine similarity too low: {cos_sim:.6f}. "
+            f"vLLM captures should match HuggingFace baseline."
+        )
 
     await handle.close()
 
