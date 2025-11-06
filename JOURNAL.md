@@ -1390,3 +1390,151 @@ Ran isolated benchmarks and discovered severe performance degradation in unoptim
 - `OPTIMIZATION_FINDINGS.md` - Detailed analysis
 
 **Conclusion:** Capture overhead is now acceptable for production use. The 14% overhead for all-layer capture is reasonable, and per-layer cost scales linearly at ~0.4% per layer.
+
+---
+
+## 2025-11-06: GPU→CPU Transfer Optimizations
+
+**Context:** After implementing zero-copy shared memory IPC for activation extraction, deep analysis revealed the async GPU→CPU transfer was already implemented but had several bottlenecks limiting performance.
+
+### Analysis of Existing Async Transfer System
+
+**Current implementation** (lines 901-912 in runtime.py):
+- Uses `torch.cuda.Stream` for async GPU→CPU transfers
+- Transfers initiated during generation with `.to('cpu', non_blocking=True)`
+- CUDA events track completion before serialization
+- Decode tokens buffered (originally 32 tokens) before transfer
+
+**Identified Bottlenecks:**
+
+1. **Unnecessary `.clone()` calls** (lines 876, 887)
+   - `req_hidden.detach().clone()` called during prefill and decode buffering
+   - PyTorch slices already create new storage, making clone redundant
+   - Doubles GPU memory traffic unnecessarily
+   - Impact: 2x memory operations during every forward pass
+
+2. **Sequential event synchronization** (lines 1948-1951)
+   - Loop: `for cpu_tensor, event, _ in transfer_data.values(): event.synchronize()`
+   - Per-event synchronization overhead
+   - Head-of-line blocking (must wait for each event sequentially)
+   - Doesn't leverage stream-level batching
+
+3. **Single shared transfer stream**
+   - All concurrent requests share one CUDA stream
+   - Only utilizes 1 of ~16 available PCIe copy engines
+   - No parallelism for concurrent requests
+   - Large transfers block smaller ones
+
+4. **Small buffer size**
+   - 32-token buffer threshold
+   - For Qwen3-32B (hidden=5120, bf16): 32 tokens = 320KB
+   - Doesn't saturate PCIe bandwidth effectively
+
+### Optimizations Implemented
+
+#### Phase 1: Remove Unnecessary Clones
+
+**Changes:**
+- Line 876: `req_hidden.detach().clone()` → `req_hidden.detach()`
+- Line 887: `decode_buf.append(req_hidden.detach().clone())` → `decode_buf.append(req_hidden.detach())`
+
+**Rationale:** Slicing already creates new storage; extra clone wastes GPU memory bandwidth.
+
+**Expected impact:** ~2x reduction in GPU memory operations during capture.
+
+**Commit:** *(to be committed)*
+
+#### Phase 2: Batch Stream Synchronization
+
+**Before (lines 1948-1951):**
+```python
+if state.transfer_stream is not None:
+    for cpu_tensor, event, _ in transfer_data.values():
+        if event is not None:
+            event.synchronize()
+```
+
+**After:**
+```python
+if state.transfer_stream is not None:
+    state.transfer_stream.synchronize()
+```
+
+**Rationale:** Single stream sync waits for all pending work at once, eliminating per-event overhead and head-of-line blocking.
+
+**Expected impact:** Reduced synchronization overhead, especially for large batches with many layers.
+
+**Commit:** *(to be committed)*
+
+#### Phase 3: Increase Buffer Size
+
+**Changed:** Decode buffer threshold 32 → 128 tokens (line 889-890)
+
+**Rationale:**
+- Qwen3-32B: 128 tokens × 5120 × 2 bytes = 1.28MB per buffer
+- Better PCIe bandwidth saturation
+- Still maintains overlap between generation and transfer
+- Reduces cat operations by 4x
+
+**Expected impact:** Better PCIe utilization, fewer concatenation operations.
+
+**Commit:** *(to be committed)*
+
+### Testing
+
+**All tests passed on GPU 1:**
+- `test_hidden_state_capture_basic` (with and without shared memory)
+- `test_hidden_state_capture_batch_fetch` (with and without shared memory)
+
+**Test environment:**
+- CUDA_VISIBLE_DEVICES=1
+- CHATSPACE_SHARED_MEMORY={0,1}
+- CHATSPACE_SHM_THRESHOLD_KB=1 (when enabled)
+- Qwen/Qwen3-0.6B test model
+- Timeout: 120s per test
+
+**Results:** All 4 test configurations PASSED
+
+### Benchmarking
+
+**Setup:**
+- GPU 0: Full baseline run (241 traits, CHATSPACE_SHARED_MEMORY=0) - still running
+- GPU 1: Sample dataset benchmark (240 responses, zealous trait)
+  - Baseline (CHATSPACE_SHARED_MEMORY=0) - in progress
+  - Optimized (CHATSPACE_SHARED_MEMORY=1) - pending
+
+**Initial baseline observation:**
+- NumPy serialization: 47.9s for ~10GB data
+- This is the OLD serialization approach (before shared memory)
+- Expect significant speedup with zero-copy shared memory
+
+**Comparison script:** `/tmp/run_comparison.sh` will automatically run shared memory version after baseline completes
+
+### Future Work
+
+**Stream-per-request optimization** (deferred):
+- GitHub issue created: #3
+- Proposal: Allocate one CUDA stream per request instead of shared stream
+- Benefits:
+  - Up to 16 concurrent PCIe transfers
+  - Better overlap with vLLM's request-level parallelism
+  - Reduced latency for concurrent workloads
+- Implementation considerations:
+  - Per-request stream allocation and cleanup
+  - Synchronization changes in `fetch_captures_batch`
+  - Backward compatibility with single-stream fallback
+
+### Files Modified
+
+- `chatspace/vllm_steering/runtime.py`:
+  - Lines 876, 887: Removed unnecessary `.clone()` calls
+  - Line 890: Increased buffer size 32 → 128 tokens
+  - Lines 1948-1951: Replaced event loop with single stream sync
+
+### Timestamp
+
+- Started: 2025-11-06 06:50 UTC (baseline run on GPU 0)
+- Optimizations completed: 2025-11-06 08:23 UTC
+- Tests passed: 2025-11-06 08:22 UTC
+- Benchmark in progress: GPU 1 sample dataset comparison
+
