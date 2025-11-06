@@ -10,6 +10,7 @@ dependencies = [
     "peft>=0.17.1",
     "plotly>=5.24.0",
     "pyarrow>=21.0.0",
+    "pypeln>=0.4.9",
     "python-dotenv>=1.1.1",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",

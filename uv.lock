@@ -463,6 +463,7 @@ dependencies = [
     { name = "peft" },
     { name = "plotly" },
     { name = "pyarrow" },
+    { name = "pypeln" },
     { name = "python-dotenv" },
     { name = "scikit-learn" },
     { name = "seaborn" },
@@ -505,6 +506,7 @@ requires-dist = [
     { name = "peft", specifier = ">=0.17.1" },
     { name = "plotly", specifier = ">=5.24.0" },
     { name = "pyarrow", specifier = ">=21.0.0" },
+    { name = "pypeln", specifier = ">=0.4.9" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "seaborn", specifier = ">=0.13.2" },
@@ -3261,6 +3263,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pypeln"
+version = "0.4.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "stopit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/87/7e4929696a4cf29fede0756d38c5cc08395d91bd7feac8d6072edf0a1ecf/pypeln-0.4.9.tar.gz", hash = "sha256:01c1acc1b2307895107980d3216288898cf94ebe328e4888b93dead654211da5", size = 53675, upload-time = "2022-01-06T15:32:41.609Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/67/5ddbeb48d992413002412fe081b6d77a5580ed09ee5c987d31ea0dd7fe37/pypeln-0.4.9-py3-none-any.whl", hash = "sha256:38d108419fcf8c6127a1fe4465978a98ea4017262dd3ab07185d5cfdae8bf780", size = 105280, upload-time = "2022-01-06T15:32:39.245Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -4290,6 +4304,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/a7/a5/d6f429d43394057b6
 wheels = [
     { url = "https://files.pythonhosted.org/packages/be/72/2db2f49247d0a18b4f1bb9a5a39a0162869acf235f3a96418363947b3d46/starlette-0.48.0-py3-none-any.whl", hash = "sha256:0764ca97b097582558ecb498132ed0c7d942f233f365b86ba37770e026510659", size = 73736, upload-time = "2025-09-13T08:41:03.869Z" },
 ]
+
+[[package]]
+name = "stopit"
+version = "1.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/35/58/e8bb0b0fb05baf07bbac1450c447d753da65f9701f551dca79823ce15d50/stopit-1.1.2.tar.gz", hash = "sha256:f7f39c583fd92027bd9d06127b259aee7a5b7945c1f1fa56263811e1e766996d", size = 18281, upload-time = "2018-02-09T00:32:14.204Z" }
 
 [[package]]
 name = "sympy"
