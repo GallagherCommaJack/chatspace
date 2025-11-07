@@ -1106,10 +1106,15 @@ def deserialize_tensor(
 ) -> torch.Tensor:
     """Best-effort reconstruction of a tensor serialized via msgpack.
 
+    Supports three payload formats:
+    1. torch.Tensor - Direct passthrough (msgpack deserialization fallback)
+    2. dict with encoding="bytes" - Steering vectors (small, <32 KB)
+    3. dict with encoding="shm" - Activation captures (large, 30+ MB, zero-copy)
+
     Parameters
     ----------
     payload : Any
-        Serialized tensor data (dict, tuple, or Tensor)
+        Serialized tensor data (torch.Tensor or dict with encoding metadata)
     device : torch.device, optional
         Target device for the tensor
     dtype : torch.dtype, optional
@@ -1119,8 +1124,10 @@ def deserialize_tensor(
         the SharedMemory object will be appended to this list to keep it alive
         and prevent garbage collection that would invalidate tensor views
     """
+    # Format 1: Raw tensor (msgpack deserialization fallback)
     if isinstance(payload, torch.Tensor):
         tensor = payload
+    # Format 2 & 3: Dict with encoding metadata
     elif isinstance(payload, dict):
         try:
             dtype_str = payload["dtype"]
@@ -1134,29 +1141,22 @@ def deserialize_tensor(
         shape_tuple = tuple(int(dim) for dim in shape)
         storage_dtype_str = payload.get("storage_dtype")
         encoding = payload.get("encoding")
+
+        # Format 2: Bytes encoding (steering vectors)
         if encoding == "bytes":
-            if isinstance(data, memoryview):  # type: ignore[name-defined]
-                raw = data.tobytes()
-            elif isinstance(data, (bytes, bytearray)):
-                raw = bytes(data)
-            else:
-                raise TypeError(f"Unsupported tensor data payload for encoding=bytes: {type(data)}")
-            if len(raw) == 0:
-                tensor = torch.empty(shape_tuple, dtype=target_dtype)
-            else:
-                storage_dtype = target_dtype
-                if storage_dtype_str:
-                    storage_dtype = getattr(torch, storage_dtype_str, None)
-                    if not isinstance(storage_dtype, torch.dtype):
-                        raise TypeError(f"Unsupported storage dtype payload: {storage_dtype_str}")
-                # Create writable copy to avoid PyTorch warning about non-writable buffers
-                tensor = torch.frombuffer(bytearray(raw), dtype=storage_dtype).clone().reshape(shape_tuple)
-                if storage_dtype != target_dtype:
-                    tensor = tensor.to(dtype=target_dtype)
-        elif encoding in (None, "list"):
-            tensor = torch.tensor(data, dtype=target_dtype).reshape(shape_tuple)
+            if not isinstance(data, bytes):
+                raise TypeError(f"Expected bytes for encoding=bytes, got {type(data)}")
+            storage_dtype = target_dtype
+            if storage_dtype_str:
+                storage_dtype = getattr(torch, storage_dtype_str, None)
+                if not isinstance(storage_dtype, torch.dtype):
+                    raise TypeError(f"Unsupported storage dtype payload: {storage_dtype_str}")
+            # Create writable copy to avoid PyTorch warning about non-writable buffers
+            tensor = torch.frombuffer(bytearray(data), dtype=storage_dtype).clone().reshape(shape_tuple)
+            if storage_dtype != target_dtype:
+                tensor = tensor.to(dtype=target_dtype)
+        # Format 3: Shared memory encoding (activation captures, zero-copy)
         elif encoding == "shm":
-            # Shared memory zero-copy deserialization
             try:
                 shm_name = payload["shm_name"]
             except KeyError as exc:
@@ -1186,30 +1186,6 @@ def deserialize_tensor(
                 tensor = torch.from_numpy(np_array)
         else:
             raise TypeError(f"Unsupported tensor encoding: {encoding}")
-    elif (
-        isinstance(payload, (list, tuple))
-        and len(payload) == 3
-        and isinstance(payload[0], str)
-        and isinstance(payload[1], Sequence)
-    ):
-        dtype_str, shape, data = payload
-        target_dtype = getattr(torch, dtype_str, None)
-        if target_dtype is None:
-            raise TypeError(f"Unsupported tensor dtype payload: {dtype_str}")
-        shape_tuple = tuple(int(dim) for dim in shape)
-        if isinstance(data, memoryview):  # type: ignore[name-defined]
-            raw = data.tobytes()
-        elif isinstance(data, (bytes, bytearray)):
-            raw = bytes(data)
-        elif isinstance(data, list):
-            tensor = torch.tensor(data, dtype=target_dtype)
-            return tensor.reshape(shape_tuple).to(device=device, dtype=dtype or target_dtype)
-        else:
-            raise TypeError(f"Unsupported tensor data payload: {type(data)}")
-        if len(raw) == 0:
-            tensor = torch.empty(shape_tuple, dtype=target_dtype)
-        else:
-            tensor = torch.frombuffer(raw, dtype=target_dtype).clone().reshape(shape_tuple)
     else:
         raise TypeError(f"Unexpected tensor payload type: {type(payload)}")
     if dtype is not None and tensor.dtype != dtype:
