@@ -43,6 +43,20 @@ uv run python main.py
 bash runs/fineweb-10BT.sh
 ```
 
+### Tool Preferences
+
+**IMPORTANT**: When using bash commands for file operations, prefer modern tools:
+
+- **Search files by pattern**: Use `fd` instead of `find`
+  - `fd "pattern" /path` (fast, intuitive syntax, respects .gitignore)
+  - NOT `find /path -name "pattern"` (slow, verbose syntax)
+
+- **Search file contents**: Use `rg` (ripgrep) instead of `grep`
+  - `rg "pattern" /path` (fast, colored output, respects .gitignore)
+  - NOT `grep -r "pattern" /path` (slow, can hang on large directories)
+
+- **Why**: `rg` and `fd` are orders of magnitude faster and won't hang on large directories like `/workspace` or external repos. They also have saner defaults (skip .git, skip binary files, colored output).
+
 ## Architecture
 
 ### Entry Points
