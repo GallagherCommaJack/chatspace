@@ -256,17 +256,6 @@ def _profile_fetch_batch(
 
 
 
-
-@dataclass
-class _StepContext:
-    """Batch metadata computed once per scheduler step."""
-
-    step_index: int
-    request_ids: tuple[str, ...]
-    scheduled_tokens: tuple[int, ...]
-    slice_ranges: tuple[tuple[int, int], ...]  # Precomputed cumulative offsets
-
-
 @dataclass
 class _SteeringState:
     """Track steering metadata for a worker."""
@@ -289,9 +278,6 @@ class _SteeringState:
     # Per-step batch metadata (captured from model runner)
     step_metadata: dict[int, dict[str, Any]] = None  # step_number -> {request_ids, seq_lens, ...}
     global_step: int = 0  # Monotonically increasing step counter
-
-    # Future: current_step_context for optimized routing
-    current_step_context: _StepContext | None = None
 
     # Async transfer infrastructure
     transfer_stream: torch.cuda.Stream | None = None  # Stream for non-blocking GPU→CPU transfers
@@ -455,51 +441,6 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
         if isinstance(hidden, torch.Tensor):
             return hidden
     return None
-
-
-def _extract_hidden_from_output_timed(output: Any) -> tuple[torch.Tensor | None, float, float]:
-    """Timed version of _extract_hidden_from_output for profiling.
-
-    Returns:
-        (hidden_tensor, time_spent_in_addition, time_spent_total)
-    """
-    import time
-    start_total = time.perf_counter()
-
-    if isinstance(output, torch.Tensor):
-        return output, 0.0, time.perf_counter() - start_total
-
-    if isinstance(output, (tuple, list)):
-        if len(output) >= 2:
-            first = output[0]
-            second = output[1]
-            if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
-                # Time the tensor addition specifically
-                start_add = time.perf_counter()
-                result = second + first
-                time_add = time.perf_counter() - start_add
-
-                time_total = time.perf_counter() - start_total
-                return result, time_add, time_total
-
-        if len(output) > 0:
-            hidden = output[0]
-            if isinstance(hidden, torch.Tensor):
-                time_total = time.perf_counter() - start_total
-                return hidden, 0.0, time_total
-
-    if isinstance(output, dict) and "last_hidden_state" in output:
-        time_total = time.perf_counter() - start_total
-        return output["last_hidden_state"], 0.0, time_total
-
-    if hasattr(output, "last_hidden_state"):
-        hidden = output.last_hidden_state
-        if isinstance(hidden, torch.Tensor):
-            time_total = time.perf_counter() - start_total
-            return hidden, 0.0, time_total
-
-    time_total = time.perf_counter() - start_total
-    return None, 0.0, time_total
 
 
 def _is_qwen_layer_output(output: Any) -> bool:
@@ -668,18 +609,11 @@ def _deserialize_direction_payload(
     state: _SteeringState,
     target_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    try:
-        vector = deserialize_tensor(
-            payload,
-            device=dest.device,
-            dtype=target_dtype,
-        )
-    except TypeError:
-        if not isinstance(payload, torch.Tensor):
-            raise
-        vector = payload.to(device=dest.device)
-        if target_dtype is not None and vector.dtype != target_dtype:
-            vector = vector.to(dtype=target_dtype)
+    vector = deserialize_tensor(
+        payload,
+        device=dest.device,
+        dtype=target_dtype,
+    )
     if vector.ndim != 1:
         raise ValueError("Direction vector must be 1D.")
     if vector.shape[0] != state.hidden_size:
@@ -745,97 +679,6 @@ if _dynamo is not None:
     _apply_projection_cap_to_output = _dynamo.disable(_apply_projection_cap_to_output)
     _apply_ablation_to_output = _dynamo.disable(_apply_ablation_to_output)
 
-
-# ============================================================================
-# Hook Variant System for Profiling
-# ============================================================================
-# Environment variable to select hook variant for performance testing
-_HOOK_VARIANT = os.environ.get("CHATSPACE_HOOK_VARIANT", "full")
-
-
-def _capture_hook_noop(
-    state: _SteeringState,
-    layer_idx: int,
-    hidden: torch.Tensor,
-    request_ids: list[str],
-    seq_lens: list[int] | None,
-) -> None:
-    """No-op hook: measures baseline overhead of hook invocation."""
-    pass
-
-
-def _capture_hook_noop_notiming(
-    state: _SteeringState,
-    layer_idx: int,
-    hidden: torch.Tensor,
-    request_ids: list[str],
-    seq_lens: list[int] | None,
-) -> None:
-    """No-op hook with NO hidden extraction: measures pure metadata lookup overhead."""
-    pass
-
-
-def _capture_hook_slice_only(
-    state: _SteeringState,
-    layer_idx: int,
-    hidden: torch.Tensor,
-    request_ids: list[str],
-    seq_lens: list[int] | None,
-) -> None:
-    """Slice-only hook: performs slicing but no clone/store."""
-    start_idx = 0
-    for i, req_id in enumerate(request_ids):
-        if req_id not in state.active_capture_requests:
-            if seq_lens and i < len(seq_lens):
-                start_idx += seq_lens[i]
-            continue
-
-        if layer_idx not in state.active_capture_requests[req_id]:
-            if seq_lens and i < len(seq_lens):
-                start_idx += seq_lens[i]
-            continue
-
-        # Slice but don't clone
-        if seq_lens and i < len(seq_lens):
-            seq_len = seq_lens[i]
-            end_idx = start_idx + seq_len
-            req_hidden = hidden[start_idx:end_idx]  # SLICE ONLY
-            start_idx = end_idx
-        else:
-            req_hidden = hidden  # noqa: F841
-
-
-def _capture_hook_clone_only(
-    state: _SteeringState,
-    layer_idx: int,
-    hidden: torch.Tensor,
-    request_ids: list[str],
-    seq_lens: list[int] | None,
-) -> None:
-    """Clone-only hook: slices and clones but doesn't store."""
-    start_idx = 0
-    for i, req_id in enumerate(request_ids):
-        if req_id not in state.active_capture_requests:
-            if seq_lens and i < len(seq_lens):
-                start_idx += seq_lens[i]
-            continue
-
-        if layer_idx not in state.active_capture_requests[req_id]:
-            if seq_lens and i < len(seq_lens):
-                start_idx += seq_lens[i]
-            continue
-
-        # Slice and clone but don't store
-        if seq_lens and i < len(seq_lens):
-            seq_len = seq_lens[i]
-            end_idx = start_idx + seq_len
-            req_hidden = hidden[start_idx:end_idx]
-            start_idx = end_idx
-        else:
-            req_hidden = hidden
-
-        # Clone but discard immediately
-        _ = req_hidden.detach().clone()  # CLONE ONLY
 
 
 def _capture_hook_full(
@@ -917,24 +760,6 @@ def _capture_hook_full(
                             state.request_pending_transfers[req_id] = {}
                         state.request_pending_transfers[req_id][layer_idx] = (cpu_tensor, event)
 
-
-# Hook variant registry
-_HOOK_VARIANTS: dict[str, Callable] = {
-    "noop_notiming": _capture_hook_noop_notiming,
-    "noop": _capture_hook_noop,
-    "slice_only": _capture_hook_slice_only,
-    "clone_only": _capture_hook_clone_only,
-    "full": _capture_hook_full,
-}
-
-# Log selected variant for debugging
-if _HOOK_VARIANT not in _HOOK_VARIANTS:
-    logger.warning(
-        f"Invalid CHATSPACE_HOOK_VARIANT='{_HOOK_VARIANT}'. "
-        f"Valid options: {list(_HOOK_VARIANTS.keys())}. Defaulting to 'full'."
-    )
-    _HOOK_VARIANT = "full"
-logger.info(f"Activation capture hook variant: {_HOOK_VARIANT}")
 
 
 def _patch_decoder_layer_class(layer_cls: type) -> None:
@@ -1300,40 +1125,6 @@ def _create_shared_tensor(
         return serialize_tensor(cpu_tensor)
 
 
-def _record_step_context(
-    state: _SteeringState,
-    request_ids: list[str],
-    seq_lens: list[int] | None,
-) -> None:
-    """Record batch context with precomputed slice ranges for efficient routing."""
-    if not request_ids:
-        state.current_step_context = None
-        return
-
-    # Use seq_lens if available, otherwise assume 1 token per request (decode phase)
-    if seq_lens is None or len(seq_lens) != len(request_ids):
-        scheduled_tokens = tuple([1] * len(request_ids))
-    else:
-        scheduled_tokens = tuple(seq_lens)
-
-    # Precompute cumulative slice ranges ONCE per step
-    slice_ranges = []
-    offset = 0
-    for token_count in scheduled_tokens:
-        start = offset
-        end = offset + token_count
-        slice_ranges.append((start, end))
-        offset = end
-
-    state.current_step_context = _StepContext(
-        step_index=state.global_step,
-        request_ids=tuple(request_ids),
-        scheduled_tokens=scheduled_tokens,
-        slice_ranges=tuple(slice_ranges),
-    )
-    state.global_step += 1
-
-
 def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
     """Patch GPUModelRunner.execute_model to capture per-step batch metadata."""
     if not _CAPTURE_METADATA_ENABLED:
@@ -1433,8 +1224,6 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                     f"Stored step_metadata for step {current_step}: "
                     f"request_ids={request_ids}, seq_lens={seq_lens}"
                 )
-                # Record step context with precomputed slicing (new)
-                _record_step_context(state, request_ids, seq_lens)
             else:
                 logger.debug("No request_ids extracted from model_input")
         except Exception as e:
@@ -1493,7 +1282,6 @@ def initialize_worker_state(
         request_token_counts={},
         step_metadata={},
         global_step=0,
-        current_step_context=None,
         transfer_stream=torch.cuda.Stream(device=device) if device.type == 'cuda' else None,
         request_pending_transfers={},
         active_shared_memory={},

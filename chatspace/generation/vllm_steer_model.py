@@ -36,7 +36,7 @@ import torch
 from vllm import SamplingParams
 
 from chatspace.vllm_steering import runtime as steering_runtime
-from .base import SteerableModel
+# SteerableModel ABC removed - only vLLM implementation exists
 
 
 logger = logging.getLogger(__name__)
@@ -609,12 +609,10 @@ def compute_message_boundaries(
     return tuple(boundaries)
 
 
-class VLLMSteerModel(SteerableModel):
+class VLLMSteerModel:
     """Steerable wrapper around ``vllm.LLM`` for Qwen and Llama models.
 
-    The wrapper keeps a small cache of per-layer steering metadata and mirrors
-    the :class:`chatspace.generation.base.SteerableModel` contract so higher
-    level pipeline code can swap between HuggingFace and vLLM backends.  When a
+    The wrapper keeps a small cache of per-layer steering metadata. When a
     steering vector is updated we serialize the payload, broadcast it to all
     worker processes with ``collective_rpc`` and leave a CPU copy in
     ``_layer_specs`` for quick inspection.

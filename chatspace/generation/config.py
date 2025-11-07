@@ -23,21 +23,6 @@ class GenerationConfig:
     seed: Optional[int] = None
     stop_strings: Optional[list[str]] = None
 
-    def to_hf_kwargs(self) -> dict:
-        """Convert to HuggingFace transformers generate() kwargs."""
-        kwargs = {
-            "max_new_tokens": self.max_new_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "do_sample": self.do_sample,
-        }
-        if self.top_k > 0:
-            kwargs["top_k"] = self.top_k
-        if self.stop_strings:
-            # HF uses stop_strings parameter (added in recent versions)
-            kwargs["stop_strings"] = self.stop_strings
-        return kwargs
-
     def to_vllm_params(self):
         """Convert to vLLM SamplingParams.
 
