@@ -279,6 +279,78 @@ Three layers of cleanup prevent memory leaks:
 - Verify `CHATSPACE_SHARED_MEMORY=1` is set if expecting zero-copy behavior
 - Monitor `/dev/shm` usage if concerned about memory consumption
 
+## Code Cleanup and Technical Debt Management
+
+**Lessons learned from 2025-11-07 cleanup effort** (removed 347+ lines of dead code and defensive patterns):
+
+### What Works Well
+
+1. **Phased approach with tests between phases**
+   - Phase 1: Critical fixes (bare excepts, silent failures, hot-path optimizations)
+   - Phase 2: Dead code removal (hook variants, unused abstractions, timed functions)
+   - Commit after each phase passes tests - this creates safe rollback points
+
+2. **Parallel subagents for mechanical edits**
+   - Use separate agents for unrelated files (e.g., runtime.py vs hf_embed/)
+   - Reduces context bloat and speeds up execution
+   - Each agent can focus on one area deeply
+
+3. **Conservative Phase 2-style deletions are safe**
+   - Removing code with zero call sites: hook variants (185 lines), timed extraction (43 lines), unused ABCs (50 lines)
+   - grep/Glob to verify zero usage before deleting
+   - These cleanups have high confidence and low risk
+
+### What to Avoid
+
+1. **"Simplification" refactors are high-risk**
+   - Phase 3 broke captures system with subtle control flow bugs
+   - Flattening nested conditionals changed early-return behavior
+   - Inlining helper functions changed how env vars were parsed
+   - **Rule**: Avoid refactors that touch hot paths or complex conditional logic unless there's a specific bug to fix
+
+2. **Early returns change semantics**
+   - Adding `return None` inside an `if isinstance(output, (tuple, list)):` block prevented fallthrough to dict/object checks
+   - Original code used flat `if` statements that naturally fell through to final `return None`
+   - **Rule**: When "flattening" code, preserve exact control flow - don't add early returns unless they were there originally
+
+3. **Environment variable parsing is brittle**
+   - Inlining `_env_flag` and `_get_env_int` helper functions introduced subtle bugs
+   - Python ternary expressions need careful handling of None checks
+   - **Rule**: Leave working environment parsing code alone unless it's causing actual problems
+
+### How to Avoid This Cleanup in the Future
+
+1. **Write targeted code from the start**
+   - Don't create hook variant systems "for future profiling" - add them when actually needed
+   - Don't build abstractions (ABCs, inheritance) until you have 2+ implementations
+   - Don't create "timed" versions of functions - use profiler when needed
+
+2. **Delete as you go**
+   - When removing a backend (e.g., HuggingFace), immediately delete all related code
+   - When an experiment doesn't pan out (StepContext), delete it before committing
+   - Don't leave "commented out" or "maybe useful later" code
+
+3. **Trust type systems over runtime checks**
+   - If function signature says `metadata: dict[str, Any]` (not optional), don't check `if metadata is not None`
+   - If you're checking None repeatedly, the type hint is probably wrong
+   - Fix the type hint instead of adding defensive checks
+
+4. **Avoid defensive patterns in hot paths**
+   - Don't check `isinstance(cap_config, _ProjectionCapConfig)` on every forward pass - setters guarantee type
+   - Don't call `.to(device=dest.device, dtype=dest.dtype)` if tensor is already correct device/dtype
+   - Profile first, then optimize - don't guess
+
+5. **Keep it simple**
+   - One hook implementation is enough (not 5 variants)
+   - Direct imports are clearer than single-line wrapper functions
+   - Flat conditionals are often clearer than nested ones (but don't force it)
+
+### Key Takeaway
+
+**Dead code removal (Phase 2) is safe and valuable. "Simplification" refactors (Phase 3) are risky and often not worth it unless fixing a specific bug.**
+
+When in doubt, delete unused code aggressively, but leave working code alone.
+
 ## Journaling Practices
 
 - Scratch notes and active investigations go in `TEMP_JOURNAL.md` (gitignored)
