@@ -167,8 +167,8 @@ def _export_profiler_trace(prof: Any, metadata: dict[str, Any]) -> str | None:
     trace_dir = Path(_PROFILE_FETCH_TRACE_DIR).expanduser()
     try:
         trace_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        logger.warning("Unable to create profiler trace directory %s", trace_dir)
+    except OSError as e:
+        logger.debug(f"Failed to create trace directory {trace_dir}: {e}")
         return None
 
     timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
@@ -177,8 +177,8 @@ def _export_profiler_trace(prof: Any, metadata: dict[str, Any]) -> str | None:
     path = trace_dir / filename
     try:
         prof.export_chrome_trace(str(path))
-    except Exception:
-        logger.warning("Failed to export torch profiler trace to %s", path)
+    except (OSError, IOError) as e:
+        logger.debug(f"Failed to save trace to {path}: {e}")
         return None
     if metadata is not None:
         metadata.setdefault("trace_path", str(path))
@@ -980,10 +980,10 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if vector is not None:
             output = _apply_vector_to_output(output, vector)
         cap_config = getattr(self, "_chatspace_projection_cap", None)
-        if isinstance(cap_config, _ProjectionCapConfig):
+        if cap_config is not None:
             output = _apply_projection_cap_to_output(output, cap_config, debug_hook=None)
         ablation_config = getattr(self, "_chatspace_ablation", None)
-        if isinstance(ablation_config, _AblationConfig):
+        if ablation_config is not None:
             output = _apply_ablation_to_output(output, ablation_config)
 
         state = getattr(self, "_chatspace_steering_state", None)
@@ -1028,14 +1028,15 @@ def ensure_layer_patch_installed() -> None:
     for module_name, class_name in _PATCH_TARGETS:
         try:
             module = importlib.import_module(module_name)
-        except Exception:
+        except ImportError:
             continue
         layer_cls = getattr(module, class_name, None)
         if layer_cls is None:
             continue
         try:
             _patch_decoder_layer_class(layer_cls)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to patch {class_name}: {e}")
             continue
     _PATCH_INSTALLED = True
 
@@ -1294,8 +1295,8 @@ def _create_shared_tensor(
             try:
                 shm.close()
                 shm.unlink()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to cleanup shared memory: {e}")
         return serialize_tensor(cpu_tensor)
 
 
@@ -1582,9 +1583,7 @@ def set_worker_vector(worker: Any, layer_idx: int, vector: torch.Tensor) -> None
             f"got {tuple(vector.shape)}"
         )
     with torch.no_grad():
-        dest.copy_(
-            vector.to(device=dest.device, dtype=dest.dtype)
-        )
+        dest.copy_(vector)
 
 
 def set_worker_projection_cap(worker: Any, layer_idx: int, payload: dict[str, Any]) -> None:

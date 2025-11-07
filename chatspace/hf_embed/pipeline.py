@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import time
-from queue import Full
+from queue import Empty, Full
 from typing import Any, Optional
 
 from .bucketing import (
@@ -142,8 +142,8 @@ def _encode_and_dispatch_batch(
     if progress_queue is not None:
         try:
             progress_queue.put_nowait(ProgressUpdate(rows_processed=num_rows))
-        except Exception:
-            pass  # Non-critical if queue is full
+        except Full:
+            pass  # Progress updates are best-effort
 
     for row in rows:
         row["model"] = cfg.model_name
@@ -203,7 +203,7 @@ def _encoder_worker(
         while not shutdown_event.is_set():
             try:
                 item = row_queue.get(timeout=0.1)
-            except Exception:
+            except Empty:
                 continue
 
             if item is _STOP:
@@ -230,11 +230,6 @@ def _encoder_worker(
                 tokenized["attention_mask"] = torch.ones_like(tokenized["input_ids"], dtype=torch.long)
 
             seq_length = _token_sequence_length(tokenized)
-            if seq_length == 0:
-                # Send skipped row update
-                _send_stats_update(stats_queue, rows_skipped=1)
-                continue
-
             bucket_size = _select_bucket_size(seq_length, cfg)
             bucket = buckets.setdefault(bucket_size, _BucketBuffer(bucket_size))
             bucket.add(dict(item), tokenized)
