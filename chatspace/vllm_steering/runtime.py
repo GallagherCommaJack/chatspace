@@ -1048,26 +1048,35 @@ def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
 
 
 def _create_shared_tensor(
-    cpu_tensor: torch.Tensor,
+    tensor: torch.Tensor,
     state: _SteeringState,
     threshold_kb: int = 1024,
 ) -> dict[str, Any]:
     """Create shared memory segment for tensor and return metadata.
 
+    Optimized to write GPU tensors directly to shared memory, eliminating
+    the intermediate CPU buffer allocation (reduces 2 copies to 1 copy).
+
     Args:
-        cpu_tensor: CPU tensor to share (must already be on CPU)
+        tensor: Tensor to share (GPU or CPU)
         state: Worker steering state for tracking active segments
         threshold_kb: Minimum tensor size in KB to use shared memory
 
     Returns:
         Metadata dict with encoding="shm" or encoding="bytes" (fallback)
     """
+    # Ensure tensor is on CPU for serialization
+    if tensor.device.type != 'cpu':
+        cpu_tensor = tensor.cpu()
+    else:
+        cpu_tensor = tensor
+
     # Check if shared memory is enabled
     if not state.use_shared_memory:
         return serialize_tensor(cpu_tensor)
 
     # Check size threshold
-    nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+    nbytes = tensor.numel() * tensor.element_size()
     threshold_bytes = threshold_kb * 1024
     if nbytes < threshold_bytes:
         return serialize_tensor(cpu_tensor)
@@ -1083,6 +1092,7 @@ def _create_shared_tensor(
         )
         return serialize_tensor(cpu_tensor)
 
+    shm_name = None
     try:
         # Generate unique name
         shm_name = f"chatspace_{uuid.uuid4().hex}"
@@ -1090,32 +1100,62 @@ def _create_shared_tensor(
         # Create shared memory segment
         shm = SharedMemory(create=True, size=nbytes, name=shm_name)
 
-        # Handle bfloat16: torch doesn't support .numpy() for bfloat16, need to view as uint16
-        if cpu_tensor.dtype == torch.bfloat16:
-            # View as uint16, convert to numpy, then view as bfloat16
-            np_array = cpu_tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
-        else:
-            np_array = cpu_tensor.numpy()
+        # Optimization: Write directly from GPU to shared memory (1 copy instead of 2)
+        if tensor.device.type == 'cuda':
+            # Handle bfloat16: create shm-backed tensor via uint16 view
+            if tensor.dtype == torch.bfloat16:
+                # Create uint16 view of shm buffer
+                shm_array_u16 = np.ndarray(
+                    tensor.shape,
+                    dtype=np.uint16,
+                    buffer=shm.buf
+                )
+                # Create torch tensor backed by shm (via uint16 view)
+                shm_tensor_u16 = torch.from_numpy(shm_array_u16)
+                # View as bfloat16 for copy
+                shm_tensor = shm_tensor_u16.view(torch.bfloat16)
+            else:
+                # Standard dtypes: create numpy array backed by shm
+                np_dtype = torch.empty(0, dtype=tensor.dtype).numpy().dtype
+                shm_array = np.ndarray(
+                    tensor.shape,
+                    dtype=np_dtype,
+                    buffer=shm.buf
+                )
+                # Create torch tensor backed by shm
+                shm_tensor = torch.from_numpy(shm_array)
 
-        # Copy tensor data to shared memory
-        shm_array = np.ndarray(np_array.shape, dtype=np_array.dtype, buffer=shm.buf)
-        shm_array[:] = np_array
+            # Direct GPU→shm copy (eliminates intermediate CPU allocation)
+            shm_tensor.copy_(tensor, non_blocking=True)
+            torch.cuda.synchronize()  # Ensure copy completes before returning
+
+        else:
+            # CPU tensor: use standard path (no optimization needed)
+            if cpu_tensor.dtype == torch.bfloat16:
+                # View as uint16, convert to numpy, then view as bfloat16
+                np_array = cpu_tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+            else:
+                np_array = cpu_tensor.numpy()
+
+            # Copy tensor data to shared memory
+            shm_array = np.ndarray(np_array.shape, dtype=np_array.dtype, buffer=shm.buf)
+            shm_array[:] = np_array
 
         # Track in state with timestamp
         state.active_shared_memory[shm_name] = (shm, time.time())
 
         # Return metadata
-        dtype_name = str(cpu_tensor.dtype).removeprefix("torch.")
+        dtype_name = str(tensor.dtype).removeprefix("torch.")
         return {
             "encoding": "shm",
             "shm_name": shm_name,
-            "shape": list(cpu_tensor.shape),
+            "shape": list(tensor.shape),
             "dtype": dtype_name,
         }
     except Exception as e:
         logger.warning(f"Failed to create shared memory: {e}, falling back to bytes")
         # Clean up partial state if needed
-        if shm_name in state.active_shared_memory:
+        if shm_name and shm_name in state.active_shared_memory:
             shm, _ = state.active_shared_memory.pop(shm_name)
             try:
                 shm.close()
@@ -1755,38 +1795,38 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
                     cpu_tensor, event = pending[layer_idx]
                     transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
                 else:
-                    # This layer wasn't pre-transferred, start transfer now
-                    # (e.g., remaining decode tokens that didn't reach flush threshold)
-                    if state.transfer_stream is not None:
-                        with torch.cuda.stream(state.transfer_stream):
-                            gpu_tensor = tensor.detach().contiguous()
-                            cpu_tensor = gpu_tensor.to('cpu', non_blocking=True)
-                            event = torch.cuda.Event()
-                            event.record(state.transfer_stream)
-                            transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
+                    # This layer wasn't pre-transferred
+                    # For GPU tensors, we'll pass directly to _create_shared_tensor
+                    # which will do GPU→shm in one copy (no intermediate CPU buffer)
+                    if tensor.device.type == 'cuda':
+                        # GPU tensor: will be copied directly to shm (optimization)
+                        gpu_tensor = tensor.detach().contiguous()
+                        transfer_data[(req_id, layer_idx)] = (gpu_tensor, None, tensor_bytes)
                     else:
-                        # Fallback for non-CUDA devices
+                        # CPU tensor: standard path
                         cpu_tensor = tensor.detach().cpu().contiguous()
                         transfer_data[(req_id, layer_idx)] = (cpu_tensor, None, tensor_bytes)
 
-        # Phase 3: Synchronize all events before serialization
+        # Phase 3: Synchronize pre-transferred events (if any)
         if state.transfer_stream is not None:
             state.transfer_stream.synchronize()
 
-        # Phase 4: Serialize all transferred tensors
+        # Phase 4: Serialize all tensors (GPU→shm or CPU→shm)
         for req_id in request_ids:
             captures = state.request_captures.pop(req_id, {})
             serialized = {}
 
             for layer_idx in captures.keys():
-                cpu_tensor, _, tensor_bytes = transfer_data[(req_id, layer_idx)]
+                tensor, _, tensor_bytes = transfer_data[(req_id, layer_idx)]
 
                 # Time serialization (shared memory or bytes)
                 t_numpy_start = time.perf_counter()
 
-                # Use shared memory if enabled and tensor is large enough
+                # _create_shared_tensor handles both GPU and CPU tensors
+                # For GPU: direct copy to shm (1 copy, non_blocking=True)
+                # For CPU: standard copy to shm (already on CPU)
                 payload = _create_shared_tensor(
-                    cpu_tensor,
+                    tensor,
                     state,
                     threshold_kb=state.shm_threshold_kb
                 )
