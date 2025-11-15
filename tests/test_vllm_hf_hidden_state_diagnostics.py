@@ -350,7 +350,6 @@ async def test_comprehensive_hidden_state_diagnostics():
     print(f"  - Cosine similarity:         {cos_sim:.6f}")
 
     # Clean up
-    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()

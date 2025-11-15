@@ -7,7 +7,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
@@ -392,10 +398,20 @@ async def test_hidden_states_with_steering_applied():
     await handles_baseline[0].fetch()
     vllm_baseline_hidden = handles_baseline[0].captures[target_layer][0]["hidden"][-1, :].cpu()
 
-    # Apply steering and get modified hidden states
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
+    # Apply steering via per-request API
+    steering_unit = steering_vector / steering_vector.norm()
+    steering_scale = steering_vector.norm().item()
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=steering_unit.cpu(), scale=steering_scale)
+        )
+    })
+
     texts_steered, handles_steered = await vllm_model.generate(
-        [prompt], sampling_params=sampling, capture_layers=target_layer
+        [prompt],
+        sampling_params=sampling,
+        capture_layers=target_layer,
+        steering_spec=steering_spec
     )
     await handles_steered[0].fetch()
     vllm_steered_hidden = handles_steered[0].captures[target_layer][0]["hidden"][-1, :].cpu()
