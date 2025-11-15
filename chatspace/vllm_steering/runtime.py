@@ -1315,6 +1315,13 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                 )
                 # Increment global_step so next batch stores at a different index
                 state.global_step += 1
+
+                # Clean up old metadata to prevent unbounded growth (keep last 1000 steps)
+                if len(state.step_metadata) > 1000:
+                    old_steps = sorted(state.step_metadata.keys())[:-1000]
+                    for step in old_steps:
+                        state.step_metadata.pop(step, None)
+                    logger.debug(f"Cleaned up {len(old_steps)} old step_metadata entries")
             else:
                 logger.debug("No request_ids extracted from model_input")
         except Exception as e:
@@ -1623,8 +1630,11 @@ def register_steering_spec(
 def unregister_steering_spec(worker: Any, request_id: str) -> None:
     """Unregister a per-request steering spec from the worker."""
     state = _ensure_state(worker)
-    logger.debug(f"unregister_steering_spec: request_id={request_id}")
-    state.request_steering_specs.pop(request_id, None)
+    spec = state.request_steering_specs.pop(request_id, None)
+    if spec is None:
+        logger.warning(f"unregister_steering_spec called for unknown request_id={request_id}")
+    else:
+        logger.debug(f"unregister_steering_spec: request_id={request_id}")
 
 
 def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:

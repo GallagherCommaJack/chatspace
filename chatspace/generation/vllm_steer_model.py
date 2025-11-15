@@ -776,8 +776,121 @@ class VLLMSteerModel:
         """Unregister a per-request steering spec from all workers."""
         await self._collective_rpc("unregister_steering_spec", request_id)
 
+    @staticmethod
+    def simple_steering(layer: int, vector: torch.Tensor, scale: float = 1.0) -> SteeringSpec:
+        """Create a simple additive steering spec for a single layer.
+
+        Parameters
+        ----------
+        layer : int
+            Layer index to apply steering to.
+        vector : torch.Tensor
+            Steering vector (will be normalized to unit vector).
+        scale : float, optional
+            Magnitude to scale the unit vector by (default: 1.0).
+
+        Returns
+        -------
+        SteeringSpec
+            A steering spec with a single additive steering layer.
+
+        Examples
+        --------
+        >>> model = VLLMSteerModel(cfg)
+        >>> my_vector = torch.randn(model.hidden_size)
+        >>> spec = VLLMSteerModel.simple_steering(5, my_vector, scale=2.0)
+        >>> outputs = await model.generate(prompts, sampling_params, steering_spec=spec)
+        """
+        norm = float(vector.norm().item())
+        unit = vector / norm if norm > 0 else vector
+        return SteeringSpec(
+            layers={layer: LayerSteeringSpec(add=AddSpec(vector=unit, scale=norm * scale))}
+        )
+
+    @staticmethod
+    def simple_projection_cap(
+        layer: int, vector: torch.Tensor, min: float | None = None, max: float | None = None
+    ) -> SteeringSpec:
+        """Create a projection cap steering spec for a single layer.
+
+        Limits the projection of hidden states onto a direction vector.
+
+        Parameters
+        ----------
+        layer : int
+            Layer index to apply projection cap to.
+        vector : torch.Tensor
+            Direction vector to project onto (will be normalized).
+        min : float | None
+            Minimum allowed projection value.
+        max : float | None
+            Maximum allowed projection value.
+
+        Returns
+        -------
+        SteeringSpec
+            A steering spec with a single projection cap layer.
+
+        Examples
+        --------
+        >>> spec = VLLMSteerModel.simple_projection_cap(5, direction_vec, min=-0.5, max=0.5)
+        >>> outputs = await model.generate(prompts, sampling_params, steering_spec=spec)
+        """
+        if min is None and max is None:
+            raise ValueError("Must specify at least one of min or max")
+        norm = float(vector.norm().item())
+        if norm == 0:
+            raise ValueError("Projection cap vector must have nonzero norm")
+        unit = vector / norm
+        return SteeringSpec(
+            layers={
+                layer: LayerSteeringSpec(projection_cap=ProjectionCapSpec(vector=unit, min=min, max=max))
+            }
+        )
+
+    @staticmethod
+    def simple_ablation(layer: int, vector: torch.Tensor, scale: float = 1.0) -> SteeringSpec:
+        """Create an ablation steering spec for a single layer.
+
+        Removes the component of hidden states along a direction vector.
+
+        Parameters
+        ----------
+        layer : int
+            Layer index to apply ablation to.
+        vector : torch.Tensor
+            Direction vector to ablate (will be normalized).
+        scale : float, optional
+            Ablation strength, where 1.0 = full ablation (default: 1.0).
+
+        Returns
+        -------
+        SteeringSpec
+            A steering spec with a single ablation layer.
+
+        Examples
+        --------
+        >>> spec = VLLMSteerModel.simple_ablation(5, direction_vec, scale=0.7)
+        >>> outputs = await model.generate(prompts, sampling_params, steering_spec=spec)
+        """
+        norm = float(vector.norm().item())
+        if norm == 0:
+            raise ValueError("Ablation vector must have nonzero norm")
+        unit = vector / norm
+        return SteeringSpec(
+            layers={layer: LayerSteeringSpec(ablation=AblationSpec(vector=unit, scale=scale))}
+        )
+
     def _serialize_steering_spec(self, spec: SteeringSpec) -> dict[str, Any]:
         """Serialize a SteeringSpec for RPC transmission."""
+        # Validate layer indices before serialization
+        for layer_idx in spec.layers.keys():
+            if layer_idx < 0 or layer_idx >= self.layer_count:
+                raise ValueError(
+                    f"Layer index {layer_idx} out of range [0, {self.layer_count}). "
+                    f"Model {self.cfg.model_name} has {self.layer_count} layers."
+                )
+
         serialized_layers = {}
         for layer_idx, layer_spec in spec.layers.items():
             serialized_layer = {}
@@ -911,10 +1024,22 @@ class VLLMSteerModel:
             else:
                 return results
         finally:
-            # Clean up steering specs
+            # Clean up steering specs with timeout handling
             if steering_spec is not None:
+                failures = []
                 for req_id in request_ids:
-                    await self._unregister_steering_spec(req_id)
+                    try:
+                        await asyncio.wait_for(
+                            self._unregister_steering_spec(req_id),
+                            timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        failures.append(f"{req_id} (timeout)")
+                    except Exception as e:
+                        failures.append(f"{req_id} ({type(e).__name__}: {e})")
+
+                if failures:
+                    logger.warning(f"Steering cleanup failed for {len(failures)} requests: {failures[:5]}")
 
     @overload
     async def chat(
