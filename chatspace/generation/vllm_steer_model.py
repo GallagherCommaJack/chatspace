@@ -601,6 +601,7 @@ class VLLMSteerModel:
         shm_threshold_kb: int | None = None,
         shm_ttl_seconds: int | None = None,
         shm_max_gb: float | None = None,
+        decode_buffer_size: int | None = None,
         **vllm_kwargs,
     ) -> None:
         self.cfg = cfg
@@ -622,6 +623,10 @@ class VLLMSteerModel:
         self._shm_max_gb = (
             shm_max_gb if shm_max_gb is not None
             else float(os.getenv("CHATSPACE_MAX_SHM_GB", "128"))
+        )
+        self._decode_buffer_size = (
+            decode_buffer_size if decode_buffer_size is not None
+            else int(os.getenv("CHATSPACE_DECODE_BUFFER_SIZE", "128"))
         )
 
         enforce_eager_raw = vllm_kwargs.get("enforce_eager", True)
@@ -719,7 +724,7 @@ class VLLMSteerModel:
             self._engine = AsyncLLMEngine.from_engine_args(self._engine_args)
             self._engine_client = self._engine  # AsyncLLMEngine has collective_rpc directly
 
-            # Initialize worker state with shared memory config
+            # Initialize worker state with shared memory and capture config
             setup_info = await self._collective_rpc(
                 "initialize_worker_state",
                 self._init_layers,
@@ -727,6 +732,7 @@ class VLLMSteerModel:
                 self._shm_threshold_kb,
                 self._shm_ttl_seconds,
                 self._shm_max_gb,
+                self._decode_buffer_size,
             )
             if not setup_info:
                 raise RuntimeError("Failed to initialize steering state on workers.")
@@ -1024,22 +1030,26 @@ class VLLMSteerModel:
             else:
                 return results
         finally:
-            # Clean up steering specs with timeout handling
+            # Clean up steering specs in parallel with timeout handling
             if steering_spec is not None:
-                failures = []
-                for req_id in request_ids:
-                    try:
-                        await asyncio.wait_for(
-                            self._unregister_steering_spec(req_id),
-                            timeout=5.0
-                        )
-                    except asyncio.TimeoutError:
-                        failures.append(f"{req_id} (timeout)")
-                    except Exception as e:
-                        failures.append(f"{req_id} ({type(e).__name__}: {e})")
-
-                if failures:
-                    logger.warning(f"Steering cleanup failed for {len(failures)} requests: {failures[:5]}")
+                cleanup_tasks = [
+                    self._unregister_steering_spec(req_id) for req_id in request_ids
+                ]
+                try:
+                    # Run all cleanups in parallel with a single timeout for the entire batch
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                        timeout=5.0
+                    )
+                    # Check for failures
+                    failures = []
+                    for req_id, result in zip(request_ids, results):
+                        if isinstance(result, Exception):
+                            failures.append(f"{req_id} ({type(result).__name__}: {result})")
+                    if failures:
+                        logger.warning(f"Steering cleanup failed for {len(failures)} requests: {failures[:5]}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Steering cleanup timed out for batch of {len(request_ids)} requests")
 
     @overload
     async def chat(

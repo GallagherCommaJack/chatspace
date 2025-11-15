@@ -288,6 +288,7 @@ class _SteeringState:
 
     # Shared memory IPC for zero-copy activation extraction
     active_shared_memory: dict[str, tuple[Any, float]] = None  # shm_name -> (SharedMemory, timestamp)
+    shm_lock: threading.Lock = None  # Protects active_shared_memory dict access
     shm_cleanup_thread: Any = None  # threading.Thread for TTL cleanup
 
     # Shared memory configuration
@@ -295,6 +296,9 @@ class _SteeringState:
     shm_threshold_kb: int = 1024
     shm_ttl_seconds: int = 600
     shm_max_gb: float = 128.0
+
+    # Capture configuration
+    decode_buffer_size: int = 128  # Flush decode buffer every N tokens
 
 
 @dataclass
@@ -735,8 +739,8 @@ def _capture_hook_full(
             decode_buf = state.request_decode_buffers[req_id][layer_idx]
             decode_buf.append(req_hidden.detach())
 
-            # Flush buffer every 128 tokens to reduce cat operations
-            if len(decode_buf) >= 128:
+            # Flush buffer periodically to reduce cat operations
+            if len(decode_buf) >= state.decode_buffer_size:
                 batched = torch.cat(decode_buf, dim=0)
                 decode_buf.clear()
 
@@ -768,15 +772,19 @@ def _apply_per_request_steering(
     layer_idx: int,
     request_ids: list[str],
     seq_lens: list[int] | None,
+    cached_hidden: torch.Tensor | None = None,
 ) -> Any:
     """Apply per-request steering by slicing, transforming, and concatenating.
 
     This function extracts the hidden state tensor, slices it per request,
     applies each request's steering configuration (if present), and
     reconstructs the output.
+
+    Args:
+        cached_hidden: Pre-extracted hidden state to avoid double extraction
     """
-    # Extract hidden state for slicing
-    hidden = _extract_hidden_from_output(output)
+    # Use cached hidden if available, otherwise extract
+    hidden = cached_hidden if cached_hidden is not None else _extract_hidden_from_output(output)
     if hidden is None or hidden.dim() != 2:
         return output
 
@@ -940,11 +948,21 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                     has_per_request_steering = True
                     break
 
+        # Extract hidden state once for both steering and capture
+        # This avoids double extraction when both are active
+        cached_hidden = None
+        if has_per_request_steering or state.active_capture_requests:
+            cached_hidden = _extract_hidden_from_output(output)
+
         # Apply per-request steering if needed
         if has_per_request_steering:
             output = _apply_per_request_steering(
-                output, state, layer_idx, request_ids, seq_lens
+                output, state, layer_idx, request_ids, seq_lens, cached_hidden=cached_hidden
             )
+            # After steering, output has changed, so invalidate cached_hidden
+            # We need to re-extract for capture
+            if state.active_capture_requests:
+                cached_hidden = _extract_hidden_from_output(output)
 
         # Handle activation capture
         if state is None or not state.active_capture_requests:
@@ -953,7 +971,7 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
         if request_ids is None or layer_idx is None:
             return output
 
-        hidden = _extract_hidden_from_output(output)
+        hidden = cached_hidden if cached_hidden is not None else _extract_hidden_from_output(output)
         if hidden is None or hidden.dim() != 2:
             return output
 
@@ -1163,9 +1181,10 @@ def _create_shared_tensor(
 
     # Check memory limit
     max_gb = state.shm_max_gb
-    total_shm_bytes = sum(
-        shm.size for shm, _ in state.active_shared_memory.values()
-    )
+    with state.shm_lock:
+        total_shm_bytes = sum(
+            shm.size for shm, _ in state.active_shared_memory.values()
+        )
     if (total_shm_bytes + nbytes) / (1024**3) > max_gb:
         logger.warning(
             f"Shared memory limit reached ({max_gb}GB), falling back to bytes"
@@ -1191,7 +1210,8 @@ def _create_shared_tensor(
         shm_array[:] = np_array
 
         # Track in state with timestamp
-        state.active_shared_memory[shm_name] = (shm, time.time())
+        with state.shm_lock:
+            state.active_shared_memory[shm_name] = (shm, time.time())
 
         # Return metadata
         dtype_name = str(cpu_tensor.dtype).removeprefix("torch.")
@@ -1204,11 +1224,14 @@ def _create_shared_tensor(
     except Exception as e:
         logger.warning(f"Failed to create shared memory: {e}, falling back to bytes")
         # Clean up partial state if needed
-        if shm_name in state.active_shared_memory:
-            shm, _ = state.active_shared_memory.pop(shm_name)
+        shm_to_cleanup = None
+        with state.shm_lock:
+            if shm_name in state.active_shared_memory:
+                shm_to_cleanup, _ = state.active_shared_memory.pop(shm_name)
+        if shm_to_cleanup is not None:
             try:
-                shm.close()
-                shm.unlink()
+                shm_to_cleanup.close()
+                shm_to_cleanup.unlink()
             except Exception as e:
                 logger.debug(f"Failed to cleanup shared memory: {e}")
         return serialize_tensor(cpu_tensor)
@@ -1324,12 +1347,20 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                     logger.debug(f"Cleaned up {len(old_steps)} old step_metadata entries")
             else:
                 logger.debug("No request_ids extracted from model_input")
-        except Exception as e:
-            # Log exception details instead of silently failing
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            # Catch expected exceptions from object introspection and data access
+            # These can occur if vLLM's internal structure changes
             logger.warning(
                 f"Failed to extract metadata from model_input: {type(e).__name__}: {e}",
                 exc_info=True
             )
+        except Exception as e:
+            # Unexpected exception - log at ERROR level and re-raise
+            logger.error(
+                f"Unexpected error in metadata extraction: {type(e).__name__}: {e}",
+                exc_info=True
+            )
+            raise
 
         # Call original execute_model
         return original_execute(model_input, *args, **kwargs)
@@ -1345,6 +1376,7 @@ def initialize_worker_state(
     shm_threshold_kb: int = 1024,
     shm_ttl_seconds: int = 600,
     shm_max_gb: float = 128.0,
+    decode_buffer_size: int = 128,
 ) -> dict[str, Any]:
     """Install steering patch on worker after model load."""
     ensure_layer_patch_installed()
@@ -1381,11 +1413,13 @@ def initialize_worker_state(
         transfer_stream=torch.cuda.Stream(device=device) if device.type == 'cuda' else None,
         request_pending_transfers={},
         active_shared_memory={},
+        shm_lock=threading.Lock(),
         shm_cleanup_thread=None,
         use_shared_memory=use_shared_memory,
         shm_threshold_kb=shm_threshold_kb,
         shm_ttl_seconds=shm_ttl_seconds,
         shm_max_gb=shm_max_gb,
+        decode_buffer_size=decode_buffer_size,
     )
     worker._chatspace_steering = state
 
@@ -1704,35 +1738,49 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
         # Phase 2: Collect pre-transferred data and start new transfers for remaining data
         transfer_data: dict[tuple[str, int], tuple[torch.Tensor, torch.cuda.Event | None, int]] = {}
 
-        for req_id in request_ids:
-            # First check for pre-transferred data from Phase 2 streaming
-            pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
+        # Hoist transfer stream check outside loop to avoid repeated branching
+        if state.transfer_stream is not None:
+            # CUDA path: use async transfers
+            for req_id in request_ids:
+                # First check for pre-transferred data from Phase 2 streaming
+                pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
 
-            # Get current captures (may include data not yet transferred)
-            captures = state.request_captures.get(req_id, {})
+                # Get current captures (may include data not yet transferred)
+                captures = state.request_captures.get(req_id, {})
 
-            for layer_idx, tensor in captures.items():
-                layer_count += 1
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                total_bytes += tensor_bytes
+                for layer_idx, tensor in captures.items():
+                    layer_count += 1
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    total_bytes += tensor_bytes
 
-                # Check if this layer was pre-transferred during generation
-                if layer_idx in pending:
-                    # Use pre-transferred data (already in flight or complete)
-                    cpu_tensor, event = pending[layer_idx]
-                    transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
-                else:
-                    # This layer wasn't pre-transferred, start transfer now
-                    # (e.g., remaining decode tokens that didn't reach flush threshold)
-                    if state.transfer_stream is not None:
+                    # Check if this layer was pre-transferred during generation
+                    if layer_idx in pending:
+                        # Use pre-transferred data (already in flight or complete)
+                        cpu_tensor, event = pending[layer_idx]
+                        transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
+                    else:
+                        # This layer wasn't pre-transferred, start transfer now
                         with torch.cuda.stream(state.transfer_stream):
                             gpu_tensor = tensor.detach().contiguous()
                             cpu_tensor = gpu_tensor.to('cpu', non_blocking=True)
                             event = torch.cuda.Event()
                             event.record(state.transfer_stream)
                             transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
+        else:
+            # Non-CUDA path: synchronous transfers
+            for req_id in request_ids:
+                pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
+                captures = state.request_captures.get(req_id, {})
+
+                for layer_idx, tensor in captures.items():
+                    layer_count += 1
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    total_bytes += tensor_bytes
+
+                    if layer_idx in pending:
+                        cpu_tensor, event = pending[layer_idx]
+                        transfer_data[(req_id, layer_idx)] = (cpu_tensor, event, tensor_bytes)
                     else:
-                        # Fallback for non-CUDA devices
                         cpu_tensor = tensor.detach().cpu().contiguous()
                         transfer_data[(req_id, layer_idx)] = (cpu_tensor, None, tensor_bytes)
 
@@ -1850,12 +1898,15 @@ def release_shared_memory(worker: Any, shm_names: list[str]) -> dict[str, Any]:
     errors = []
 
     for shm_name in shm_names:
-        if shm_name not in state.active_shared_memory:
-            not_found.append(shm_name)
-            continue
-
-        try:
+        # Pop from dict with lock held
+        with state.shm_lock:
+            if shm_name not in state.active_shared_memory:
+                not_found.append(shm_name)
+                continue
             shm, _ = state.active_shared_memory.pop(shm_name)
+
+        # Close and unlink outside lock
+        try:
             shm.close()
             shm.unlink()
             released.append(shm_name)
@@ -1888,22 +1939,31 @@ def _cleanup_stale_shared_memory(state: _SteeringState, stop_event: threading.Ev
     logger.info(f"Starting shared memory cleanup thread (TTL: {ttl_seconds}s, scan: {scan_interval}s)")
 
     while not stop_event.wait(scan_interval):
-        if not state.active_shared_memory:
-            continue
+        # Snapshot current shared memory state with lock
+        with state.shm_lock:
+            if not state.active_shared_memory:
+                continue
+            active_items = list(state.active_shared_memory.items())
 
         now = time.time()
         stale_names = []
 
-        # Find stale segments
-        for shm_name, (shm, timestamp) in state.active_shared_memory.items():
+        # Find stale segments (outside lock)
+        for shm_name, (shm, timestamp) in active_items:
             age = now - timestamp
             if age > ttl_seconds:
                 stale_names.append(shm_name)
 
         # Clean up stale segments
         for shm_name in stale_names:
-            try:
+            # Pop from dict with lock held
+            with state.shm_lock:
+                if shm_name not in state.active_shared_memory:
+                    continue  # Already cleaned up
                 shm, timestamp = state.active_shared_memory.pop(shm_name)
+
+            # Close and unlink outside lock
+            try:
                 age = now - timestamp
                 shm.close()
                 shm.unlink()
