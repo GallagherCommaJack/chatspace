@@ -1244,7 +1244,7 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
 
     def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
         """Intercept execute_model to capture batch metadata."""
-        if not state.active_capture_requests:
+        if not state.active_capture_requests and not state.request_steering_specs:
             return original_execute(model_input, *args, **kwargs)
         logger.debug(
             f"patched_execute_model called: model_input type={type(model_input).__name__}, "
@@ -1313,6 +1313,8 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                     f"Stored step_metadata for step {current_step}: "
                     f"request_ids={request_ids}, seq_lens={seq_lens}"
                 )
+                # Increment global_step so next batch stores at a different index
+                state.global_step += 1
             else:
                 logger.debug("No request_ids extracted from model_input")
         except Exception as e:

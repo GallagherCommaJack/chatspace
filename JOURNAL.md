@@ -145,6 +145,83 @@ results = await model.generate(prompts, steering_spec=spec)
 - Consider adding performance benchmarks for heterogeneous batching
 - May want example notebook demonstrating per-user steering use case
 
+### Per-Request Steering Bug Fix: Metadata Gate Condition
+
+**Timestamp:** 2025-11-15 04:40 UTC
+
+Fixed critical bug where per-request steering had no effect on generation due to incorrect gate condition in metadata extraction.
+
+**Symptoms:**
+- `test_vllm_chat_respects_steering` failed with identical logprobs for baseline and steered outputs
+- Steering vectors registered successfully but never applied during generation
+- Even extreme steering (scale=5000) had zero effect on token probabilities
+
+**Root Cause:**
+
+Metadata extraction in `patched_execute_model()` was gated by `if not state.active_capture_requests:` early return (line 1247). This meant:
+- ✅ **When capture enabled:** Metadata extracted → both capture AND steering worked
+- ❌ **When steering only:** Early return skipped metadata → steering failed silently
+
+Per-request steering and capture both depend on the same metadata system (request IDs, sequence lengths), but steering-only requests never triggered metadata extraction.
+
+**Why This Happened:**
+
+The gate condition assumed metadata was only needed for capture. When per-request steering was added, it reused the same metadata infrastructure but the gate condition wasn't updated to check for active steering requests.
+
+**Debugging Process:**
+
+1. **Initial hypothesis:** `global_step` never incremented (causing off-by-one in metadata lookup)
+2. **Key insight from user:** "Per-request steering should reuse the same machinery as per-request activation capture"
+3. **Investigation revealed:** Capture tests passed but steering tests failed, even though they should share infrastructure
+4. **Root cause found:** Gate condition only checked `active_capture_requests`, not `request_steering_specs`
+
+**The Fix:**
+
+Two changes in `chatspace/vllm_steering/runtime.py`:
+
+1. **Fixed gate condition (line 1247):**
+   ```python
+   # Before:
+   if not state.active_capture_requests:
+       return original_execute(model_input, *args, **kwargs)
+
+   # After:
+   if not state.active_capture_requests and not state.request_steering_specs:
+       return original_execute(model_input, *args, **kwargs)
+   ```
+
+2. **Added missing global_step increment (line 1317):**
+   ```python
+   # After storing metadata:
+   state.global_step += 1
+   ```
+
+The increment was lost during cleanup commit d442dfe when `_StepContext` infrastructure was removed. Without it, metadata would be stored at step 0 but forward hooks would look for step -1.
+
+**Test Results:**
+
+Before fix:
+- `test_vllm_chat_respects_steering` ❌ FAILED - steering had no effect
+- `test_vllm_comprehensive_integration` ✅ PASSED - capture enabled, so metadata worked
+
+After fix:
+- `test_vllm_chat_respects_steering` ✅ PASSED - steering now works independently
+- `test_vllm_comprehensive_integration` ✅ PASSED - no regressions
+
+**Lessons Learned:**
+
+1. **Shared infrastructure needs unified gate conditions:** When multiple features depend on the same metadata system, all triggers must be checked
+2. **Silent failures are dangerous:** Steering failed silently because missing metadata just resulted in `has_per_request_steering = False`
+3. **Test isolation matters:** Comprehensive test masked the bug by enabling capture, which accidentally fixed steering
+4. **User intuition is valuable:** "Should reuse same machinery" led directly to finding the divergence point
+5. **Cleanup can introduce subtle bugs:** The missing increment was removed during "dead code" cleanup
+
+**Impact:**
+
+- Per-request steering now works independently of activation capture
+- Steering-only use cases (no capture) now function correctly
+- Both features can be used together or separately without issues
+
 ---
 
 ## 2025-10-31
