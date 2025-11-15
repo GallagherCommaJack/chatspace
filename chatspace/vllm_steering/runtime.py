@@ -263,9 +263,6 @@ class _SteeringState:
     hidden_size: int
     dtype: torch.dtype
     device: torch.device
-    layer_vectors: dict[int, torch.Tensor]
-    projection_caps: dict[int, "_ProjectionCapConfig"]
-    ablations: dict[int, "_AblationConfig"]
 
     # Per-request activation capture
     active_capture_requests: dict[str, set[int]] = None  # request_id -> layer indices
@@ -274,6 +271,9 @@ class _SteeringState:
     request_decode_buffers: dict[str, dict[int, list[torch.Tensor]]] = None  # request_id -> layer -> decode tokens
     request_last_phase: dict[str, str] = None  # request_id -> "prefill" or "decode"
     request_token_counts: dict[str, int] = None  # request_id -> token count
+
+    # Per-request steering
+    request_steering_specs: dict[str, Any] = None  # request_id -> SteeringSpec (Any to avoid circular import)
 
     # Per-step batch metadata (captured from model runner)
     step_metadata: dict[int, dict[str, Any]] = None  # step_number -> {request_ids, seq_lens, ...}
@@ -762,6 +762,146 @@ def _capture_hook_full(
 
 
 
+def _apply_per_request_steering(
+    output: Any,
+    state: _SteeringState,
+    layer_idx: int,
+    request_ids: list[str],
+    seq_lens: list[int] | None,
+) -> Any:
+    """Apply per-request steering by slicing, transforming, and concatenating.
+
+    This function extracts the hidden state tensor, slices it per request,
+    applies each request's steering configuration (if present), and
+    reconstructs the output.
+    """
+    # Extract hidden state for slicing
+    hidden = _extract_hidden_from_output(output)
+    if hidden is None or hidden.dim() != 2:
+        return output
+
+    # Handle case where seq_lens is None (single request or no metadata)
+    if seq_lens is None or len(seq_lens) != len(request_ids):
+        # Fall back to treating entire batch as single request
+        if len(request_ids) == 1:
+            req_id = request_ids[0]
+            spec = state.request_steering_specs.get(req_id)
+            if spec is not None and layer_idx in spec.layers:
+                return _apply_layer_steering_to_output(output, spec.layers[layer_idx], state)
+        return output
+
+    # Slice hidden states per request
+    request_slices = []
+    start_idx = 0
+
+    for i, req_id in enumerate(request_ids):
+        seq_len = seq_lens[i]
+        end_idx = start_idx + seq_len
+        req_hidden = hidden[start_idx:end_idx]
+
+        # Apply steering if this request has a spec for this layer
+        spec = state.request_steering_specs.get(req_id)
+        if spec is not None and layer_idx in spec.layers:
+            layer_spec = spec.layers[layer_idx]
+            req_hidden = _apply_layer_steering_to_hidden(req_hidden, layer_spec, state)
+
+        request_slices.append(req_hidden)
+        start_idx = end_idx
+
+    # Concatenate transformed slices
+    transformed_hidden = torch.cat(request_slices, dim=0)
+
+    # Reconstruct output with transformed hidden state
+    return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
+
+
+def _apply_layer_steering_to_hidden(
+    hidden: torch.Tensor,
+    layer_spec: Any,  # DeserializedLayerSpec from register_steering_spec
+    state: _SteeringState,
+) -> torch.Tensor:
+    """Apply steering operations (add, projection_cap, ablation) to a hidden state tensor."""
+    # Apply additive steering
+    if layer_spec.add is not None:
+        # layer_spec.add is already a tensor on the correct device/dtype
+        hidden = hidden + layer_spec.add
+
+    # Apply projection cap
+    if layer_spec.projection_cap is not None:
+        # layer_spec.projection_cap is (cap_vector, min, max)
+        cap_vector, cap_min, cap_max = layer_spec.projection_cap
+        cap_config = _ProjectionCapConfig(
+            unit_vector=cap_vector,
+            min=cap_min,
+            max=cap_max,
+        )
+        hidden = _apply_projection_cap(hidden, cap_config)
+
+    # Apply ablation
+    if layer_spec.ablation is not None:
+        # layer_spec.ablation is (abl_vector, scale)
+        abl_vector, abl_scale = layer_spec.ablation
+        ablation_config = _AblationConfig(
+            unit_vector=abl_vector,
+            scale=abl_scale,
+        )
+        hidden = _apply_ablation(hidden, ablation_config)
+
+    return hidden
+
+
+def _apply_layer_steering_to_output(
+    output: Any,
+    layer_spec: Any,  # LayerSteeringSpec
+    state: _SteeringState,
+) -> Any:
+    """Apply layer steering to the entire output (for single-request case)."""
+    def transform(hidden: torch.Tensor) -> torch.Tensor:
+        return _apply_layer_steering_to_hidden(hidden, layer_spec, state)
+
+    return _transform_output(output, transform, fallback=None, mode="hidden")
+
+
+def _reconstruct_output_with_hidden(
+    output: Any,
+    original_hidden: torch.Tensor,
+    transformed_hidden: torch.Tensor,
+) -> Any:
+    """Reconstruct output structure with transformed hidden state."""
+    # Handle Qwen-style (delta, residual) output
+    if _is_qwen_layer_output(output):
+        delta, residual = output[0], output[1]
+        # transformed_hidden = residual + new_delta
+        # new_delta = transformed_hidden - residual
+        new_delta = transformed_hidden - residual
+        return (new_delta,) + output[1:]
+
+    # Handle tensor output
+    if isinstance(output, torch.Tensor):
+        return transformed_hidden
+
+    # Handle tuple/list output
+    if isinstance(output, (tuple, list)):
+        if isinstance(output, tuple):
+            return (transformed_hidden,) + output[1:]
+        else:
+            return [transformed_hidden] + output[1:]
+
+    # Handle dict output
+    if isinstance(output, dict) and "last_hidden_state" in output:
+        patched = dict(output)
+        patched["last_hidden_state"] = transformed_hidden
+        return patched
+
+    # Handle object with last_hidden_state attribute
+    if hasattr(output, "last_hidden_state"):
+        output.last_hidden_state = transformed_hidden
+        return output
+
+    # Fallback: return transformed_hidden directly
+    return transformed_hidden
+
+
 def _patch_decoder_layer_class(layer_cls: type) -> None:
     if layer_cls in _PATCHED_CLASSES:
         return
@@ -771,71 +911,52 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
     @wraps(original_init)
     def _patched_init(self, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
-        if hasattr(self, "_chatspace_steering_vector"):
-            with torch.no_grad():
-                self._chatspace_steering_vector.zero_()  # type: ignore[attr-defined]
-        else:
-            hidden_size = getattr(self, "hidden_size", None)
-            if hidden_size is None:
-                # Fallback: infer hidden size from first parameter.
-                param = next(self.parameters(), None)
-                if param is None:
-                    raise RuntimeError(
-                        f"Cannot infer hidden size for steering patch on {layer_cls!r}"
-                    )
-                hidden_size = param.shape[-1]
-            ref_param = next(self.parameters(), None)
-            dtype = ref_param.dtype if ref_param is not None else torch.float32
-            device = ref_param.device if ref_param is not None else torch.device("cpu")
-            parameter = nn.Parameter(
-                torch.zeros(hidden_size, dtype=dtype, device=device),
-                requires_grad=True,
-            )
-            self.register_parameter("_chatspace_steering_vector", parameter)
-        if not hasattr(self, "_chatspace_projection_cap"):
-            self._chatspace_projection_cap = None  # type: ignore[attr-defined]
-        if not hasattr(self, "_chatspace_ablation"):
-            self._chatspace_ablation = None  # type: ignore[attr-defined]
+        # No longer need module parameters for global steering
 
     @wraps(original_forward)
     def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
         output = original_forward(self, *args, **kwargs)
 
-        vector = getattr(self, "_chatspace_steering_vector", None)
-        if vector is not None:
-            output = _apply_vector_to_output(output, vector)
-        cap_config = getattr(self, "_chatspace_projection_cap", None)
-        if cap_config is not None:
-            output = _apply_projection_cap_to_output(output, cap_config, debug_hook=None)
-        ablation_config = getattr(self, "_chatspace_ablation", None)
-        if ablation_config is not None:
-            output = _apply_ablation_to_output(output, ablation_config)
-
         state = getattr(self, "_chatspace_steering_state", None)
+        layer_idx = getattr(self, "_chatspace_layer_index", None)
+
+        # Extract request metadata for per-request steering
+        request_ids = None
+        seq_lens = None
+        if state is not None:
+            current_step = state.global_step - 1
+            if current_step >= 0:
+                metadata = state.step_metadata.get(current_step)
+                if metadata is not None:
+                    request_ids = metadata.get("request_ids")
+                    seq_lens = metadata.get("seq_lens")
+
+        # Check if we have per-request steering specs for any request in the batch
+        has_per_request_steering = False
+        if state is not None and request_ids and layer_idx is not None:
+            for req_id in request_ids:
+                spec = state.request_steering_specs.get(req_id)
+                if spec is not None and layer_idx in spec.layers:
+                    has_per_request_steering = True
+                    break
+
+        # Apply per-request steering if needed
+        if has_per_request_steering:
+            output = _apply_per_request_steering(
+                output, state, layer_idx, request_ids, seq_lens
+            )
+
+        # Handle activation capture
         if state is None or not state.active_capture_requests:
             return output
 
-        current_step = state.global_step - 1
-        if current_step < 0:
-            return output
-
-        metadata = state.step_metadata.get(current_step)
-        if metadata is None:
-            return output
-
-        request_ids = metadata.get("request_ids")
-        if not request_ids:
-            return output
-
-        layer_idx = getattr(self, "_chatspace_layer_index", None)
-        if layer_idx is None:
+        if request_ids is None or layer_idx is None:
             return output
 
         hidden = _extract_hidden_from_output(output)
         if hidden is None or hidden.dim() != 2:
             return output
 
-        seq_lens = metadata.get("seq_lens")
         _capture_hook_full(state, layer_idx, hidden, request_ids, seq_lens)
 
         return output
@@ -889,38 +1010,6 @@ def _ensure_state(worker: Any) -> _SteeringState:
     return state
 
 
-def _ensure_layer_entry(worker: Any, state: _SteeringState, layer_idx: int) -> torch.Tensor:
-    """Ensure the requested layer owns a steering buffer and return it."""
-    layer_idx = int(layer_idx)
-    model = worker.model_runner.model
-    layers = _resolve_layers(model)
-    if layer_idx >= len(layers):
-        raise ValueError(
-            f"Target layer {layer_idx} out of range for model with {len(layers)} layers"
-        )
-    layer = layers[layer_idx]
-    vector = getattr(layer, "_chatspace_steering_vector", None)
-    if not isinstance(vector, torch.Tensor) or vector.numel() != state.hidden_size:
-        parameter = nn.Parameter(
-            torch.zeros(
-                state.hidden_size,
-                dtype=state.dtype,
-                device=state.device,
-            ),
-            requires_grad=True,
-        )
-        layer.register_parameter("_chatspace_steering_vector", parameter)
-        vector = parameter
-    if vector.ndim != 1:
-        raise ValueError("Steering vector buffer must be 1-dimensional.")
-    if vector.numel() != state.hidden_size:
-        raise ValueError(
-            f"Steering buffer size mismatch: expected {state.hidden_size}, got {vector.numel()}"
-        )
-    state.layer_vectors[layer_idx] = vector
-    setattr(layer, "_chatspace_steering_state", state)
-    setattr(layer, "_chatspace_layer_index", layer_idx)
-    return vector
 
 
 def deserialize_tensor(
@@ -1271,15 +1360,13 @@ def initialize_worker_state(
         hidden_size=int(hidden_size),
         dtype=dtype,
         device=device,
-        layer_vectors={},
-        projection_caps={},
-        ablations={},
         active_capture_requests={},
         request_captures={},
         request_prefill_buffers={},
         request_decode_buffers={},
         request_last_phase={},
         request_token_counts={},
+        request_steering_specs={},
         step_metadata={},
         global_step=0,
         transfer_stream=torch.cuda.Stream(device=device) if device.type == 'cuda' else None,
@@ -1331,16 +1418,6 @@ def initialize_worker_state(
         setattr(layer, "_chatspace_steering_state", state)
         setattr(layer, "_chatspace_layer_index", layer_idx)
 
-    initial_layers = tuple(int(idx) for idx in (layer_indices or ()))
-    seen: set[int] = set()
-    for layer_idx in initial_layers:
-        if layer_idx in seen:
-            continue
-        seen.add(layer_idx)
-        _ensure_layer_entry(worker, state, layer_idx)
-        with torch.no_grad():
-            state.layer_vectors[layer_idx].zero_()
-
     return {
         "hidden_size": hidden_size,
         "layer_count": len(layers),
@@ -1349,78 +1426,10 @@ def initialize_worker_state(
     }
 
 
-def set_worker_vector(worker: Any, layer_idx: int, vector: torch.Tensor) -> None:
-    """Replace or install the steering vector for a specific layer."""
-    state = _ensure_state(worker)
-    dest = _ensure_layer_entry(worker, state, int(layer_idx))
-    try:
-        vector = deserialize_tensor(
-            vector,
-            device=dest.device,
-            dtype=dest.dtype,
-        )
-    except TypeError:
-        # Fall back for already-deserialized tensors.
-        if not isinstance(vector, torch.Tensor):
-            raise
-    if vector.ndim != 1:
-        raise ValueError("Steering vector must be 1D.")
-    if vector.shape != dest.shape:
-        raise ValueError(
-            f"Steering vector shape mismatch: expected {tuple(dest.shape)}, "
-            f"got {tuple(vector.shape)}"
-        )
-    with torch.no_grad():
-        dest.copy_(vector)
 
 
-def set_worker_projection_cap(worker: Any, layer_idx: int, payload: dict[str, Any]) -> None:
-    """Configure projection capping for a specific layer."""
-    state = _ensure_state(worker)
-    target_idx = int(layer_idx)
-    dest = _ensure_layer_entry(worker, state, target_idx)
-    vector_payload = payload.get("vector")
-    if vector_payload is None:
-        raise ValueError("Projection cap payload missing 'vector'.")
-    unit = _deserialize_direction_payload(
-        vector_payload, dest=dest, state=state, target_dtype=torch.float32
-    )
-    min_val = payload.get("min")
-    max_val = payload.get("max")
-    min_float = float(min_val) if min_val is not None else None
-    max_float = float(max_val) if max_val is not None else None
-    if (
-        min_float is not None
-        and max_float is not None
-        and min_float > max_float
-    ):
-        raise ValueError("min cannot exceed max.")
-    config = _ProjectionCapConfig(
-        unit_vector=unit.detach().clone().contiguous(),
-        min=min_float,
-        max=max_float,
-    )
-    state.projection_caps[target_idx] = config
-    layer = _resolve_layers(worker.model_runner.model)[target_idx]
-    layer._chatspace_projection_cap = config  # type: ignore[attr-defined]
 
 
-def clear_worker_projection_cap(worker: Any, layer_idx: int | None = None) -> None:
-    """Disable projection capping for one or all layers."""
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        targets = tuple(state.projection_caps.keys())
-    else:
-        targets = (int(layer_idx),)
-    if not targets:
-        return
-    layers = _resolve_layers(worker.model_runner.model)
-    for idx in targets:
-        state.projection_caps.pop(idx, None)
-        if 0 <= idx < len(layers):
-            layer = layers[idx]
-            if hasattr(layer, "_chatspace_projection_cap"):
-                layer._chatspace_projection_cap = None  # type: ignore[attr-defined]
 
 
 def set_projection_cap_precision(worker: Any, dtype_name: str | None) -> None:
@@ -1438,148 +1447,14 @@ def set_projection_cap_precision(worker: Any, dtype_name: str | None) -> None:
     _PROJECTION_CAP_PRECISION = target
 
 
-def set_worker_ablation(worker: Any, layer_idx: int, payload: dict[str, Any]) -> None:
-    """Configure ablation scaling for a specific layer."""
-    state = _ensure_state(worker)
-    target_idx = int(layer_idx)
-    dest = _ensure_layer_entry(worker, state, target_idx)
-    vector_payload = payload.get("vector")
-    if vector_payload is None:
-        raise ValueError("Ablation payload missing 'vector'.")
-    scale = payload.get("scale")
-    if scale is None:
-        raise ValueError("Ablation payload missing 'scale'.")
-    scale_float = float(scale)
-    if not math.isfinite(scale_float):
-        raise ValueError("Ablation scale must be finite.")
-    unit = _deserialize_direction_payload(vector_payload, dest=dest, state=state)
-    config = _AblationConfig(
-        unit_vector=unit.detach().clone().contiguous(),
-        scale=scale_float,
-    )
-    state.ablations[target_idx] = config
-    layer = _resolve_layers(worker.model_runner.model)[target_idx]
-    layer._chatspace_ablation = config  # type: ignore[attr-defined]
 
 
-def clear_worker_ablation(worker: Any, layer_idx: int | None = None) -> None:
-    """Disable ablation scaling for one or all layers."""
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        targets = tuple(state.ablations.keys())
-    else:
-        targets = (int(layer_idx),)
-    if not targets:
-        return
-    layers = _resolve_layers(worker.model_runner.model)
-    for idx in targets:
-        state.ablations.pop(idx, None)
-        if 0 <= idx < len(layers):
-            layer = layers[idx]
-            if hasattr(layer, "_chatspace_ablation"):
-                layer._chatspace_ablation = None  # type: ignore[attr-defined]
 
 
-def clear_worker_vector(worker: Any, layer_idx: int | None = None) -> None:
-    """Zero out steering vectors for one or all layers."""
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        clear_worker_projection_cap(worker, None)
-        clear_worker_ablation(worker, None)
-    else:
-        clear_worker_projection_cap(worker, int(layer_idx))
-        clear_worker_ablation(worker, int(layer_idx))
-    targets: Sequence[torch.Tensor]
-    if layer_idx is None:
-        targets = tuple(state.layer_vectors.values())
-    else:
-        vector = state.layer_vectors.get(int(layer_idx))
-        if vector is None:
-            try:
-                vector = _ensure_layer_entry(worker, state, int(layer_idx))
-            except ValueError:
-                return
-        targets = (vector,)
-    if not targets:
-        return
-    with torch.no_grad():
-        for vec in targets:
-            vec.zero_()
 
 
-def fetch_worker_vectors(worker: Any) -> dict[int, dict[str, Any]]:
-    """Return serialized steering vectors keyed by layer index."""
-    state = _ensure_state(worker)
-    return {
-        layer_idx: serialize_tensor(vector)
-        for layer_idx, vector in state.layer_vectors.items()
-    }
 
 
-def fetch_worker_state(worker: Any) -> dict[str, Any]:
-    """Inspect the worker steering state."""
-    state = _ensure_state(worker)
-    model = worker.model_runner.model
-    layer_count = len(_resolve_layers(model))
-    return {
-        "active_layers": sorted(state.layer_vectors.keys()),
-        "shape": (state.hidden_size,),
-        "dtype": str(state.dtype),
-        "device": str(state.device),
-        "layer_count": layer_count,
-    }
-
-
-def inspect_layer_vector(worker: Any, layer_idx: int | None = None) -> dict[str, Any]:
-    """Return diagnostics for the patched layer (for debugging)."""
-    state = _ensure_state(worker)
-    if layer_idx is None:
-        if not state.layer_vectors:
-            return {"has_vector": False}
-        target_idx = int(next(iter(state.layer_vectors.keys())))
-    else:
-        target_idx = int(layer_idx)
-    try:
-        vector = _ensure_layer_entry(worker, state, target_idx)
-    except ValueError:
-        return {"has_vector": False}
-    layers = _resolve_layers(worker.model_runner.model)
-    layer = layers[target_idx]
-    layer_type = type(layer).__name__
-    with torch.no_grad():
-        norm = float(vector.norm().item())
-        sum_val = float(vector.sum().item())
-    forward_name = type(layer.forward).__name__
-    has_instance_forward = "forward" in layer.__dict__
-    projection_cap = getattr(layer, "_chatspace_projection_cap", None)
-    if isinstance(projection_cap, _ProjectionCapConfig):
-        proj_info = {
-            "min": projection_cap.min,
-            "max": projection_cap.max,
-        }
-    else:
-        proj_info = None
-    ablation = getattr(layer, "_chatspace_ablation", None)
-    if isinstance(ablation, _AblationConfig):
-        ablation_info = {
-            "scale": ablation.scale,
-        }
-    else:
-        ablation_info = None
-    return {
-        "has_vector": True,
-        "norm": norm,
-        "sum": sum_val,
-        "dtype": str(vector.dtype),
-        "device": str(vector.device),
-        "output_types": list(_SEEN_OUTPUT_TYPES),
-        "layer_type": layer_type,
-        "forward_type": forward_name,
-        "instance_forward": has_instance_forward,
-        "layer_module": layer.__class__.__module__,
-        "projection_cap": proj_info,
-        "ablation": ablation_info,
-    }
 
 
 def _coalesce_prefill_chunks(state: _SteeringState, request_id: str) -> None:
@@ -1668,6 +1543,86 @@ def register_capture_request(
     state.request_pending_transfers[request_id] = {}
     state.request_last_phase[request_id] = "prefill"
     state.request_token_counts[request_id] = 0
+
+
+def register_steering_spec(
+    worker: Any, request_id: str, serialized_spec: dict[str, Any]
+) -> None:
+    """Register a per-request steering spec on the worker.
+
+    Parameters
+    ----------
+    worker : Any
+        The vLLM worker instance.
+    request_id : str
+        Unique request identifier.
+    serialized_spec : dict[str, Any]
+        Serialized SteeringSpec with structure:
+        {
+            "layers": {
+                layer_idx: {
+                    "add": {"vector": bytes},
+                    "projection_cap": {"vector": bytes, "min": float, "max": float},
+                    "ablation": {"vector": bytes, "scale": float}
+                }
+            }
+        }
+    """
+    state = _ensure_state(worker)
+    logger.debug(f"register_steering_spec: request_id={request_id}")
+
+    # Deserialize the steering spec
+    from dataclasses import dataclass
+    from typing import Any as AnyType
+
+    # Simple dataclass to hold deserialized layer specs
+    @dataclass
+    class DeserializedLayerSpec:
+        add: torch.Tensor | None = None
+        projection_cap: tuple[torch.Tensor, float | None, float | None] | None = None
+        ablation: tuple[torch.Tensor, float] | None = None
+
+    @dataclass
+    class DeserializedSteeringSpec:
+        layers: dict[int, DeserializedLayerSpec]
+
+    deserialized_layers = {}
+    for layer_idx_str, layer_data in serialized_spec["layers"].items():
+        layer_idx = int(layer_idx_str)
+        layer_spec = DeserializedLayerSpec()
+
+        if "add" in layer_data:
+            vector_bytes = layer_data["add"]["vector"]
+            vector = deserialize_tensor(vector_bytes, dtype=state.dtype, device=state.device)
+            layer_spec.add = vector
+
+        if "projection_cap" in layer_data:
+            cap_data = layer_data["projection_cap"]
+            cap_vector = deserialize_tensor(
+                cap_data["vector"], dtype=torch.float32, device=state.device
+            )
+            layer_spec.projection_cap = (cap_vector, cap_data["min"], cap_data["max"])
+
+        if "ablation" in layer_data:
+            abl_data = layer_data["ablation"]
+            abl_vector = deserialize_tensor(
+                abl_data["vector"], dtype=torch.float32, device=state.device
+            )
+            layer_spec.ablation = (abl_vector, abl_data["scale"])
+
+        deserialized_layers[layer_idx] = layer_spec
+
+    # Store the deserialized spec in the state
+    state.request_steering_specs[request_id] = DeserializedSteeringSpec(
+        layers=deserialized_layers
+    )
+
+
+def unregister_steering_spec(worker: Any, request_id: str) -> None:
+    """Unregister a per-request steering spec from the worker."""
+    state = _ensure_state(worker)
+    logger.debug(f"unregister_steering_spec: request_id={request_id}")
+    state.request_steering_specs.pop(request_id, None)
 
 
 def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
@@ -1952,17 +1907,10 @@ def _cleanup_stale_shared_memory(state: _SteeringState, stop_event: threading.Ev
 
 for _rpc_fn in (
     initialize_worker_state,
-    set_worker_vector,
-    set_worker_projection_cap,
-    clear_worker_projection_cap,
     set_projection_cap_precision,
-    set_worker_ablation,
-    clear_worker_ablation,
-    clear_worker_vector,
-    fetch_worker_vectors,
-    fetch_worker_state,
-    inspect_layer_vector,
     register_capture_request,
+    register_steering_spec,
+    unregister_steering_spec,
     fetch_request_activations,
     fetch_batch_captures,
     fetch_last_profile,

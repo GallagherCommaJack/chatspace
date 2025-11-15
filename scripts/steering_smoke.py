@@ -1,17 +1,21 @@
 """Quick smoke test to confirm steering vectors affect vLLM outputs.
 
 This script runs a baseline decode, applies a large random steering vector to
-demonstrate behavior change, then clears the vector to restore the baseline.
+demonstrate behavior change, then generates without steering to restore baseline.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import torch
 
 from chatspace.generation.vllm_steer_model import (
     VLLMSteerModel,
     VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
 )
 from vllm import SamplingParams
 
@@ -29,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+async def main() -> None:
     args = parse_args()
 
     cfg = VLLMSteeringConfig(
@@ -47,25 +51,44 @@ def main() -> None:
     model = VLLMSteerModel(cfg, bootstrap_layers=(target_layer,), **vllm_kwargs)
     params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
-    baseline = model.generate(args.prompt, params)[0]
+    # Baseline (no steering)
+    baseline = (await model.generate([args.prompt], params))[0]
     print("=== Baseline ===")
     print(repr(baseline))
 
+    # Build steering spec with large random perturbation
     perturb = torch.randn(model.hidden_size) * args.scale
-    model.set_layer_vector(target_layer, perturb)
-    worker_vec = model._fetch_worker_vectors()[0][target_layer]
-    print(f"Applied vector norm: {worker_vec.float().norm().item():.2f}")
-    steered = model.generate(args.prompt, params)[0]
-    post_worker_vec = model._fetch_worker_vectors()[0][target_layer]
-    print(f"Vector norm after generate: {post_worker_vec.float().norm().item():.2f}")
+    perturb_norm = float(perturb.norm().item())
+    perturb_unit = perturb / perturb_norm
+
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=perturb_unit, scale=perturb_norm)
+        )
+    })
+
+    print(f"\nApplying steering vector norm: {perturb_norm:.2f}")
+
+    # Generate with steering
+    steered = (await model.generate(
+        [args.prompt],
+        params,
+        steering_spec=steering_spec,
+    ))[0]
     print("\n=== Steered ===")
     print(repr(steered))
 
-    model.clear_all_vectors()
-    restored = model.generate(args.prompt, params)[0]
+    # Restored (no steering spec = baseline behavior)
+    restored = (await model.generate([args.prompt], params))[0]
     print("\n=== Restored ===")
     print(repr(restored))
 
+    # Verify baseline and restored match
+    if baseline == restored:
+        print("\n✓ Restored output matches baseline (steering is per-request)")
+    else:
+        print("\n⚠ Warning: Restored output differs from baseline")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

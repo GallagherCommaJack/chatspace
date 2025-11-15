@@ -17,19 +17,40 @@ import torch
 import pytest
 from vllm import SamplingParams
 
-from chatspace.generation.vllm_steer_model import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation.vllm_steer_model import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+    ProjectionCapSpec,
+    AblationSpec,
+)
 
 
-async def _get_final_output(model, prompt, sampling_params):
+async def _get_final_output(model, prompt, sampling_params, steering_spec=None):
     """Helper to get final output from async generator."""
     import uuid
     # Ensure engine is initialized before accessing model.llm
     await model._ensure_engine_initialized()
-    final_output = None
+
     request_id = f"test_{uuid.uuid4().hex}"
-    async for output in model.llm.generate(prompt, sampling_params, request_id=request_id):
-        final_output = output
-    return final_output
+
+    # Register steering spec for this request if provided
+    if steering_spec is not None:
+        await model._register_steering_spec(request_id, steering_spec)
+
+    try:
+        final_output = None
+        async for output in model.llm.generate(
+            prompt, sampling_params, request_id=request_id
+        ):
+            final_output = output
+        return final_output
+    finally:
+        # Clean up steering spec registration
+        if steering_spec is not None:
+            await model._unregister_steering_spec(request_id)
 
 
 
@@ -64,8 +85,17 @@ async def test_tp_additive_steering_matches_single_gpu():
         for tok, data in baseline_single.outputs[0].logprobs[0].items()
     }
 
-    await model_single.set_layer_vector(target_layer, steering_vec)
-    steered_single = await _get_final_output(model_single, prompt, sampling)
+    # Build steering spec with normalized vector
+    vec_unit = steering_vec / steering_vec.norm()
+    vec_scale = steering_vec.norm().item()
+    steering_spec_single = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=vec_unit, scale=vec_scale)
+        )
+    })
+    steered_single = await _get_final_output(
+        model_single, prompt, sampling, steering_spec=steering_spec_single
+    )
     steered_logprobs_single = {
         tok: data.logprob
         for tok, data in steered_single.outputs[0].logprobs[0].items()
@@ -90,8 +120,10 @@ async def test_tp_additive_steering_matches_single_gpu():
         for tok, data in baseline_tp.outputs[0].logprobs[0].items()
     }
 
-    await model_tp.set_layer_vector(target_layer, steering_vec)
-    steered_tp = await _get_final_output(model_tp, prompt, sampling)
+    # Reuse same steering spec (vectors already normalized and scaled)
+    steered_tp = await _get_final_output(
+        model_tp, prompt, sampling, steering_spec=steering_spec_single
+    )
     steered_logprobs_tp = {
         tok: data.logprob
         for tok, data in steered_tp.outputs[0].logprobs[0].items()
@@ -148,8 +180,20 @@ async def test_tp_projection_cap_matches_single_gpu():
     # Single GPU with projection cap
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=10)
 
-    await model_single.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
-    capped_single = await _get_final_output(model_single, prompt, sampling)
+    # Build steering spec with normalized direction
+    dir_unit = direction / direction.norm()
+    steering_spec_single = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            projection_cap=ProjectionCapSpec(
+                vector=dir_unit,
+                min=min_val,
+                max=max_val,
+            )
+        )
+    })
+    capped_single = await _get_final_output(
+        model_single, prompt, sampling, steering_spec=steering_spec_single
+    )
     capped_logprobs_single = {
         tok: data.logprob
         for tok, data in capped_single.outputs[0].logprobs[0].items()
@@ -168,8 +212,10 @@ async def test_tp_projection_cap_matches_single_gpu():
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    await model_tp.set_layer_projection_cap(target_layer, direction, min=min_val, max=max_val)
-    capped_tp = await _get_final_output(model_tp, prompt, sampling)
+    # Reuse same steering spec (vector already normalized)
+    capped_tp = await _get_final_output(
+        model_tp, prompt, sampling, steering_spec=steering_spec_single
+    )
     capped_logprobs_tp = {
         tok: data.logprob
         for tok, data in capped_tp.outputs[0].logprobs[0].items()
@@ -216,8 +262,19 @@ async def test_tp_ablation_matches_single_gpu():
     # Single GPU with ablation
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=10)
 
-    await model_single.set_layer_ablation(target_layer, direction, scale=scale)
-    ablated_single = await _get_final_output(model_single, prompt, sampling)
+    # Build steering spec with normalized direction
+    dir_unit = direction / direction.norm()
+    steering_spec_single = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            ablation=AblationSpec(
+                vector=dir_unit,
+                scale=scale,
+            )
+        )
+    })
+    ablated_single = await _get_final_output(
+        model_single, prompt, sampling, steering_spec=steering_spec_single
+    )
     ablated_logprobs_single = {
         tok: data.logprob
         for tok, data in ablated_single.outputs[0].logprobs[0].items()
@@ -236,8 +293,10 @@ async def test_tp_ablation_matches_single_gpu():
     )
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(target_layer,))
 
-    await model_tp.set_layer_ablation(target_layer, direction, scale=scale)
-    ablated_tp = await _get_final_output(model_tp, prompt, sampling)
+    # Reuse same steering spec (vector already normalized)
+    ablated_tp = await _get_final_output(
+        model_tp, prompt, sampling, steering_spec=steering_spec_single
+    )
     ablated_logprobs_tp = {
         tok: data.logprob
         for tok, data in ablated_tp.outputs[0].logprobs[0].items()

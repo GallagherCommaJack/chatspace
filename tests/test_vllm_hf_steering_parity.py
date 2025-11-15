@@ -12,7 +12,15 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+    ProjectionCapSpec,
+    AblationSpec,
+)
 
 
 async def _get_final_output(model, prompt, sampling_params):
@@ -178,28 +186,40 @@ async def test_vllm_hf_steering_combinations_match():
             # ------------------------------------------------------------------
             # vLLM path
             # ------------------------------------------------------------------
-            await vllm_model.clear_all_vectors()
-            await vllm_model.clear_layer_projection_cap(target_layer)
-            await vllm_model.clear_layer_ablation(target_layer)
-                
-            # Only set steering at target layer
+            # Build steering spec for this case (only at target layer)
+            layer_spec = LayerSteeringSpec()
+
             if case["vector"] is not None:
-                await vllm_model.set_layer_vector(target_layer, case["vector"])
+                # Normalize vector: unit = vec / vec.norm(), scale = vec.norm()
+                norm = torch.norm(case["vector"]).item()
+                unit_vec = case["vector"] / torch.norm(case["vector"])
+                layer_spec.add = AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+
             if case["cap"] is not None:
-                await vllm_model.set_layer_projection_cap(
-                    target_layer,
-                    case["cap"].vector,
+                # Normalize cap vector
+                cap_unit = _normalize(case["cap"].vector).to(dtype=torch.float32)
+                layer_spec.projection_cap = ProjectionCapSpec(
+                    vector=cap_unit,
                     min=case["cap"].min,
                     max=case["cap"].max,
                 )
+
             if case["ablation"] is not None:
-                await vllm_model.set_layer_ablation(
-                    target_layer,
-                    case["ablation"].vector,
+                # Normalize ablation vector
+                ablation_unit = _normalize(case["ablation"].vector).to(dtype=torch.float32)
+                layer_spec.ablation = AblationSpec(
+                    vector=ablation_unit,
                     scale=case["ablation"].scale,
                 )
 
-            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+            steering_spec = SteeringSpec(layers={target_layer: layer_spec})
+
+            texts, handles = await vllm_model.generate(
+                [prompt],
+                sampling_params=sampling,
+                steering_spec=steering_spec,
+                capture_layers=[target_layer, downstream_layer]
+            )
             await vllm_model.fetch_captures_batch(handles)
             vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
             vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
@@ -280,14 +300,25 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
-    # Set steering vector (only at target layer)
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
+    # Build steering spec for target layer
+    norm = torch.norm(steering_vector).item()
+    unit_vec = steering_vector / torch.norm(steering_vector)
+    steering_spec = SteeringSpec(
+        layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            )
+        }
+    )
 
-    # Enable capture on both layers
-
-    # Generate tokens
+    # Generate tokens with steering
     sampling = SamplingParams(temperature=0.0, max_tokens=5, logprobs=0, ignore_eos=True)
-    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+    texts, handles = await vllm_model.generate(
+        [prompt],
+        sampling_params=sampling,
+        steering_spec=steering_spec,
+        capture_layers=[target_layer, downstream_layer]
+    )
 
     # Get the generated text (outputs is list[str] of completion only)
     generated_text = texts[0]
@@ -446,7 +477,6 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     print(f"\n✓ vLLM decode-time steering matches HF prefill-time steering (target + downstream layers)")
 
     # Cleanup
-    await vllm_model.clear_all_vectors()
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()
@@ -536,15 +566,26 @@ async def test_vllm_hf_high_magnitude_steering():
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
-    # Set high-magnitude steering vector
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
-
-    # Enable capture on both layers
+    # Build steering spec with high-magnitude vector
+    norm = torch.norm(steering_vector).item()
+    unit_vec = steering_vector / torch.norm(steering_vector)
+    steering_spec = SteeringSpec(
+        layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            )
+        }
+    )
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+        texts, handles = await vllm_model.generate(
+            [prompt],
+            sampling_params=sampling,
+            steering_spec=steering_spec,
+            capture_layers=[target_layer, downstream_layer]
+        )
 
         await vllm_model.fetch_captures_batch(handles)
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
@@ -600,7 +641,6 @@ async def test_vllm_hf_high_magnitude_steering():
         print(f"\n✓ High-magnitude steering (10x) works correctly at target and downstream layers")
 
     finally:
-        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
@@ -711,26 +751,38 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
-    # Set high-magnitude steering operations
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
-    await vllm_model.set_layer_projection_cap(
-        target_layer,
-        cap_direction,
-        min=projection_spec.min,
-        max=projection_spec.max,
-    )
-    await vllm_model.set_layer_ablation(
-        target_layer,
-        ablation_direction,
-        scale=ablation_spec.scale,
-    )
+    # Build steering spec with high-magnitude operations
+    norm = torch.norm(steering_vector).item()
+    unit_vec = steering_vector / torch.norm(steering_vector)
+    cap_unit = _normalize(cap_direction).to(dtype=torch.float32)
+    ablation_unit = _normalize(ablation_direction).to(dtype=torch.float32)
 
-    # Enable capture on both layers
+    steering_spec = SteeringSpec(
+        layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm),
+                projection_cap=ProjectionCapSpec(
+                    vector=cap_unit,
+                    min=projection_spec.min,
+                    max=projection_spec.max,
+                ),
+                ablation=AblationSpec(
+                    vector=ablation_unit,
+                    scale=ablation_spec.scale,
+                ),
+            )
+        }
+    )
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+        texts, handles = await vllm_model.generate(
+            [prompt],
+            sampling_params=sampling,
+            steering_spec=steering_spec,
+            capture_layers=[target_layer, downstream_layer]
+        )
 
         await vllm_model.fetch_captures_batch(handles)
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
@@ -787,9 +839,6 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
         print(f"\n✓ High-magnitude ablation and projection capping work correctly")
 
     finally:
-        await vllm_model.clear_all_vectors()
-        await vllm_model.clear_layer_projection_cap(target_layer)
-        await vllm_model.clear_layer_ablation(target_layer)
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
@@ -887,12 +936,23 @@ async def test_vllm_hf_multi_magnitude_steering():
             # -------------------------------------------------------------------------
             # vLLM path
             # -------------------------------------------------------------------------
-            await vllm_model.clear_all_vectors()
-                
-            # Set steering vector at this magnitude
-            await vllm_model.set_layer_vector(target_layer, steering_vector)
+            # Build steering spec for this magnitude
+            norm = torch.norm(steering_vector).item()
+            unit_vec = steering_vector / torch.norm(steering_vector)
+            steering_spec = SteeringSpec(
+                layers={
+                    target_layer: LayerSteeringSpec(
+                        add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                    )
+                }
+            )
 
-            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+            texts, handles = await vllm_model.generate(
+                [prompt],
+                sampling_params=sampling,
+                steering_spec=steering_spec,
+                capture_layers=[target_layer, downstream_layer]
+            )
 
             await vllm_model.fetch_captures_batch(handles)
             vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
@@ -937,7 +997,6 @@ async def test_vllm_hf_multi_magnitude_steering():
         print(f"\n✓ All {len(magnitudes)} magnitudes (0.001 - 10.0) work correctly")
 
     finally:
-        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
@@ -1027,15 +1086,26 @@ async def test_vllm_hf_high_precision_steering():
     )
     vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
 
-    # Set steering vector
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
-
-    # Enable capture on both layers
+    # Build steering spec
+    norm = torch.norm(steering_vector).item()
+    unit_vec = steering_vector / torch.norm(steering_vector)
+    steering_spec = SteeringSpec(
+        layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            )
+        }
+    )
 
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
 
     try:
-        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+        texts, handles = await vllm_model.generate(
+            [prompt],
+            sampling_params=sampling,
+            steering_spec=steering_spec,
+            capture_layers=[target_layer, downstream_layer]
+        )
 
         await vllm_model.fetch_captures_batch(handles)
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"]
@@ -1092,7 +1162,6 @@ async def test_vllm_hf_high_precision_steering():
         )
 
     finally:
-        await vllm_model.clear_all_vectors()
         del vllm_model
         del hf_model
         torch.cuda.empty_cache()
@@ -1202,10 +1271,25 @@ async def test_delta_vs_residual_numerics():
                     dtype=dtype_name,
                 )
                 vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer, downstream_layer))
-                await vllm_model.set_layer_vector(target_layer, steering_vector)
-            
+
+                # Build steering spec
+                norm = torch.norm(steering_vector).item()
+                unit_vec = steering_vector / torch.norm(steering_vector)
+                steering_spec = SteeringSpec(
+                    layers={
+                        target_layer: LayerSteeringSpec(
+                            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                        )
+                    }
+                )
+
                 sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-                texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer, downstream_layer])
+                texts, handles = await vllm_model.generate(
+                    [prompt],
+                    sampling_params=sampling,
+                    steering_spec=steering_spec,
+                    capture_layers=[target_layer, downstream_layer]
+                )
 
                 await vllm_model.fetch_captures_batch(handles)
                 target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
@@ -1222,7 +1306,6 @@ async def test_delta_vs_residual_numerics():
                     "avg_error": avg_error,
                 }
 
-                await vllm_model.clear_all_vectors()
                 del vllm_model
                 torch.cuda.empty_cache()
 
@@ -1390,10 +1473,25 @@ async def test_delta_vs_residual_instrumented():
                 dtype="float32",
             )
             vllm_model = VLLMSteerModel(vllm_cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-            await vllm_model.set_layer_vector(target_layer, steering_vector)
-        
+
+            # Build steering spec
+            norm = torch.norm(steering_vector).item()
+            unit_vec = steering_vector / torch.norm(steering_vector)
+            steering_spec = SteeringSpec(
+                layers={
+                    target_layer: LayerSteeringSpec(
+                        add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                    )
+                }
+            )
+
             sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-            texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[target_layer])
+            texts, handles = await vllm_model.generate(
+                [prompt],
+                sampling_params=sampling,
+                steering_spec=steering_spec,
+                capture_layers=[target_layer]
+            )
 
             await vllm_model.fetch_captures_batch(handles)
             hidden = handles[0].captures[target_layer][0]["hidden"]
@@ -1415,7 +1513,6 @@ async def test_delta_vs_residual_instrumented():
             results[approach_name]["error_vs_hf"] = error
             print(f"  Error vs HF: {error:.6e}")
 
-            await vllm_model.clear_all_vectors()
             del vllm_model
             torch.cuda.empty_cache()
 
@@ -1560,13 +1657,24 @@ async def test_vllm_hf_multi_layer_steering_float32():
         bootstrap_layers=tuple(all_check_layers),
     )
 
-    # Apply steering vectors to each layer
+    # Build steering spec for all steered layers
+    layers_dict = {}
     for layer_idx, vector in steering_vectors.items():
-        await vllm_model.set_layer_vector(layer_idx, vector)
+        norm = torch.norm(vector).item()
+        unit_vec = vector / torch.norm(vector)
+        layers_dict[layer_idx] = LayerSteeringSpec(
+            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+        )
+    steering_spec = SteeringSpec(layers=layers_dict)
 
     # Generate with capture on all layers we want to check
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-    texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_check_layers))
+    texts, handles = await vllm_model.generate(
+        [prompt],
+        sampling_params=sampling,
+        steering_spec=steering_spec,
+        capture_layers=list(all_check_layers)
+    )
 
     await vllm_model.fetch_captures_batch(handles)
 
@@ -1611,7 +1719,6 @@ async def test_vllm_hf_multi_layer_steering_float32():
         else:
             print(f"  ✓ PASS: cosine similarity {cos_sim:.9f} >= {threshold}")
 
-    await vllm_model.clear_all_vectors()
     del vllm_model
     torch.cuda.empty_cache()
 
@@ -1701,12 +1808,23 @@ async def test_vllm_hf_multi_layer_steering_float32():
         bootstrap_layers=tuple(all_every_check),
     )
 
-    # Apply steering to every layer
+    # Build steering spec for every layer
+    every_layers_dict = {}
     for layer_idx, vector in every_layer_vectors.items():
-        await vllm_every_model.set_layer_vector(layer_idx, vector)
+        norm = torch.norm(vector).item()
+        unit_vec = vector / torch.norm(vector)
+        every_layers_dict[layer_idx] = LayerSteeringSpec(
+            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+        )
+    every_steering_spec = SteeringSpec(layers=every_layers_dict)
 
     # Generate with capture on all layers
-    texts, handles = await vllm_every_model.generate([prompt], sampling_params=sampling, capture_layers=list(all_every_check))
+    texts, handles = await vllm_every_model.generate(
+        [prompt],
+        sampling_params=sampling,
+        steering_spec=every_steering_spec,
+        capture_layers=list(all_every_check)
+    )
     await vllm_every_model.fetch_captures_batch(handles)
 
     print("\nvLLM results (sample layers):")
@@ -1747,7 +1865,6 @@ async def test_vllm_hf_multi_layer_steering_float32():
         else:
             print(f"  ✓ PASS")
 
-    await vllm_every_model.clear_all_vectors()
     del vllm_every_model
     torch.cuda.empty_cache()
 
@@ -1936,14 +2053,23 @@ async def test_bf16_degradation_hf_vs_vllm():
             bootstrap_layers=tuple(all_layers_to_bootstrap),
         )
 
-        # Apply steering
+        # Build steering spec for all steered layers
+        vllm_layers_dict = {}
         for layer_idx, vector in steering_vectors.items():
-            await vllm_model.set_layer_vector(layer_idx, vector)
-
-        # Enable capture at check layer
+            norm = torch.norm(vector).item()
+            unit_vec = vector / torch.norm(vector)
+            vllm_layers_dict[layer_idx] = LayerSteeringSpec(
+                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            )
+        vllm_steering_spec = SteeringSpec(layers=vllm_layers_dict)
 
         sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-        texts, handles = await vllm_model.generate([prompt], sampling_params=sampling, capture_layers=[check_layer])
+        texts, handles = await vllm_model.generate(
+            [prompt],
+            sampling_params=sampling,
+            steering_spec=vllm_steering_spec,
+            capture_layers=[check_layer]
+        )
 
         await vllm_model.fetch_captures_batch(handles)
         vllm_bf16_hidden = handles[0].captures[check_layer][0]["hidden"]
@@ -1956,7 +2082,6 @@ async def test_bf16_degradation_hf_vs_vllm():
 
         print(f"  vLLM bf16 vs fp32: MAE={vllm_bf16_mae:.6e}, cos={vllm_bf16_cos:.9f}")
 
-        await vllm_model.clear_all_vectors()
         del vllm_model
         torch.cuda.empty_cache()
 

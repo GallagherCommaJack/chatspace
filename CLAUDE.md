@@ -159,7 +159,7 @@ Each run records:
   - HuggingFace parity validation (cosine similarity ~1.0, MAE <0.02)
   - Concurrent generation with temporal overlap verification
   - Capture isolation (concurrent requests don't mix)
-  - RWLock coordination (steering changes block during generation)
+  - Per-request steering (each request uses independent steering configuration)
 - Run this test when modifying steering logic, capture mechanisms, or concurrency handling
 - Expected runtime: ~20-25 seconds with CUDA available
 
@@ -185,18 +185,16 @@ Each run records:
 - Use `scripts/steering_smoke.py` for quick verification of steering behavior
 - **Qwen decoder layer fusion**: vLLM fuses RMSNorm with skip connection, returns `(mlp_delta, residual_before_mlp)` - must add `delta + residual` to mirror HuggingFace captures
 
-### Concurrency and Threading Model
+### Concurrency and Per-Request Steering
 
-**AsyncRWLock for Steering Configuration:**
-- `VLLMSteerModel` uses a readers-writer lock (`AsyncRWLock`) to coordinate concurrent operations
-- **Read operations** (concurrent): Multiple `generate()` calls can run simultaneously
-- **Write operations** (exclusive): Steering configuration changes block until all in-flight requests complete
-- Write operations include:
-  - `set_layer_vector()`, `set_layer_projection_cap()`, `set_layer_ablation()`
-  - `clear_layer_projection_cap()`, `clear_layer_ablation()`, `clear_all_vectors()`
-  - `apply_steering_spec()`
-- Writers signal intent via `_writer_waiting` flag to prevent reader starvation
-- Concurrent generation is safe and performant - requests don't block each other
+**Per-Request Steering Model:**
+- Steering configuration is passed per-request via the `steering_spec` parameter to `generate()`
+- No global state means no locking required - all requests are independent
+- Different requests in the same batch can use different steering configurations (heterogeneous batching)
+- **Concurrent generation**: Multiple requests can run simultaneously without coordination
+- Workers maintain per-request steering state keyed by request ID
+- Steering state is automatically cleaned up when request completes
+- **Migration note**: The old global API (`set_layer_vector()`, etc.) was removed in favor of per-request specs
 
 ### Hidden State Capture Behavior
 

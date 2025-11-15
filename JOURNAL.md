@@ -1,5 +1,152 @@
 # Engineering Journal
 
+## 2025-11-15
+
+### Per-Request Steering Migration
+
+**Timestamp:** 2025-11-15 02:22 UTC
+
+Completed full migration from global steering to per-request steering architecture. This major refactor eliminates shared mutable state, removes locking coordination, and enables heterogeneous batching where concurrent requests can use different steering configurations.
+
+**Motivation:**
+- Global steering state required AsyncRWLock coordination between readers (generation) and writers (steering changes)
+- Single steering configuration applied to all requests in flight
+- No support for per-user or per-conversation steering
+- Complex concurrency model with write lock blocking
+- Research showed per-request capture pattern could be mirrored for steering
+
+**Implementation (5 Phases):**
+
+**Phase 1-2: Per-Request Infrastructure**
+- Added `request_steering_specs: dict[str, Any]` to `_SteeringState` for per-request tracking
+- Created `register_steering_spec()` and `unregister_steering_spec()` RPC handlers
+- Implemented `_apply_per_request_steering()` with slice/apply/concat pattern:
+  1. Extract hidden state tensor from batch output
+  2. Slice by sequence lengths to get per-request hidden states
+  3. Apply each request's steering spec to its slice independently
+  4. Concatenate transformed slices back into batch tensor
+  5. Reconstruct output structure with transformed hidden state
+- Added helper functions: `_apply_layer_steering_to_hidden()`, `_reconstruct_output_with_hidden()`
+
+**Phase 3: API Updates**
+- Added `steering_spec` parameter to `generate()` and `chat()` methods
+- Created `_register_steering_spec()`, `_unregister_steering_spec()`, `_serialize_steering_spec()` on client
+- Steering specs registered before generation, cleaned up in `try/finally` block
+- Serialization converts `SteeringSpec` → dict with tensor bytes for RPC transmission
+
+**Phase 4: Global Steering Removal** (~500 lines deleted)
+- Removed from `_SteeringState`: `layer_vectors`, `projection_caps`, `ablations` dicts
+- Removed module parameters: `_chatspace_steering_vector`, `_chatspace_projection_cap`, `_chatspace_ablation`
+- Removed AsyncRWLock class (~50 lines) and all read/write lock usage
+- Removed global setter methods: `set_layer_vector()`, `set_layer_projection_cap()`, `set_layer_ablation()`
+- Removed clear methods: `clear_layer_vector()`, `clear_layer_projection_cap()`, `clear_layer_ablation()`, `clear_all_vectors()`
+- Removed spec management: `apply_steering_spec()`, `push_steering_spec()`, `pop_steering_spec()`, `steering()` context manager
+- Removed helper methods: `_ensure_layer_spec()`, `_prune_layer_entry()`, `_prepare_layer_vector()`, `_normalize_vector()`, `_prepare_direction_vector()`
+- Removed internal state: `_layer_specs`, `_steering_stack`, `_active_layer`
+- Removed broadcast methods: `_broadcast_add()`, `_broadcast_projection_cap()`, `_broadcast_ablation()`, `_broadcast_clear()`
+
+**Phase 5: Test & Documentation Updates**
+- Updated `test_vllm_comprehensive_integration.py`:
+  - Replaced global API calls with `SteeringSpec` construction
+  - Added `steering_spec` parameter to all `generate()` calls
+  - Removed RWLock coordination test (no longer relevant)
+  - Updated success messages and docstring
+  - Removed cleanup calls (no global state)
+- Updated `scripts/steering_smoke.py`:
+  - Converted to async (`asyncio.run(main())`)
+  - Replaced `set_layer_vector()` with `SteeringSpec` + `AddSpec`
+  - Added verification that baseline and restored match
+- Added `test_vllm_heterogeneous_batch_steering()`:
+  - Tests 3 concurrent requests with different steering configs (heavy, moderate, baseline)
+  - Validates per-request isolation and different outputs
+  - ~135 lines, validates the core heterogeneous batching capability
+- Updated CLAUDE.md:
+  - Replaced "AsyncRWLock for Steering Configuration" section with "Per-Request Steering Model"
+  - Documented heterogeneous batching capability
+  - Updated test descriptions to remove RWLock mentions
+  - Added migration note about old API removal
+
+**Architecture Changes:**
+
+Before (Global):
+```python
+model = VLLMSteerModel(cfg)
+await model.set_layer_vector(5, my_vector)  # Applies to ALL requests
+results = await model.generate(prompts)
+```
+
+After (Per-Request):
+```python
+model = VLLMSteerModel(cfg)
+spec = SteeringSpec(layers={
+    5: LayerSteeringSpec(add=AddSpec(vector=my_vector, scale=1.0))
+})
+results = await model.generate(prompts, steering_spec=spec)
+```
+
+**Key Technical Details:**
+
+*Slice/Apply/Concat Pattern:*
+- Mirror's the existing per-request capture architecture
+- Uses request IDs and sequence lengths from batch metadata
+- Handles both single-request (no slicing) and multi-request (slice/concat) cases
+- Works with Qwen's `(delta, residual)` output format by reconstructing delta after transformation
+
+*Memory/Performance Trade-offs:*
+- Per-request: 3× memory bandwidth (slice out, transform, concat back) vs. global (single vector add)
+- But: eliminates RWLock contention and enables true concurrent execution
+- Optimization chosen: simplicity over performance (no complex batched operations)
+
+*Heterogeneous Batching:*
+- vLLM scheduler naturally handles batching requests with different configs
+- Worker looks up `request_steering_specs[request_id]` during forward hook
+- Each request's slice gets its own steering applied independently
+- No coordination between requests needed
+
+**Results:**
+
+**Code Changes:**
+- ~500 lines removed (global steering + AsyncRWLock)
+- ~350 lines added (per-request infrastructure + RPC + helpers)
+- ~370 lines modified (test updates)
+- ~135 lines added (new heterogeneous test)
+- **Net: -95 lines, significantly simpler architecture**
+
+**Files Modified:**
+- `chatspace/vllm_steering/runtime.py` - Core steering implementation
+- `chatspace/generation/vllm_steer_model.py` - Public API
+- `tests/test_vllm_comprehensive_integration.py` - Main integration test
+- `scripts/steering_smoke.py` - Smoke test script
+- `CLAUDE.md` - Documentation updates
+
+**Benefits:**
+1. **Simpler**: No AsyncRWLock, no coordination between readers/writers, no global state management
+2. **Flexible**: Each request can have different steering configurations (per-user, per-conversation)
+3. **Cleaner API**: Steering is explicit per-request, not hidden global state
+4. **Better isolation**: Concurrent requests don't interfere with each other
+5. **Heterogeneous batching**: vLLM can batch requests with different steering specs naturally
+6. **Easier to reason about**: No hidden state changes, steering is part of request parameters
+
+**Lessons Learned:**
+- Per-request patterns scale well from capture to steering
+- Slice/apply/concat overhead is acceptable for cleaner architecture
+- Removing global state eliminates entire classes of concurrency bugs
+- Tests that validate concurrency models (RWLock) become obsolete when architecture changes
+- Clean migration without backward compatibility is viable for pre-release projects
+
+**Future Considerations:**
+- Could optimize batch tensor reconstruction with masked operations instead of slice/concat
+- Could add per-prompt steering_spec list parameter for true within-batch heterogeneity
+- Could cache steering specs to reduce RPC overhead for repeated patterns
+- Performance profiling needed to quantify slice/concat overhead in production workloads
+
+**Next Steps:**
+- Monitor for any remaining scripts/notebooks using old API patterns
+- Consider adding performance benchmarks for heterogeneous batching
+- May want example notebook demonstrating per-user steering use case
+
+---
+
 ## 2025-10-31
 
 ### Chat API Activation Capture Tests

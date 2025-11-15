@@ -56,17 +56,23 @@ def main() -> None:
 
     # Test 3: Verify vector retrieval
     print("\n=== Test 3: Verify vector retrieval ===")
-    retrieved = model.current_vector(layer_idx=8)
-    vector_match = torch.allclose(retrieved, random_vector, rtol=1e-4, atol=1e-6)
-    print(f"Vector retrieved successfully: {vector_match}")
-    print(f"Vector norm: {retrieved.norm().item():.4f}")
+    # NOTE: current_vector() was part of old global API and has been removed
+    # Per-request steering now passes vectors via generate() steering_spec parameter
+    # retrieved = model.current_vector(layer_idx=8)
+    # vector_match = torch.allclose(retrieved, random_vector, rtol=1e-4, atol=1e-6)
+    # print(f"Vector retrieved successfully: {vector_match}")
+    # print(f"Vector norm: {retrieved.norm().item():.4f}")
+    print("(Old global API removed - use per-request steering via steering_spec parameter)")
 
     # Test 4: Clear vector and verify
     print("\n=== Test 4: Clear vector ===")
-    model.clear_layer_vector(8)
-    cleared_vector = model.current_vector(layer_idx=8)
-    is_zero = torch.allclose(cleared_vector, torch.zeros_like(cleared_vector))
-    print(f"Vector cleared: {is_zero}")
+    # NOTE: clear_layer_vector() and current_vector() were part of old global API and have been removed
+    # Per-request steering is stateless - clear vectors by not passing them in steering_spec
+    # model.clear_layer_vector(8)
+    # cleared_vector = model.current_vector(layer_idx=8)
+    # is_zero = torch.allclose(cleared_vector, torch.zeros_like(cleared_vector))
+    # print(f"Vector cleared: {is_zero}")
+    print("(Old global API removed - use per-request steering via steering_spec parameter)")
 
     # Test 5: Multi-layer steering
     print("\n=== Test 5: Multi-layer steering ===")

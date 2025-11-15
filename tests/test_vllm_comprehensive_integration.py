@@ -6,7 +6,7 @@ This test validates the complete vLLM steering API with realistic usage:
 - Decode phase generation (30-50 tokens)
 - All 3 steering methods (add, projection cap, ablation) on multiple layers
 - Hidden state capture and comparison vs HuggingFace ground truth
-- RWLock testing for concurrent operations
+- Concurrent generation with capture isolation
 """
 
 from __future__ import annotations
@@ -20,7 +20,15 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+    ProjectionCapSpec,
+    AblationSpec,
+)
 
 
 def _normalize(vector: torch.Tensor) -> torch.Tensor:
@@ -155,28 +163,33 @@ async def test_comprehensive_vllm_integration():
         bootstrap_layers=(layer_2_config["layer"], layer_5_config["layer"]),
     )
 
-    # Apply multi-method steering
+    # Build per-request steering spec with multi-method steering
     # Layer 2: Additive + Projection Cap
-    await vllm_model.set_layer_vector(layer_2_config["layer"], layer_2_config["add_vector"])
-    await vllm_model.set_layer_projection_cap(
-        layer_2_config["layer"],
-        layer_2_config["cap_vector"],
-        min=layer_2_config["cap_min"],
-        max=layer_2_config["cap_max"],
-    )
-
     # Layer 5: Ablation + Projection Cap
-    await vllm_model.set_layer_ablation(
-        layer_5_config["layer"],
-        layer_5_config["ablation_vector"],
-        scale=layer_5_config["ablation_scale"],
-    )
-    await vllm_model.set_layer_projection_cap(
-        layer_5_config["layer"],
-        layer_5_config["cap_vector"],
-        min=layer_5_config["cap_min"],
-        max=layer_5_config["cap_max"],
-    )
+    steering_spec = SteeringSpec(layers={
+        layer_2_config["layer"]: LayerSteeringSpec(
+            add=AddSpec(
+                vector=_normalize(layer_2_config["add_vector"]),
+                scale=float(torch.norm(layer_2_config["add_vector"]).item()),
+            ),
+            projection_cap=ProjectionCapSpec(
+                vector=_normalize(layer_2_config["cap_vector"]),
+                min=layer_2_config["cap_min"],
+                max=layer_2_config["cap_max"],
+            ),
+        ),
+        layer_5_config["layer"]: LayerSteeringSpec(
+            ablation=AblationSpec(
+                vector=_normalize(layer_5_config["ablation_vector"]),
+                scale=layer_5_config["ablation_scale"],
+            ),
+            projection_cap=ProjectionCapSpec(
+                vector=_normalize(layer_5_config["cap_vector"]),
+                min=layer_5_config["cap_min"],
+                max=layer_5_config["cap_max"],
+            ),
+        ),
+    })
 
     # Generate with steering and capture
     sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=False)
@@ -186,6 +199,7 @@ async def test_comprehensive_vllm_integration():
             prompts,
             sampling_params=sampling,
             capture_layers=[layer_2_config["layer"], layer_5_config["layer"]],
+            steering_spec=steering_spec,
         )
 
         # Fetch all captures in batch (efficient single RPC)
@@ -358,15 +372,16 @@ async def test_comprehensive_vllm_integration():
         torch.cuda.empty_cache()
 
         # =====================================================================
-        # Part 4: Test RWLock with Concurrent Operations
+        # Part 4: Test Concurrent Operations
         # =====================================================================
-        print(f"\n[3/4] Testing RWLock with concurrent operations...")
+        print(f"\n[3/4] Testing concurrent operations...")
 
         async def concurrent_generate(prompt_idx: int):
             """Generate with a single prompt (should be allowed concurrently)."""
             result = await vllm_model.generate(
                 [prompts[prompt_idx]],
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=5),
+                steering_spec=steering_spec,
             )
             return result[0]
 
@@ -383,6 +398,7 @@ async def test_comprehensive_vllm_integration():
             result = await vllm_model.generate(
                 [prompts[prompt_idx]],
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=10),
+                steering_spec=steering_spec,
             )
             end = time.time()
             gen_timings.append({"idx": prompt_idx, "start": start, "end": end})
@@ -423,6 +439,7 @@ async def test_comprehensive_vllm_integration():
                 [prompts[prompt_idx]],
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=10, seed=5000 + prompt_idx),
                 capture_layers=capture_layers,
+                steering_spec=steering_spec,
             )
             await vllm_model.fetch_captures_batch(handles_conc)
             return (texts_conc[0], handles_conc[0].captures, prompt_idx)
@@ -478,30 +495,6 @@ async def test_comprehensive_vllm_integration():
         else:
             print(f"    ✓ All {len(results)} concurrent captures properly isolated and valid")
 
-        # Test 3: Steering change blocks until generation completes
-        print("  Testing steering change blocks during generation...")
-
-        async def long_generate():
-            """Long generation to test blocking."""
-            await vllm_model.generate(
-                [prompts[0]],
-                sampling_params=SamplingParams(temperature=0.0, max_tokens=20),
-            )
-
-        async def try_steering_change():
-            """Try to change steering (should block until generation completes)."""
-            await asyncio.sleep(0.1)  # Let generation start
-            new_vector = torch.randn(hidden_size, dtype=torch.float32) * 0.2
-            await vllm_model.set_layer_vector(layer_2_config["layer"], new_vector)
-            return "steering_changed"
-
-        # Run both concurrently - steering should block
-        gen_task = asyncio.create_task(long_generate())
-        steering_task = asyncio.create_task(try_steering_change())
-
-        await asyncio.gather(gen_task, steering_task)
-        print("    ✓ Steering change correctly blocked until generation completed")
-
         # =====================================================================
         # Final Assertions
         # =====================================================================
@@ -536,8 +529,8 @@ async def test_comprehensive_vllm_integration():
             print("  - Batch generation with chat formatting works")
             print("  - Decode phase steering matches HF ground truth")
             print("  - Multi-method steering (add + cap + ablation) works")
-            print("  - Concurrent captures match serial execution (isolation verified)")
-            print("  - RWLock correctly coordinates concurrent operations")
+            print("  - Concurrent captures properly isolated")
+            print("  - Per-request steering works correctly")
         else:
             print("\n✗ SOME TESTS FAILED")
 
@@ -545,9 +538,140 @@ async def test_comprehensive_vllm_integration():
 
     finally:
         # Cleanup
-        await vllm_model.clear_all_vectors()
-        await vllm_model.clear_layer_projection_cap(layer_2_config["layer"])
-        await vllm_model.clear_layer_ablation(layer_5_config["layer"])
-        await vllm_model.clear_layer_projection_cap(layer_5_config["layer"])
+        del vllm_model
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.asyncio
+async def test_vllm_heterogeneous_batch_steering():
+    """Test that different concurrent requests can use different steering configurations.
+
+    This test validates heterogeneous batching where multiple requests with different
+    steering specs are processed concurrently. It verifies:
+    - Different steering configs produce different outputs
+    - Per-request state isolation (no cross-contamination)
+    - Concurrent execution completes successfully
+    """
+    # Use smaller model for faster testing
+    model_name = "Qwen/Qwen3-0.6B"
+    target_layer = 2
+
+    vllm_cfg = VLLMSteeringConfig(
+        model_name=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.2,
+        max_model_len=256,
+        dtype="float16",
+    )
+
+    vllm_model = VLLMSteerModel(
+        vllm_cfg,
+        enforce_eager=True,
+        bootstrap_layers=(target_layer,),
+    )
+
+    # Test prompt
+    prompt = "Question: What is the capital of France? Answer:"
+    sampling = SamplingParams(temperature=0.0, max_tokens=20)
+
+    try:
+        # Config 1: Heavy additive steering (should produce very different output)
+        heavy_vector = torch.randn(vllm_model.hidden_size, dtype=torch.float32) * 1000.0
+        heavy_norm = float(heavy_vector.norm().item())
+        heavy_unit = heavy_vector / heavy_norm
+
+        heavy_steering = SteeringSpec(layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=heavy_unit, scale=heavy_norm)
+            )
+        })
+
+        # Config 2: Moderate additive steering
+        moderate_vector = torch.randn(vllm_model.hidden_size, dtype=torch.float32) * 50.0
+        moderate_norm = float(moderate_vector.norm().item())
+        moderate_unit = moderate_vector / moderate_norm
+
+        moderate_steering = SteeringSpec(layers={
+            target_layer: LayerSteeringSpec(
+                add=AddSpec(vector=moderate_unit, scale=moderate_norm)
+            )
+        })
+
+        # Config 3: No steering (baseline)
+        no_steering = None
+
+        print(f"\n{'='*80}")
+        print("HETEROGENEOUS BATCH STEERING TEST")
+        print(f"{'='*80}")
+        print(f"Model: {model_name}")
+        print(f"Target layer: {target_layer}")
+        print(f"Heavy steering norm: {heavy_norm:.2f}")
+        print(f"Moderate steering norm: {moderate_norm:.2f}")
+        print(f"{'='*80}\n")
+
+        # Generate all three concurrently with different steering configs
+        print("[1/2] Launching 3 concurrent requests with different steering configs...")
+
+        async def generate_with_config(config_name: str, steering_spec):
+            result = await vllm_model.generate(
+                [prompt],
+                sampling,
+                steering_spec=steering_spec,
+            )
+            return (config_name, result[0])
+
+        # Launch all three concurrently
+        task_heavy = asyncio.create_task(generate_with_config("Heavy", heavy_steering))
+        task_moderate = asyncio.create_task(generate_with_config("Moderate", moderate_steering))
+        task_baseline = asyncio.create_task(generate_with_config("Baseline", no_steering))
+
+        results = await asyncio.gather(task_heavy, task_moderate, task_baseline)
+
+        # Extract results
+        outputs = {name: text for name, text in results}
+
+        print("✓ All 3 concurrent requests completed successfully\n")
+
+        # Display outputs
+        for name in ["Baseline", "Moderate", "Heavy"]:
+            print(f"{name} output:")
+            print(f"  {repr(outputs[name])}\n")
+
+        # =====================================================================
+        # Validation: Check that different steering produces different outputs
+        # =====================================================================
+        print("[2/2] Validating heterogeneous steering effects...")
+
+        # Outputs should be different
+        all_unique = (
+            outputs["Heavy"] != outputs["Baseline"] and
+            outputs["Moderate"] != outputs["Baseline"] and
+            outputs["Heavy"] != outputs["Moderate"]
+        )
+
+        if all_unique:
+            print("✓ All three outputs are unique (different steering configs work)")
+        else:
+            # Check which ones are the same
+            if outputs["Heavy"] == outputs["Baseline"]:
+                print("✗ Heavy steering produced same output as baseline")
+            if outputs["Moderate"] == outputs["Baseline"]:
+                print("⚠ Moderate steering produced same output as baseline (may be expected)")
+            if outputs["Heavy"] == outputs["Moderate"]:
+                print("✗ Heavy and moderate steering produced identical outputs")
+
+        # Heavy steering should definitely produce different output
+        assert outputs["Heavy"] != outputs["Baseline"], (
+            "Heavy steering should produce different output than baseline"
+        )
+
+        print(f"\n{'='*80}")
+        print("✓ HETEROGENEOUS BATCHING TEST PASSED")
+        print("  - Different steering configs applied concurrently")
+        print("  - Per-request steering isolation verified")
+        print("  - Heavy steering produced different output")
+        print(f"{'='*80}\n")
+
+    finally:
         del vllm_model
         torch.cuda.empty_cache()

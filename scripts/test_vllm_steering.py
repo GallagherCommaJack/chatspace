@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
 
 
-def test_basic_generation(model_name: str = "Qwen/Qwen2.5-3B"):
+async def test_basic_generation(model_name: str = "Qwen/Qwen2.5-3B"):
     """Test basic model loading and generation."""
     print(f"[1/4] Testing basic model loading and generation with {model_name}")
 
@@ -42,16 +42,16 @@ def test_basic_generation(model_name: str = "Qwen/Qwen2.5-3B"):
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=50)
 
     print("  Generating text without steering...")
-    outputs = model.generate(prompts, sampling_params)
+    outputs = await model.generate(prompts, sampling_params)
     print(f"  Output: {outputs[0][:100]}...")
     print("  ✓ Generation successful")
 
     return model, target_layer
 
 
-def test_steering_vector_setting(model: VLLMSteerModel, layer_idx: int) -> None:
-    """Test setting steering vectors."""
-    print("\n[2/4] Testing steering vector setting")
+async def test_steering_vector_setting(model: VLLMSteerModel, layer_idx: int) -> None:
+    """Test setting steering vectors via per-request API."""
+    print("\n[2/4] Testing steering vector setting (per-request API)")
 
     hidden_size = model.hidden_size
     print(f"  Model hidden size: {hidden_size}")
@@ -60,51 +60,72 @@ def test_steering_vector_setting(model: VLLMSteerModel, layer_idx: int) -> None:
     test_vector = torch.randn(hidden_size)
     print(f"  Created test vector with shape {test_vector.shape}")
 
-    # Set the vector
-    model.set_layer_vector(layer_idx, test_vector)
-    print("  ✓ Steering vector set successfully")
+    # Build per-request steering spec instead of global set_layer_vector()
+    from chatspace.generation.vllm_steer_model import SteeringSpec, LayerSteeringSpec, AddSpec
+    steering_spec = SteeringSpec(layers={
+        layer_idx: LayerSteeringSpec(
+            add=AddSpec(vector=test_vector, scale=1.0)
+        )
+    })
+    print("  ✓ Steering spec created successfully")
 
-    # Verify it was set correctly
-    with torch.no_grad():
-        diff = torch.abs(model.current_vector(layer_idx) - test_vector).max()
-        assert diff < 1e-5, f"Vector not set correctly (max diff: {diff})"
-    print("  ✓ Steering vector verified")
+    # Test with a simple prompt
+    prompts = ["Hello"]
+    from vllm import SamplingParams
+    sampling_params = SamplingParams(temperature=0.7, max_tokens=10)
 
-    # Test clearing the vector
-    model.clear_all_vectors()
-    with torch.no_grad():
-        assert torch.abs(model.current_vector(layer_idx)).max() < 1e-5, "Vector not cleared"
-    print("  ✓ Steering vector cleared successfully")
+    # Generate with steering - this registers/unregisters per-request
+    outputs = await model.generate(prompts, sampling_params, steering_spec=steering_spec)
+    print(f"  ✓ Generation with steering spec successful")
+    print(f"  Output: {outputs[0][:50]}...")
+
+    # NOTE: Old global API methods removed
+    # - model.current_vector(layer_idx) - was used to verify vector in-place
+    # - model.set_layer_vector(layer_idx, vector) - was used to set globally
+    # - model.clear_all_vectors() - was used to clear globally
+    # New per-request API means each generate() call has independent steering
 
 
-def test_multi_layer_vectors(model: VLLMSteerModel, base_layer: int) -> None:
-    """Test managing steering vectors on multiple layers."""
-    print("\n[3/4] Testing multi-layer support")
+async def test_multi_layer_vectors(model: VLLMSteerModel, base_layer: int) -> None:
+    """Test managing steering vectors on multiple layers via per-request API."""
+    print("\n[3/4] Testing multi-layer support (per-request API)")
     other_layer = base_layer + 2
 
     hidden_size = model.hidden_size
     base_vector = torch.randn(hidden_size)
     other_vector = torch.randn(hidden_size)
 
-    model.set_layer_vector(base_layer, base_vector)
-    model.set_layer_vector(other_layer, other_vector)
+    # Build multi-layer steering spec
+    from chatspace.generation.vllm_steer_model import SteeringSpec, LayerSteeringSpec, AddSpec
+    steering_spec = SteeringSpec(layers={
+        base_layer: LayerSteeringSpec(
+            add=AddSpec(vector=base_vector, scale=1.0)
+        ),
+        other_layer: LayerSteeringSpec(
+            add=AddSpec(vector=other_vector, scale=1.0)
+        ),
+    })
+    print("  ✓ Multi-layer steering spec created")
 
-    worker_maps = model._fetch_worker_vectors()
-    assert worker_maps, "Expected worker vectors."
-    for worker_map in worker_maps:
-        assert torch.allclose(
-            worker_map[base_layer], base_vector.to(dtype=worker_map[base_layer].dtype), atol=1e-5
-        )
-        assert torch.allclose(
-            worker_map[other_layer], other_vector.to(dtype=worker_map[other_layer].dtype), atol=1e-5
-        )
-    print("  ✓ Managed independent vectors on two layers")
-    model.clear_all_vectors()
+    # Generate with multi-layer steering
+    from vllm import SamplingParams
+    sampling_params = SamplingParams(temperature=0.7, max_tokens=10)
+    outputs = await model.generate(
+        ["Test prompt"],
+        sampling_params,
+        steering_spec=steering_spec
+    )
+    print("  ✓ Generation with multi-layer steering successful")
+
+    # NOTE: Old global API methods removed
+    # - model.set_layer_vector() - was used to set vectors globally
+    # - model._fetch_worker_vectors() - was used to verify vectors on workers
+    # New per-request API makes steering independent for each request
 
 
-def test_steering_effect(model: VLLMSteerModel, layer_idx: int) -> None:
+async def test_steering_effect(model: VLLMSteerModel, layer_idx: int) -> None:
     """Test that steering actually affects generation."""
-    print("\n[4/4] Testing steering effect on generation")
+    print("\n[4/4] Testing steering effect on generation (per-request API)")
 
     hidden_size = model.hidden_size
     prompt = "The weather today is"
@@ -116,24 +137,33 @@ def test_steering_effect(model: VLLMSteerModel, layer_idx: int) -> None:
         seed=42,  # Use seed for reproducibility
     )
 
+    from chatspace.generation.vllm_steer_model import SteeringSpec, LayerSteeringSpec, AddSpec
+
     # Generate without steering (baseline)
-    model.clear_all_vectors()
     print("  Generating baseline (no steering)...")
-    baseline = model.generate([prompt], sampling_params)[0]
+    baseline = (await model.generate([prompt], sampling_params))[0]
     print(f"  Baseline: {baseline[:100]}")
 
-    # Generate with positive steering vector
+    # Generate with positive steering vector (per-request)
     positive_vector = torch.randn(hidden_size) * 5.0  # Large magnitude
-    model.set_layer_vector(layer_idx, positive_vector)
+    steering_pos = SteeringSpec(layers={
+        layer_idx: LayerSteeringSpec(
+            add=AddSpec(vector=positive_vector, scale=1.0)
+        )
+    })
     print("  Generating with positive steering...")
-    steered_pos = model.generate([prompt], sampling_params)[0]
+    steered_pos = (await model.generate([prompt], sampling_params, steering_spec=steering_pos))[0]
     print(f"  Steered+: {steered_pos[:100]}")
 
-    # Generate with negative steering vector
+    # Generate with negative steering vector (per-request)
     negative_vector = -positive_vector
-    model.set_layer_vector(layer_idx, negative_vector)
+    steering_neg = SteeringSpec(layers={
+        layer_idx: LayerSteeringSpec(
+            add=AddSpec(vector=negative_vector, scale=1.0)
+        )
+    })
     print("  Generating with negative steering...")
-    steered_neg = model.generate([prompt], sampling_params)[0]
+    steered_neg = (await model.generate([prompt], sampling_params, steering_spec=steering_neg))[0]
     print(f"  Steered-: {steered_neg[:100]}")
 
     # Verify outputs are different (steering has an effect)
@@ -144,10 +174,9 @@ def test_steering_effect(model: VLLMSteerModel, layer_idx: int) -> None:
     else:
         print("  ⚠ Warning: Steering may not be working (outputs identical)")
         print("    This can happen with random vectors; try with trained vectors")
-    model.clear_all_vectors()
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
@@ -157,15 +186,15 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("vLLM Steering Vector Test Suite")
+    print("vLLM Steering Vector Test Suite (Per-Request API)")
     print("=" * 70)
 
     try:
         # Run tests
-        model, target_layer = test_basic_generation(args.model)
-        test_steering_vector_setting(model, target_layer)
-        test_multi_layer_vectors(model, target_layer)
-        test_steering_effect(model, target_layer)
+        model, target_layer = await test_basic_generation(args.model)
+        await test_steering_vector_setting(model, target_layer)
+        await test_multi_layer_vectors(model, target_layer)
+        await test_steering_effect(model, target_layer)
 
         print("\n" + "=" * 70)
         print("✓ All tests passed!")
@@ -184,4 +213,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

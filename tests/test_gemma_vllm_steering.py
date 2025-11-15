@@ -12,9 +12,22 @@ from vllm import SamplingParams
 from chatspace.generation import (
     VLLMSteerModel,
     VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+    ProjectionCapSpec,
+    AblationSpec,
 )
 from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
+
+
+def _normalize(vector: torch.Tensor) -> torch.Tensor:
+    """Normalize a vector to unit length."""
+    norm = torch.norm(vector)
+    if float(norm) <= 0:
+        raise ValueError("Vector norm must be positive.")
+    return vector / norm
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
@@ -43,53 +56,62 @@ async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     hidden_size = model.hidden_size
+
+    # Test 1: Additive steering vector
     vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_vector(target_layer, vector)
+    unit = _normalize(vector)
+    scale = float(torch.norm(vector).item())
 
-    # Verify vector was broadcast to workers
-    worker_maps = await model._fetch_worker_vectors()
-    assert worker_maps, "Expected at least one worker vector."
-    for worker_map in worker_maps:
-        worker_vec = worker_map[target_layer]
-        assert torch.allclose(
-            worker_vec, vector.to(dtype=worker_vec.dtype), atol=1e-5
-        ), "Broadcast steering vector does not match worker copy."
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit, scale=scale)
+        )
+    })
 
-    # Test projection cap (clear additive first)
-    await model.clear_layer_vector(target_layer)
-    cap_vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_projection_cap(target_layer, cap_vector, min=-0.5, max=0.75)
-
-    # Test ablation (clear everything first)
-    await model.clear_layer_vector(target_layer)
-    await model.clear_layer_projection_cap(target_layer)
-    ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
-
-    # Run a generation to trigger patched forward method with all operations
+    # Run generation with steering
     prompt = "Test"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1)
-    await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+    await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec, use_tqdm=False)
 
-    # Check that patching works (output_types should include tuple)
-    inspection = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
-    )
-    assert inspection, "Expected inspection data for target layer."
-    layer_info = inspection[0]
-    output_types = layer_info.get("output_types", [])
-    assert "tuple" in output_types, f"Expected tuple output type for Gemma, got {output_types}"
+    # NOTE: inspect_layer_vector() was removed with global API
+    # Per-request steering means we can't inspect worker state - each request is independent
+    # Gemma patching is validated through successful generation instead
 
-    # Test multi-layer steering
+    # Test 2: Projection cap only
+    cap_vector = torch.randn(hidden_size, dtype=torch.float32)
+    steering_spec_cap = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            projection_cap=ProjectionCapSpec(
+                vector=_normalize(cap_vector),
+                min=-0.5,
+                max=0.75
+            )
+        )
+    })
+    await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_cap, use_tqdm=False)
+
+    # Test 3: Ablation only
+    ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
+    steering_spec_ablation = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            ablation=AblationSpec(
+                vector=_normalize(ablation_vector),
+                scale=0.4
+            )
+        )
+    })
+    await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_ablation, use_tqdm=False)
+
+    # Test 4: Multi-layer steering
     layer_a, layer_b = target_layer - 1, target_layer + 1
-    await model.set_layer_vector(layer_a, torch.randn(hidden_size, dtype=torch.float32))
-    await model.set_layer_vector(layer_b, torch.randn(hidden_size, dtype=torch.float32))
+    vector_a = torch.randn(hidden_size, dtype=torch.float32)
+    vector_b = torch.randn(hidden_size, dtype=torch.float32)
 
-    worker_maps = await model._fetch_worker_vectors()
-    for worker_map in worker_maps:
-        assert layer_a in worker_map
-        assert layer_b in worker_map
+    steering_spec_multi = SteeringSpec(layers={
+        layer_a: LayerSteeringSpec(add=AddSpec(vector=_normalize(vector_a), scale=float(torch.norm(vector_a).item()))),
+        layer_b: LayerSteeringSpec(add=AddSpec(vector=_normalize(vector_b), scale=float(torch.norm(vector_b).item()))),
+    })
+    await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_multi, use_tqdm=False)
 
     del model
     torch.cuda.empty_cache()
@@ -123,8 +145,9 @@ async def test_gemma_vllm_chat_respects_steering(model_name: str):
     prompt = "The capital of France is"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
 
-    # Baseline generation
-    baseline_result = (await model.generate([prompt], sampling_params, raw_output=True, use_tqdm=False))[0]
+    # Baseline generation (no steering)
+    baseline_spec = SteeringSpec(layers={})
+    baseline_result = (await model.generate([prompt], sampling_params, steering_spec=baseline_spec, raw_output=True, use_tqdm=False))[0]
     baseline_logprobs = {
         tok: data.logprob
         for tok, data in baseline_result.outputs[0].logprobs[0].items()
@@ -132,10 +155,17 @@ async def test_gemma_vllm_chat_respects_steering(model_name: str):
 
     # Apply strong steering vector
     steering_vec = torch.randn(model.hidden_size, dtype=torch.float32) * 100.0
-    await model.set_layer_vector(target_layer, steering_vec)
+    unit = _normalize(steering_vec)
+    scale = float(torch.norm(steering_vec).item())
+
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit, scale=scale)
+        )
+    })
 
     # Steered generation
-    steered_result = (await model.generate([prompt], sampling_params, raw_output=True, use_tqdm=False))[0]
+    steered_result = (await model.generate([prompt], sampling_params, steering_spec=steering_spec, raw_output=True, use_tqdm=False))[0]
     steered_logprobs = {
         tok: data.logprob
         for tok, data in steered_result.outputs[0].logprobs[0].items()
@@ -152,9 +182,9 @@ async def test_gemma_vllm_chat_respects_steering(model_name: str):
     max_diff = max(logprob_diffs)
     assert max_diff > 0.5, f"Expected significant logprob change, got max diff {max_diff:.3f}"
 
-    # Clear steering and verify reset
-    await model.clear_layer_vector(target_layer)
-    cleared_result = (await model.generate([prompt], sampling_params, raw_output=True, use_tqdm=False))[0]
+    # Verify cleared steering gives baseline results by using empty steering spec
+    cleared_spec = SteeringSpec(layers={})
+    cleared_result = (await model.generate([prompt], sampling_params, steering_spec=cleared_spec, raw_output=True, use_tqdm=False))[0]
     cleared_logprobs = {
         tok: data.logprob
         for tok, data in cleared_result.outputs[0].logprobs[0].items()
@@ -193,10 +223,11 @@ async def test_gemma_hidden_state_capture(model_name: str):
     except OSError as exc:
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
-    # Generate with capture
+    # Generate with capture (no steering)
     prompt = "Hello world"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=2)
-    texts, handles = await model.generate([prompt], sampling_params=sampling_params, use_tqdm=False, capture_layers=[target_layer])
+    baseline_spec = SteeringSpec(layers={})
+    texts, handles = await model.generate([prompt], sampling_params=sampling_params, steering_spec=baseline_spec, use_tqdm=False, capture_layers=[target_layer])
 
     # Fetch captured states
     await model.fetch_captures_batch(handles)
@@ -214,6 +245,29 @@ async def test_gemma_hidden_state_capture(model_name: str):
     hidden = first_capture["hidden"]
     assert isinstance(hidden, torch.Tensor)
     assert hidden.size(-1) == model.hidden_size
+
+    # Also test with steering applied
+    steering_vec = torch.randn(model.hidden_size, dtype=torch.float32)
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(
+                vector=_normalize(steering_vec),
+                scale=float(torch.norm(steering_vec).item())
+            )
+        )
+    })
+    texts_steered, handles_steered = await model.generate(
+        [prompt],
+        sampling_params=sampling_params,
+        steering_spec=steering_spec,
+        use_tqdm=False,
+        capture_layers=[target_layer]
+    )
+
+    # Fetch steered captures
+    await model.fetch_captures_batch(handles_steered)
+    assert len(handles_steered) > 0, "Expected at least one steered request"
+    assert target_layer in handles_steered[0].captures, f"Expected captures for layer {target_layer}"
 
     del model
     torch.cuda.empty_cache()
@@ -250,16 +304,25 @@ async def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
     prompt = "The capital of Germany is"
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
 
-    # vLLM baseline
-    vllm_baseline = (await vllm_model.generate([prompt], sampling_params, raw_output=True, use_tqdm=False))[0]
+    # vLLM baseline (no steering)
+    baseline_spec = SteeringSpec(layers={})
+    vllm_baseline = (await vllm_model.generate([prompt], sampling_params, steering_spec=baseline_spec, raw_output=True, use_tqdm=False))[0]
     vllm_baseline_logprobs = {
         tok: data.logprob
         for tok, data in vllm_baseline.outputs[0].logprobs[0].items()
     }
 
     # vLLM steered
-    await vllm_model.set_layer_vector(target_layer, steering_vec)
-    vllm_steered = (await vllm_model.generate([prompt], sampling_params, raw_output=True, use_tqdm=False))[0]
+    unit = _normalize(steering_vec)
+    scale = float(torch.norm(steering_vec).item())
+
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit, scale=scale)
+        )
+    })
+
+    vllm_steered = (await vllm_model.generate([prompt], sampling_params, steering_spec=steering_spec, raw_output=True, use_tqdm=False))[0]
     vllm_steered_logprobs = {
         tok: data.logprob
         for tok, data in vllm_steered.outputs[0].logprobs[0].items()
@@ -291,12 +354,14 @@ async def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
         hf_baseline_output = hf_model(**inputs)
     hf_baseline_logits = hf_baseline_output.logits[0, -1, :]
 
-    # HF steered
+    # HF steered - convert normalized vector back to original scale
+    scaled_steering_vec = steering_vec.to(
+        device=hf_model.steering.vector.device,
+        dtype=hf_model.steering.vector.dtype,
+    )
+
     with torch.no_grad():
-        hf_model.steering.vector.data = steering_vec.to(
-            device=hf_model.steering.vector.device,
-            dtype=hf_model.steering.vector.dtype,
-        )
+        hf_model.steering.vector.data = scaled_steering_vec
 
     with torch.no_grad():
         hf_steered_output = hf_model(**inputs)

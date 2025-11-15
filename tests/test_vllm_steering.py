@@ -10,7 +10,12 @@ from transformers import AutoConfig, AutoTokenizer
 from vllm import SamplingParams
 
 from chatspace.generation import (
+    AddSpec,
+    AblationSpec,
     ChatResponse,
+    LayerSteeringSpec,
+    ProjectionCapSpec,
+    SteeringSpec,
     VLLMSteerModel,
     VLLMSteeringConfig,
 )
@@ -37,72 +42,66 @@ async def test_vllm_steering_vector_round_trip():
         pytest.skip(f"Unable to load model ({exc}). Ensure weights are cached.")
 
     hidden_size = model.hidden_size
+
+    # Test 1: Basic additive steering with per-request API
     vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_vector(target_layer, vector)
+    vector_norm = vector.norm().item()
+    unit_vector = vector / (vector.norm() + 1e-8)
 
-    worker_maps = await model._fetch_worker_vectors()
-    assert worker_maps, "Expected at least one worker vector."
-    for worker_map in worker_maps:
-        worker_vec = worker_map[target_layer]
-        assert torch.allclose(
-            worker_vec, vector.to(dtype=worker_vec.dtype), atol=1e-5
-        ), "Broadcast steering vector does not match worker copy."
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit_vector, scale=vector_norm)
+        )
+    })
 
+    # Generate with steering to verify it's applied per-request
+    prompt = "Test prompt"
+    sampling = SamplingParams(temperature=0.0, max_tokens=1)
+    texts = await model.generate([prompt], sampling_params=sampling, steering_spec=steering_spec)
+    assert texts, "Expected text output from steered generation."
+
+    # Test 2: Projection cap and ablation
     cap_vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_projection_cap(target_layer, cap_vector, min=-0.5, max=0.75)
+    cap_unit = cap_vector / (cap_vector.norm() + 1e-8)
+
     ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
-    await model.set_layer_ablation(target_layer, ablation_vector, scale=0.4)
+    ablation_unit = ablation_vector / (ablation_vector.norm() + 1e-8)
 
-    inspection = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
-    )
-    assert inspection, "Expected inspection data for target layer."
-    layer_info = inspection[0]
-    projection_cap = layer_info.get("projection_cap")
-    assert projection_cap is not None
-    assert projection_cap["min"] == pytest.approx(-0.5)
-    assert projection_cap["max"] == pytest.approx(0.75)
-    ablation_info = layer_info.get("ablation")
-    assert ablation_info is not None
-    assert ablation_info["scale"] == pytest.approx(0.4)
+    steering_spec_full = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit_vector, scale=vector_norm),
+            projection_cap=ProjectionCapSpec(vector=cap_unit, min=-0.5, max=0.75),
+            ablation=AblationSpec(vector=ablation_unit, scale=0.4),
+        )
+    })
 
-    await model.clear_layer_projection_cap(target_layer)
-    await model.clear_layer_ablation(target_layer)
-    inspection_after_clear = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
-    )
-    assert inspection_after_clear, "Expected inspection after clearing."
-    layer_info_after_clear = inspection_after_clear[0]
-    assert layer_info_after_clear.get("projection_cap") is None
-    assert layer_info_after_clear.get("ablation") is None
+    # NOTE: inspect_layer_vector() and fetch_worker_state() were removed with global API
+    # Per-request steering means we can't inspect worker state - each request is independent
 
-    worker_state = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("fetch_worker_state"),
-    )
-    assert worker_state, "Expected worker state info."
-    layer_count = int(worker_state[0].get("layer_count", 0) or 0)
-    if layer_count > 1:
-        other_layer = (target_layer + 1) % layer_count
-        if other_layer == target_layer:
-            other_layer = (other_layer + 1) % layer_count
-        extra_vector = torch.randn(hidden_size, dtype=torch.float32)
-        await model.set_layer_vector(other_layer, extra_vector)
-        expanded_maps = await model._fetch_worker_vectors()
-        for worker_map in expanded_maps:
-            assert other_layer in worker_map, "Missing secondary layer vector."
-            worker_vec = worker_map[other_layer]
-            assert torch.allclose(
-                worker_vec, extra_vector.to(dtype=worker_vec.dtype), atol=1e-5
-            ), "Secondary layer vector mismatch."
+    # Generate with full steering spec
+    texts_full = await model.generate([prompt], sampling_params=sampling, steering_spec=steering_spec_full)
+    assert texts_full, "Expected text output from fully steered generation."
 
-    await model.clear_all_vectors()
-    cleared_maps = await model._fetch_worker_vectors()
-    for worker_map in cleared_maps:
-        for worker_vec in worker_map.values():
-            assert torch.allclose(worker_vec, torch.zeros_like(worker_vec))
+    # Test 3: Multi-layer steering
+    # Per-request steering means each layer is configured independently
+    # Use two different layers for multi-layer test
+    other_layer = (target_layer + 1) if target_layer < 23 else (target_layer - 1)
+
+    extra_vector = torch.randn(hidden_size, dtype=torch.float32)
+    extra_norm = extra_vector.norm().item()
+    extra_unit = extra_vector / (extra_vector.norm() + 1e-8)
+
+    multi_layer_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(add=AddSpec(vector=unit_vector, scale=vector_norm)),
+        other_layer: LayerSteeringSpec(add=AddSpec(vector=extra_unit, scale=extra_norm)),
+    })
+
+    texts_multi = await model.generate([prompt], sampling_params=sampling, steering_spec=multi_layer_spec)
+    assert texts_multi, "Expected text output from multi-layer steered generation."
+
+    # Test 4: Baseline generation without steering (per-request steering doesn't need cleanup)
+    texts_baseline = await model.generate([prompt], sampling_params=sampling)
+    assert texts_baseline, "Expected text output from baseline generation."
 
     # Clean up to avoid leaving GPU memory allocated between tests.
     del model
@@ -130,38 +129,37 @@ async def test_vllm_chat_respects_steering():
     prompt = "State the color of a clear daytime sky."
     sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=5)
 
+    # Generate baseline output without steering
     baseline_req = (await model.generate([prompt], sampling_params=sampling, raw_output=True))[0]
     baseline_out = baseline_req.outputs[0]
     baseline_token = baseline_out.token_ids[0]
     baseline_logprob = baseline_out.logprobs[0][baseline_token].logprob
 
+    # Build steering spec with scaled random vector
     scale = 5_000.0
-    random_vector = torch.randn(model.hidden_size, dtype=torch.float32) * scale
-    await model.set_layer_vector(target_layer, random_vector)
-    worker_info = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
-    )
-    assert worker_info, "Expected worker diagnostics."
-    assert worker_info[0]["has_vector"], "Patched layer missing steering vector."
-    assert worker_info[0]["norm"] > 0, "Worker vector norm is zero unexpectedly."
+    random_vector = torch.randn(model.hidden_size, dtype=torch.float32)
+    random_norm = random_vector.norm().item()
+    random_unit = random_vector / (random_vector.norm() + 1e-8)
 
-    steered_req = (await model.generate([prompt], sampling_params=sampling, raw_output=True))[0]
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=random_unit, scale=scale)
+        )
+    })
+
+    # Generate with steering
+    steered_req = (await model.generate([prompt], sampling_params=sampling, raw_output=True, steering_spec=steering_spec))[0]
     steered_out = steered_req.outputs[0]
     steered_token = steered_out.token_ids[0]
     steered_logprob = steered_out.logprobs[0][steered_token].logprob
-    worker_info_after = await model._engine_client.collective_rpc(
-        steering_runtime.STEERING_RPC_METHOD,
-        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
-    )
 
-    await model.clear_all_vectors()
+    # Generate reset output without steering (per-request steering, no explicit cleanup needed)
     reset_req = (await model.generate([prompt], sampling_params=sampling, raw_output=True))[0]
     reset_out = reset_req.outputs[0]
     reset_token = reset_out.token_ids[0]
     reset_logprob = reset_out.logprobs[0][reset_token].logprob
 
-    # Test basic chat API
+    # Test basic chat API without steering
     request = [
         {"role": "system", "content": "You are a concise assistant."},
         {"role": "user", "content": prompt},
@@ -176,7 +174,7 @@ async def test_vllm_chat_respects_steering():
         torch.tensor(baseline_logprob), torch.tensor(steered_logprob)
     ), (
         "Steering did not perturb token logprobs. "
-        f"worker_info={worker_info} worker_info_after={worker_info_after}"
+        f"baseline_logprob={baseline_logprob} steered_logprob={steered_logprob}"
     )
     assert torch.isclose(
         torch.tensor(baseline_logprob), torch.tensor(reset_logprob)
@@ -222,6 +220,9 @@ async def test_vllm_matches_hf_logprob_shift():
     hf_baseline_lp = float(base_logprobs[0, baseline_token])
 
     steering_vector = torch.randn(hidden_size, dtype=torch.float32) * 0.01
+    steering_norm = steering_vector.norm().item()
+    steering_unit = steering_vector / (steering_vector.norm() + 1e-8)
+
     hf_model.set_vector(steering_vector)
     with torch.no_grad():
         hf_outputs_steered = hf_model(**inputs)
@@ -252,8 +253,14 @@ async def test_vllm_matches_hf_logprob_shift():
     baseline_out = (await vllm_model.generate([prompt], sampling_params=sampling, raw_output=True))[0].outputs[0]
     vllm_baseline_lp = _extract_logprob(baseline_out, baseline_token)
 
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
-    steered_out = (await vllm_model.generate([prompt], sampling_params=sampling, raw_output=True))[0].outputs[0]
+    # Build steering spec for vLLM
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=steering_unit, scale=steering_norm)
+        )
+    })
+
+    steered_out = (await vllm_model.generate([prompt], sampling_params=sampling, raw_output=True, steering_spec=steering_spec))[0].outputs[0]
     vllm_steered_lp = _extract_logprob(steered_out, baseline_token)
     vllm_shift = vllm_steered_lp - vllm_baseline_lp
 
@@ -268,7 +275,7 @@ async def test_vllm_matches_hf_logprob_shift():
         f"Steering logprob shift mismatch {shift_delta:.4f} exceeds tolerance {shift_tol:.4f}"
     )
 
-    await vllm_model.clear_all_vectors()
+    # No cleanup needed - per-request steering is automatic
     del vllm_model
     del hf_model
     torch.cuda.empty_cache()

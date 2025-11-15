@@ -53,13 +53,14 @@ def main() -> None:
     model_single.set_layer_vector(8, steering_vec)
 
     # Fetch worker vectors
-    worker_vecs = model_single._fetch_worker_vectors()
-    print(f"   Number of workers: {len(worker_vecs)}")
+    # NOTE: _fetch_worker_vectors() was part of old global API (removed in favor of per-request steering)
+    # worker_vecs = model_single._fetch_worker_vectors()
+    # print(f"   Number of workers: {len(worker_vecs)}")
 
-    for i, worker_map in enumerate(worker_vecs):
-        if 8 in worker_map:
-            vec = worker_map[8]
-            print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}")
+    # for i, worker_map in enumerate(worker_vecs):
+    #     if 8 in worker_map:
+    #         vec = worker_map[8]
+    #         print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}")
 
     # Fetch worker state
     state_info = model_single._engine_client.collective_rpc(
@@ -98,32 +99,33 @@ def main() -> None:
     model_tp.set_layer_vector(8, steering_vec)
 
     # Fetch from all workers
-    worker_vecs_tp = model_tp._fetch_worker_vectors()
-    print(f"   Number of workers: {len(worker_vecs_tp)}")
+    # NOTE: _fetch_worker_vectors() was part of old global API (removed in favor of per-request steering)
+    # worker_vecs_tp = model_tp._fetch_worker_vectors()
+    # print(f"   Number of workers: {len(worker_vecs_tp)}")
 
-    if len(worker_vecs_tp) != 2:
-        print(f"   ⚠ WARNING: Expected 2 workers for TP=2, got {len(worker_vecs_tp)}")
-
-    # Check each worker
-    for i, worker_map in enumerate(worker_vecs_tp):
-        if 8 in worker_map:
-            vec = worker_map[8]
-            print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}, device=GPU{i}")
-
-            # Verify it matches the input
-            match = torch.allclose(vec.cpu(), steering_vec.cpu(), atol=1e-5)
-            print(f"      Matches input vector: {match}")
-
-            if i > 0:
-                # Compare to first worker
-                first_vec = worker_vecs_tp[0][8]
-                cross_match = torch.allclose(vec, first_vec, atol=1e-6)
-                print(f"      Matches worker 0: {cross_match}")
-                if not cross_match:
-                    diff = (vec - first_vec).abs().max().item()
-                    print(f"      Max difference: {diff:.2e}")
-        else:
-            print(f"   Worker {i}: ⚠ Layer 8 not found in worker map")
+    # if len(worker_vecs_tp) != 2:
+    #     print(f"   ⚠ WARNING: Expected 2 workers for TP=2, got {len(worker_vecs_tp)}")
+    #
+    # # Check each worker
+    # for i, worker_map in enumerate(worker_vecs_tp):
+    #     if 8 in worker_map:
+    #         vec = worker_map[8]
+    #         print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}, device=GPU{i}")
+    #
+    #         # Verify it matches the input
+    #         match = torch.allclose(vec.cpu(), steering_vec.cpu(), atol=1e-5)
+    #         print(f"      Matches input vector: {match}")
+    #
+    #         if i > 0:
+    #             # Compare to first worker
+    #             first_vec = worker_vecs_tp[0][8]
+    #             cross_match = torch.allclose(vec, first_vec, atol=1e-6)
+    #             print(f"      Matches worker 0: {cross_match}")
+    #             if not cross_match:
+    #                 diff = (vec - first_vec).abs().max().item()
+    #                 print(f"      Max difference: {diff:.2e}")
+    #     else:
+    #         print(f"   Worker {i}: ⚠ Layer 8 not found in worker map")
 
     # Fetch worker states
     state_info_tp = model_tp._engine_client.collective_rpc(
