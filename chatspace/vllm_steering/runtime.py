@@ -1122,11 +1122,8 @@ def _create_shared_tensor(
         # Copy to shm-backed tensor
         # For GPU→shm: single async copy (eliminates intermediate CPU buffer)
         # For CPU→shm: single copy (non_blocking is ignored for CPU→CPU)
+        # Note: Caller must synchronize if batching multiple GPU copies
         shm_tensor.copy_(tensor, non_blocking=True)
-
-        # Synchronize if source was GPU
-        if tensor.device.type == 'cuda':
-            torch.cuda.synchronize()
 
         # Track in state with timestamp
         state.active_shared_memory[shm_name] = (shm, time.time())
@@ -1824,7 +1821,15 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
                 total_numpy_time += time.perf_counter() - t_numpy_start
                 serialized[layer_idx] = payload
 
-            # Cleanup
+            result[req_id] = serialized
+
+        # Phase 5: Batch synchronize all GPU→shm copies
+        # This allows all async copies to overlap instead of syncing individually
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # Cleanup
+        for req_id in request_ids:
             state.active_capture_requests.pop(req_id, None)
             state.request_prefill_buffers.pop(req_id, None)
             state.request_last_phase.pop(req_id, None)
@@ -1833,8 +1838,6 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
                 state.request_decode_buffers.pop(req_id, None)
             if state.request_pending_transfers is not None:
                 state.request_pending_transfers.pop(req_id, None)
-
-            result[req_id] = serialized
 
         # Populate profiling metadata for summary/logging
         profiling_metadata["layer_count"] = layer_count
