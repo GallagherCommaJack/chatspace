@@ -1054,8 +1054,8 @@ def _create_shared_tensor(
 ) -> dict[str, Any]:
     """Create shared memory segment for tensor and return metadata.
 
-    Optimized to write GPU tensors directly to shared memory, eliminating
-    the intermediate CPU buffer allocation (reduces 2 copies to 1 copy).
+    Optimized to write tensors directly to shared memory, eliminating
+    intermediate CPU buffer allocation for GPU tensors (reduces 2 copies to 1).
 
     Args:
         tensor: Tensor to share (GPU or CPU)
@@ -1065,20 +1065,17 @@ def _create_shared_tensor(
     Returns:
         Metadata dict with encoding="shm" or encoding="bytes" (fallback)
     """
-    # Ensure tensor is on CPU for serialization
-    if tensor.device.type != 'cpu':
-        cpu_tensor = tensor.cpu()
-    else:
-        cpu_tensor = tensor
-
     # Check if shared memory is enabled
     if not state.use_shared_memory:
+        # Fallback: serialize to bytes (requires CPU tensor)
+        cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
         return serialize_tensor(cpu_tensor)
 
     # Check size threshold
     nbytes = tensor.numel() * tensor.element_size()
     threshold_bytes = threshold_kb * 1024
     if nbytes < threshold_bytes:
+        cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
         return serialize_tensor(cpu_tensor)
 
     # Check memory limit
@@ -1090,6 +1087,7 @@ def _create_shared_tensor(
         logger.warning(
             f"Shared memory limit reached ({max_gb}GB), falling back to bytes"
         )
+        cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
         return serialize_tensor(cpu_tensor)
 
     shm_name = None
@@ -1100,46 +1098,35 @@ def _create_shared_tensor(
         # Create shared memory segment
         shm = SharedMemory(create=True, size=nbytes, name=shm_name)
 
-        # Optimization: Write directly from GPU to shared memory (1 copy instead of 2)
-        if tensor.device.type == 'cuda':
-            # Handle bfloat16: create shm-backed tensor via uint16 view
-            if tensor.dtype == torch.bfloat16:
-                # Create uint16 view of shm buffer
-                shm_array_u16 = np.ndarray(
-                    tensor.shape,
-                    dtype=np.uint16,
-                    buffer=shm.buf
-                )
-                # Create torch tensor backed by shm (via uint16 view)
-                shm_tensor_u16 = torch.from_numpy(shm_array_u16)
-                # View as bfloat16 for copy
-                shm_tensor = shm_tensor_u16.view(torch.bfloat16)
-            else:
-                # Standard dtypes: create numpy array backed by shm
-                np_dtype = torch.empty(0, dtype=tensor.dtype).numpy().dtype
-                shm_array = np.ndarray(
-                    tensor.shape,
-                    dtype=np_dtype,
-                    buffer=shm.buf
-                )
-                # Create torch tensor backed by shm
-                shm_tensor = torch.from_numpy(shm_array)
-
-            # Direct GPU→shm copy (eliminates intermediate CPU allocation)
-            shm_tensor.copy_(tensor, non_blocking=True)
-            torch.cuda.synchronize()  # Ensure copy completes before returning
-
+        # Unified path: Create shm-backed tensor and copy
+        # (works for both GPU and CPU sources)
+        if tensor.dtype == torch.bfloat16:
+            # bfloat16: create uint16 view for numpy compatibility
+            shm_array_u16 = np.ndarray(
+                tensor.shape,
+                dtype=np.uint16,
+                buffer=shm.buf
+            )
+            shm_tensor_u16 = torch.from_numpy(shm_array_u16)
+            shm_tensor = shm_tensor_u16.view(torch.bfloat16)
         else:
-            # CPU tensor: use standard path (no optimization needed)
-            if cpu_tensor.dtype == torch.bfloat16:
-                # View as uint16, convert to numpy, then view as bfloat16
-                np_array = cpu_tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
-            else:
-                np_array = cpu_tensor.numpy()
+            # Standard dtypes: create numpy array backed by shm
+            np_dtype = torch.empty(0, dtype=tensor.dtype).numpy().dtype
+            shm_array = np.ndarray(
+                tensor.shape,
+                dtype=np_dtype,
+                buffer=shm.buf
+            )
+            shm_tensor = torch.from_numpy(shm_array)
 
-            # Copy tensor data to shared memory
-            shm_array = np.ndarray(np_array.shape, dtype=np_array.dtype, buffer=shm.buf)
-            shm_array[:] = np_array
+        # Copy to shm-backed tensor
+        # For GPU→shm: single async copy (eliminates intermediate CPU buffer)
+        # For CPU→shm: single copy (non_blocking is ignored for CPU→CPU)
+        shm_tensor.copy_(tensor, non_blocking=True)
+
+        # Synchronize if source was GPU
+        if tensor.device.type == 'cuda':
+            torch.cuda.synchronize()
 
         # Track in state with timestamp
         state.active_shared_memory[shm_name] = (shm, time.time())
@@ -1162,6 +1149,9 @@ def _create_shared_tensor(
                 shm.unlink()
             except Exception as e:
                 logger.debug(f"Failed to cleanup shared memory: {e}")
+
+        # Fallback to bytes serialization
+        cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
         return serialize_tensor(cpu_tensor)
 
 
