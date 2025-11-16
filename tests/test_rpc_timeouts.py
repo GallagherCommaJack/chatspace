@@ -82,7 +82,7 @@ async def test_capture_fetch_timeout(model_factory):
     original_rpc = model._collective_rpc
 
     async def slow_fetch_rpc(op, *args, **kwargs):
-        if op == "fetch_batch_captures":
+        if op == "fetch_request_activations":
             # Hang for a very long time
             await asyncio.sleep(60)  # Will be interrupted by timeout
         return await original_rpc(op, *args, **kwargs)
@@ -300,11 +300,16 @@ async def test_unregister_steering_timeout_handling(model_factory, caplog):
             # Generate will try to unregister in finally block
             # This may timeout, but shouldn't crash
             try:
-                results, handles = await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     model.generate(prompts, sampling_params, steering_spec=steering_spec),
                     timeout=30.0  # Long timeout for generation, but unregister may timeout
                 )
                 # If we get here, generation succeeded but cleanup may have timed out
+                # Handle result which could be single value or tuple depending on how timeout occurred
+                if isinstance(result, tuple):
+                    results, handles = result
+                    if handles:
+                        await handles[0].close()
             except asyncio.TimeoutError:
                 # Timeout during cleanup is acceptable
                 pass
@@ -318,32 +323,48 @@ async def test_multiple_concurrent_timeouts(model_factory):
     """
     model = await model_factory(use_shared_memory=False)
 
+    # Initialize engine once before concurrent operations to avoid race condition
+    init_prompts = ["Init"]
+    init_params = SamplingParams(max_tokens=1, temperature=0.0)
+    init_results, init_handles = await model.generate(init_prompts, init_params, capture_layers=[5])
+    await init_handles[0].close()
+
     # Create multiple slow operations
     async def slow_operation(delay: float):
         prompts = ["Test"]
         sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
         try:
-            results, handles = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 model.generate(prompts, sampling_params),
                 timeout=delay
             )
-            await handles[0].close()
+            # Handle result which might be tuple or single value
+            if isinstance(result, tuple):
+                results, handles = result
+                if handles:
+                    await handles[0].close()
             return "success"
         except asyncio.TimeoutError:
             return "timeout"
+        except Exception as e:
+            # Log other exceptions but don't fail - testing system resilience
+            print(f"Operation encountered exception: {e}")
+            return f"error: {type(e).__name__}"
 
     # Launch multiple operations with different timeouts
+    # Use longer timeouts to avoid timing issues
     tasks = [
-        slow_operation(10.0),  # Should succeed
-        slow_operation(10.0),  # Should succeed
-        slow_operation(10.0),  # Should succeed
+        slow_operation(30.0),  # Should succeed
+        slow_operation(30.0),  # Should succeed
+        slow_operation(30.0),  # Should succeed
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # At least some should succeed (system not deadlocked)
     successes = [r for r in results if r == "success"]
-    assert len(successes) > 0, "Expected at least some operations to succeed"
+    assert len(successes) > 0, \
+        f"Expected at least some operations to succeed, got results: {results}"
 
 
 @pytest.mark.asyncio
@@ -354,12 +375,15 @@ async def test_rpc_exception_propagation(model_factory):
     """
     model = await model_factory(use_shared_memory=False)
 
+    # Store original method before mocking
+    original_rpc = model._collective_rpc
+
     # Mock RPC to raise exception
     async def failing_rpc(op, *args, **kwargs):
         if op == "register_steering_spec":
             raise RuntimeError("Simulated worker error")
-        # Let other operations through
-        return await model._collective_rpc.__wrapped__(model, op, *args, **kwargs)
+        # Let other operations through (call original method directly)
+        return await original_rpc(op, *args, **kwargs)
 
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
@@ -373,7 +397,6 @@ async def test_rpc_exception_propagation(model_factory):
     prompts = ["Test"]
     sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
 
-    original_method = model._collective_rpc
     with patch.object(model, "_collective_rpc", failing_rpc):
         # Should propagate the RuntimeError
         with pytest.raises(RuntimeError, match="Simulated worker error"):

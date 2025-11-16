@@ -326,7 +326,9 @@ async def test_threshold_boundary_conditions(model_factory):
         shm_threshold_kb=50,  # Below tensor size - should use shm
     )
 
-    prompts = ["Test"]
+    # Use longer prompt to ensure tensor exceeds threshold
+    # Repeat "Test " many times to get enough tokens
+    prompts = ["Test " * 100]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
 
     results, handles = await model.generate(
