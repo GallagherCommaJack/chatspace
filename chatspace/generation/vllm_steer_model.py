@@ -1025,7 +1025,7 @@ class VLLMSteerModel:
                     results.append(final_output.outputs[0].text)
 
             # Return with or without handles
-            if handles:
+            if handles is not None:
                 return results, handles
             else:
                 return results
