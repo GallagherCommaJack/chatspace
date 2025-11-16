@@ -86,6 +86,14 @@ class AddSpec:
     vector: torch.Tensor
     scale: float = 1.0
 
+    def __post_init__(self):
+        """Validate steering vector."""
+        if not torch.isfinite(self.vector).all():
+            raise ValueError("Steering vector contains NaN or Inf values")
+        norm = float(self.vector.norm().item())
+        if norm == 0.0:
+            raise ValueError("Steering vector has zero norm (cannot be normalized)")
+
     def clone(self) -> "AddSpec":
         return AddSpec(vector=self.vector.detach().clone(), scale=self.scale)
 
@@ -116,6 +124,16 @@ class ProjectionCapSpec:
     min: float | None = None
     max: float | None = None
 
+    def __post_init__(self):
+        """Validate projection cap spec."""
+        if self.min is None and self.max is None:
+            raise ValueError("ProjectionCapSpec requires at least one of min or max to be set")
+        if not torch.isfinite(self.vector).all():
+            raise ValueError("Projection cap vector contains NaN or Inf values")
+        norm = float(self.vector.norm().item())
+        if norm == 0.0:
+            raise ValueError("Projection cap vector has zero norm (cannot be normalized)")
+
     def clone(self) -> "ProjectionCapSpec":
         return ProjectionCapSpec(
             vector=self.vector.detach().clone(),
@@ -140,6 +158,14 @@ class AblationSpec:
 
     vector: torch.Tensor
     scale: float = 1.0
+
+    def __post_init__(self):
+        """Validate ablation spec."""
+        if not torch.isfinite(self.vector).all():
+            raise ValueError("Ablation vector contains NaN or Inf values")
+        norm = float(self.vector.norm().item())
+        if norm == 0.0:
+            raise ValueError("Ablation vector has zero norm (cannot be normalized)")
 
     def clone(self) -> "AblationSpec":
         return AblationSpec(vector=self.vector.detach().clone(), scale=self.scale)
@@ -902,13 +928,28 @@ class VLLMSteerModel:
             serialized_layer = {}
 
             if layer_spec.add is not None:
+                # Validate dimension
+                vector = layer_spec.add.materialize()
+                if vector.numel() != self.hidden_size:
+                    raise ValueError(
+                        f"Steering vector dimension mismatch at layer {layer_idx}: "
+                        f"expected {self.hidden_size}, got {vector.numel()}. "
+                        f"Vector shape: {vector.shape}"
+                    )
                 serialized_layer["add"] = {
                     "vector": steering_runtime.serialize_tensor(
-                        layer_spec.add.materialize().to(dtype=self._vector_dtype)
+                        vector.to(dtype=self._vector_dtype)
                     ),
                 }
 
             if layer_spec.projection_cap is not None:
+                # Validate dimension
+                if layer_spec.projection_cap.vector.numel() != self.hidden_size:
+                    raise ValueError(
+                        f"Projection cap vector dimension mismatch at layer {layer_idx}: "
+                        f"expected {self.hidden_size}, got {layer_spec.projection_cap.vector.numel()}. "
+                        f"Vector shape: {layer_spec.projection_cap.vector.shape}"
+                    )
                 serialized_layer["projection_cap"] = {
                     "vector": steering_runtime.serialize_tensor(
                         layer_spec.projection_cap.vector.to(dtype=torch.float32)
@@ -918,6 +959,13 @@ class VLLMSteerModel:
                 }
 
             if layer_spec.ablation is not None:
+                # Validate dimension
+                if layer_spec.ablation.vector.numel() != self.hidden_size:
+                    raise ValueError(
+                        f"Ablation vector dimension mismatch at layer {layer_idx}: "
+                        f"expected {self.hidden_size}, got {layer_spec.ablation.vector.numel()}. "
+                        f"Vector shape: {layer_spec.ablation.vector.shape}"
+                    )
                 serialized_layer["ablation"] = {
                     "vector": steering_runtime.serialize_tensor(
                         layer_spec.ablation.vector.to(dtype=torch.float32)
@@ -982,6 +1030,16 @@ class VLLMSteerModel:
                 layers_tuple = (capture_layers,)
             else:
                 layers_tuple = tuple(capture_layers)
+
+            # Validate layer indices
+            for layer_idx in layers_tuple:
+                if layer_idx < 0:
+                    raise ValueError(f"Capture layer index must be non-negative, got {layer_idx}")
+                if layer_idx >= self.layer_count:
+                    raise ValueError(
+                        f"Capture layer index {layer_idx} is out of range. "
+                        f"Model has {self.layer_count} layers (valid range: 0-{self.layer_count - 1})"
+                    )
 
             # Register captures for each prompt
             handles = []
