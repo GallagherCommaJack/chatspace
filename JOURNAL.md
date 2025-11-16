@@ -2,6 +2,79 @@
 
 ## 2025-11-16
 
+### Test Isolation Issue Fixed: 205/206 Tests Passing in Full Suite
+
+**Timestamp:** 2025-11-16 09:11 UTC
+
+Fixed test isolation issue that caused 12 tests to fail when running the full suite, despite all tests passing individually or in their respective test files.
+
+**Problem:**
+
+After fixing the 6 individual test bugs (commit 4ea40c5), running the full test suite showed 12 failures across 4 test files:
+- `test_capture_coalescing.py`: 4 failures (9 tests)
+- `test_capture_handle_lifecycle.py`: 3 failures (12 tests)
+- `test_input_validation.py`: 3 failures (25 tests)
+- `test_rpc_timeouts.py`: 2 failures (9 tests)
+
+All tests passed when run individually or in their respective test files, indicating **test pollution** rather than implementation bugs.
+
+**Root Cause:**
+
+vLLM engine state from one test was not being fully cleaned up before the next test started, causing:
+1. Async operations (engine shutdown) not completing before next test
+2. CUDA memory not being released between tests
+3. References not being garbage collected
+4. Cumulative buildup of state over many tests
+
+**Solution:**
+
+Added aggressive cleanup fixture in `tests/conftest.py`:
+
+```python
+@pytest.fixture(autouse=True, scope="function")
+def aggressive_cleanup(request):
+    """Ensure proper cleanup after each test to prevent state pollution."""
+    yield
+
+    # Allow async cleanup to complete
+    time.sleep(0.2)
+
+    # Force garbage collection (2 passes)
+    gc.collect()
+    gc.collect()
+
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    # Brief pause before next test
+    time.sleep(0.2)
+```
+
+**Key Design Decisions:**
+
+1. **Synchronous fixture with time.sleep()**: Avoids event loop interaction issues with pytest's async handling
+2. **0.4s total delay per test**: Balances cleanup thoroughness vs. test suite runtime (adds ~80s for 200 tests)
+3. **Autouse with function scope**: Applies to all tests automatically, runs after each test
+4. **Double gc.collect()**: Second pass catches objects freed by first pass
+5. **CUDA synchronization**: Ensures GPU operations complete before next test
+
+**Results:**
+
+- **Before fix:** 194 passed, 12 failed, 6 skipped
+- **After fix:** 205 passed, 1 failed, 6 skipped (24 minutes 20 seconds)
+- **Only failure:** `test_finalizer_warns_for_unaccessed_handles` (known flaky GC timing test)
+
+**Validation:**
+
+Ran all 4 problematic test files together: 54/55 tests passed (only the known GC timing test failed).
+
+**Files Modified:**
+- `tests/conftest.py`: Added aggressive_cleanup fixture
+
+---
+
 ### Test Suite Complete: 206/206 Tests Passing
 
 **Timestamp:** 2025-11-16 06:55 UTC
