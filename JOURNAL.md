@@ -2080,3 +2080,12 @@ Conducted comprehensive code review of `feat/per-request-steering` branch focusi
 
 **Branch Status:** Ready for PR with all tests passing 🎉
 
+
+## 2025-11-18 23:29 UTC
+
+**Fix flaky test failure**
+
+- **Issue:** `tests/test_capture_handle_lifecycle.py::test_finalizer_warns_for_unaccessed_handles` was failing with `AssertionError: Expected ResourceWarning`.
+- **Diagnosis:** The test deleted the `handle` reference *before* entering the `warnings.catch_warnings` block. In CPython, `del handle` immediately triggered the `weakref.finalize` callback (as it was the last reference), which emitted the `ResourceWarning`. Since the warning capture block wasn't active yet, the warning was missed by the test assertion.
+- **Fix:** Moved `del handle` and `del handles` inside the `with warnings.catch_warnings(...)` block.
+- **Verification:** Verified with reproduction script and by running the full test file.

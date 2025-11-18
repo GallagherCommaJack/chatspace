@@ -183,38 +183,6 @@ async def test_bytes_fallback_below_threshold(model_factory):
 
 
 @pytest.mark.asyncio
-async def test_unused_handle_warning(model_factory):
-    """Test ResourceWarning for unused handles."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
-
-    prompts = ["Test"]
-    sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
-
-    results, handles = await model.generate(
-        prompts,
-        sampling_params,
-        capture_layers=[5],
-    )
-
-    handle = handles[0]
-    await model.fetch_captures_batch([handle])
-
-    # Don't access handle.captures, let it get garbage collected
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always", ResourceWarning)
-
-        # Delete handle without accessing captures
-        del handle
-        import gc
-        gc.collect()
-
-        # Check if ResourceWarning was raised
-        resource_warnings = [warn for warn in w if issubclass(warn.category, ResourceWarning)]
-        # Note: Finalizers may not run immediately, so this test is best-effort
-        # In practice, the warning will appear in logs
-
-
-@pytest.mark.asyncio
 async def test_concurrent_access_isolation(model_factory):
     """Test that concurrent requests maintain proper isolation."""
     model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)

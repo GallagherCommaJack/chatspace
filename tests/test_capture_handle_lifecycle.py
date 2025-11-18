@@ -89,15 +89,15 @@ async def test_finalizer_warns_for_unaccessed_handles(model_factory):
     # DO NOT access .captures property and DO NOT call close()
     # This simulates the bug where user forgets cleanup
 
-    # Drop reference to handle and force garbage collection
-    handle_id = id(handle)
-    del handle
-    del handles
-
     # Force finalization (may require multiple attempts due to GC timing)
     import time
     with warnings.catch_warnings(record=True) as warning_list:
         warnings.simplefilter("always", ResourceWarning)
+
+        # Drop reference to handle and force garbage collection
+        handle_id = id(handle)
+        del handle
+        del handles
 
         # Try multiple gc.collect() calls with small delays
         # Finalizers aren't guaranteed to run immediately
