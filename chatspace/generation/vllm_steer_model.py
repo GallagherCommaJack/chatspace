@@ -1065,11 +1065,9 @@ class VLLMSteerModel:
                 await self._register_steering_spec(req_id, steering_spec)
 
         try:
-            # Generate each prompt
-            results = []
-            for i, prompt in enumerate(prompts):
+            # Generate all prompts concurrently for maximum throughput
+            async def process_one_request(i: int, prompt: str) -> Any:
                 request_id = request_ids[i]
-
                 final_output = None
                 async for output in self._engine.generate(prompt, sampling_params, request_id=request_id):
                     final_output = output
@@ -1078,9 +1076,13 @@ class VLLMSteerModel:
                     raise RuntimeError(f"No output for prompt: {prompt}")
 
                 if raw_output:
-                    results.append(final_output)
+                    return final_output
                 else:
-                    results.append(final_output.outputs[0].text)
+                    return final_output.outputs[0].text
+
+            # Launch all requests concurrently
+            tasks = [process_one_request(i, p) for i, p in enumerate(prompts)]
+            results = await asyncio.gather(*tasks)
 
             # Return with or without handles
             if handles is not None:
@@ -1258,9 +1260,9 @@ class VLLMSteerModel:
                 handles.append(handle)
 
         import uuid
-        results: list[ChatResponse] | list[Any] = []
 
-        for i, messages_conv in enumerate(batched_messages):
+        # Process all conversations concurrently for maximum throughput
+        async def process_one_conversation(i: int, messages_conv: list[dict[str, Any]]) -> ChatResponse | Any:
             has_prefill = False
             prefill_text = ""
             if (
@@ -1291,14 +1293,18 @@ class VLLMSteerModel:
                 final_output = output
 
             if raw_output:
-                results.append(final_output)
+                return final_output
             else:
                 generated_text = final_output.outputs[0].text
                 response = ChatResponse(
                     prefill=prefill_text if has_prefill else "",
                     generated=generated_text,
                 )
-                results.append(response)
+                return response
+
+        # Launch all conversations concurrently
+        tasks = [process_one_conversation(i, conv) for i, conv in enumerate(batched_messages)]
+        results: list[ChatResponse] | list[Any] = await asyncio.gather(*tasks)
 
         if handles:
             return results, handles

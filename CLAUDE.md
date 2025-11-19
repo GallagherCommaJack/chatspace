@@ -170,6 +170,56 @@ Each run records:
 - Route diagnostics through `logging` module; avoid bare `print` except in CLI entry points
 - Keep shard and manifest writers immutable: create new files rather than mutating outputs in-place
 
+## Async/Await Patterns and Pitfalls
+
+**CRITICAL**: When migrating sync APIs to async, preserve the concurrency model!
+
+### The Sequential Loop Antipattern ❌
+
+```python
+# BAD: Processes prompts sequentially (destroys throughput)
+async def generate(self, prompts: list[str], ...):
+    results = []
+    for prompt in prompts:
+        async for output in self._engine.generate(prompt, ...):
+            final_output = output
+        results.append(final_output)
+    return results
+```
+
+This forces each request to complete before the next starts, preventing vLLM from batching them on the GPU. With 32 requests, this can cause 20-30x throughput loss.
+
+### Correct: Concurrent Processing ✅
+
+```python
+# GOOD: Processes prompts concurrently (maximum throughput)
+async def generate(self, prompts: list[str], ...):
+    async def process_one(prompt: str):
+        async for output in self._engine.generate(prompt, ...):
+            final_output = output
+        return final_output
+
+    tasks = [process_one(p) for p in prompts]
+    results = await asyncio.gather(*tasks)
+    return results
+```
+
+This allows vLLM's async engine to batch all requests together for maximum GPU utilization.
+
+### Why This Happens
+
+- **Sync APIs** (like `vllm.LLM.generate(prompts)`) handle batching internally
+- **Async APIs** (like `AsyncLLMEngine.generate(prompt)`) require explicit concurrent task launching
+- Simply adding `async`/`await` keywords without `asyncio.gather()` makes things sequential!
+
+### When This Matters
+
+- **Batched calls**: `model.generate([p1, p2, p3])` - MUST use gather internally
+- **Individual calls**: `asyncio.gather(model.generate(p1), ...)` - Already concurrent at call site
+- Always preserve the batched API's efficiency when migrating to async
+
+**Historical note**: VLLMSteerModel had this bug from Oct 2025 to Nov 2025, causing 97% throughput loss. The sync→async migration preserved functionality but broke the concurrency model. See JOURNAL.md 2025-11-19 entry for details.
+
 ## Commit Guidelines
 
 - Use concise, imperative commit subjects (e.g., "Fix steering vector training pipeline")
