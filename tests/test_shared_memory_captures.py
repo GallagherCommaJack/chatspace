@@ -16,8 +16,6 @@ Tests cover:
 import asyncio
 import os
 import pytest
-
-pytestmark = pytest.mark.slow
 import time
 import warnings
 from multiprocessing.shared_memory import SharedMemory
@@ -65,6 +63,7 @@ async def model_factory(model_name):
             await m.engine.shutdown()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_shared_memory_basic_roundtrip(model_factory):
     """Test basic shared memory creation and retrieval."""
@@ -105,6 +104,7 @@ async def test_shared_memory_basic_roundtrip(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_shared_memory_context_manager(model_factory):
     """Test async context manager cleanup."""
@@ -133,6 +133,7 @@ async def test_shared_memory_context_manager(model_factory):
     assert handle._closed, "Handle should be marked as closed"
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_bytes_fallback_when_disabled(model_factory):
     """Test fallback to bytes encoding when shared memory disabled."""
@@ -159,6 +160,7 @@ async def test_bytes_fallback_when_disabled(model_factory):
     assert len(handle._captures) > 0
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_bytes_fallback_below_threshold(model_factory):
     """Test fallback to bytes encoding for small tensors."""
@@ -184,6 +186,7 @@ async def test_bytes_fallback_below_threshold(model_factory):
     assert handle._captures is not None
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_access_isolation(model_factory):
     """Test that concurrent requests maintain proper isolation."""
@@ -221,6 +224,7 @@ async def test_concurrent_access_isolation(model_factory):
     await handle2.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_data_integrity(model_factory):
     """Test that shared memory data matches HuggingFace baseline."""
@@ -324,6 +328,7 @@ async def test_data_integrity(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_memory_leak_detection(model_factory):
     """Test that repeated capture cycles don't leak memory."""
@@ -359,6 +364,7 @@ async def test_memory_leak_detection(model_factory):
     assert True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_explicit_close_vs_context_manager(model_factory):
     """Test both cleanup methods work correctly."""

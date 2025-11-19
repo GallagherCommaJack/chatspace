@@ -15,8 +15,6 @@ import asyncio
 from typing import Any
 
 import pytest
-
-pytestmark = pytest.mark.slow
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -75,6 +73,7 @@ def _apply_ablation(hidden: torch.Tensor, unit: torch.Tensor, *, scale: float) -
     return (flat + (scale - 1.0) * component).reshape_as(hidden)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for vLLM")
 @pytest.mark.asyncio
 async def test_comprehensive_vllm_integration():
@@ -544,6 +543,7 @@ async def test_comprehensive_vllm_integration():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_vllm_heterogeneous_batch_steering():
     """Test that different concurrent requests can use different steering configurations.

@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import torch
 import pytest
-
-pytestmark = pytest.mark.slow
 from vllm import SamplingParams
 
 from chatspace.generation.vllm_steer_model import (
@@ -56,6 +54,7 @@ async def _get_final_output(model, prompt, sampling_params, steering_spec=None):
 
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
 @pytest.mark.asyncio
@@ -155,6 +154,7 @@ async def test_tp_additive_steering_matches_single_gpu():
         )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
 @pytest.mark.asyncio
@@ -237,6 +237,7 @@ async def test_tp_projection_cap_matches_single_gpu():
         )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
 @pytest.mark.asyncio

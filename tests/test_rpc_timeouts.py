@@ -13,8 +13,6 @@ Tests cover:
 
 import asyncio
 import pytest
-
-pytestmark = pytest.mark.slow
 from unittest.mock import patch, AsyncMock
 
 import torch
@@ -60,6 +58,7 @@ async def model_factory(model_name):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_capture_fetch_timeout(model_factory):
     """Test timeout handling when fetch operation hangs.
@@ -98,6 +97,7 @@ async def test_capture_fetch_timeout(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_steering_registration_timeout(model_factory):
     """Test timeout handling when steering registration hangs.
@@ -136,6 +136,7 @@ async def test_steering_registration_timeout(model_factory):
             )
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cleanup_rpc_timeout_is_not_fatal(model_factory, caplog):
     """Test that cleanup RPC timeout doesn't crash the system.
@@ -187,6 +188,7 @@ async def test_cleanup_rpc_timeout_is_not_fatal(model_factory, caplog):
     await handles2[0].close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_system_functional_after_timeout(model_factory):
     """Test that system remains functional after RPC timeout.
@@ -229,6 +231,7 @@ async def test_system_functional_after_timeout(model_factory):
     await handles2[0].close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_rpcs_with_one_timeout(model_factory):
     """Test that one slow RPC doesn't block other operations.
@@ -266,6 +269,7 @@ async def test_concurrent_rpcs_with_one_timeout(model_factory):
     await handles2[0].close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_unregister_steering_timeout_handling(model_factory, caplog):
     """Test timeout handling during steering spec unregistration.
@@ -317,6 +321,7 @@ async def test_unregister_steering_timeout_handling(model_factory, caplog):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_multiple_concurrent_timeouts(model_factory):
     """Test system behavior when multiple operations timeout concurrently.
@@ -369,6 +374,7 @@ async def test_multiple_concurrent_timeouts(model_factory):
         f"Expected at least some operations to succeed, got results: {results}"
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_rpc_exception_propagation(model_factory):
     """Test that RPC exceptions are properly propagated to caller.
@@ -405,6 +411,7 @@ async def test_rpc_exception_propagation(model_factory):
             await model.generate(prompts, sampling_params, steering_spec=steering_spec)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_fetch_captures_batch_parallel_timeout(model_factory):
     """Test timeout handling when batch fetching multiple handles.

@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 
 import pytest
-
-pytestmark = pytest.mark.slow
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from vllm import SamplingParams
@@ -32,6 +30,7 @@ def _normalize(vector: torch.Tensor) -> torch.Tensor:
     return vector / norm
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",  # Gemma 1 (Gemma2 requires flash attention with softcapping)
@@ -119,6 +118,7 @@ async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
     torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skip(reason="vLLM V1 engine doesn't populate logprobs for Gemma models")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
@@ -202,6 +202,7 @@ async def test_gemma_vllm_chat_respects_steering(model_name: str):
     torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [
     "google/gemma-2b-it",
@@ -275,6 +276,7 @@ async def test_gemma_hidden_state_capture(model_name: str):
     torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skip(reason="vLLM V1 engine doesn't populate logprobs for Gemma models")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.parametrize("model_name", [

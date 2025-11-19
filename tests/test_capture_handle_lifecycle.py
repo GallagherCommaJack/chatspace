@@ -13,8 +13,6 @@ Tests cover:
 import asyncio
 import gc
 import pytest
-
-pytestmark = pytest.mark.slow
 import warnings
 from unittest.mock import patch
 
@@ -62,6 +60,7 @@ async def model_factory(model_name):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_finalizer_warns_for_unaccessed_handles(model_factory):
     """Test that finalizer emits ResourceWarning for unaccessed handles with shared memory.
@@ -129,6 +128,7 @@ async def test_finalizer_warns_for_unaccessed_handles(model_factory):
             print(f"Note: Finalizer emitted {len(resource_warnings)} ResourceWarning(s), but not specifically about shared memory: {warning_messages}")
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_finalizer_no_warning_when_accessed(model_factory):
     """Test that finalizer doesn't warn if handle was accessed.
@@ -178,6 +178,7 @@ async def test_finalizer_no_warning_when_accessed(model_factory):
             pytest.fail(f"Unexpected ResourceWarning for accessed handle: {[str(w.message) for w in relevant_warnings]}")
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_context_manager_automatic_cleanup(model_factory):
     """Test that async context manager properly cleans up resources."""
@@ -210,6 +211,7 @@ async def test_context_manager_automatic_cleanup(model_factory):
     assert handle._finalizer.detach() is None or True  # Already detached
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_context_manager_cleanup_on_exception(model_factory):
     """Test that context manager cleans up even if exception is raised."""
@@ -239,6 +241,7 @@ async def test_context_manager_cleanup_on_exception(model_factory):
     assert handle._closed is True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_access_captures_before_fetch_raises(model_factory):
     """Test that accessing .captures before fetch() raises helpful error."""
@@ -263,6 +266,7 @@ async def test_access_captures_before_fetch_raises(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_double_close_is_safe(model_factory):
     """Test that calling close() multiple times is idempotent."""
@@ -293,6 +297,7 @@ async def test_double_close_is_safe(model_factory):
     assert handle._closed is True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_close_before_fetch(model_factory):
     """Test that closing before fetching is safe (no shared memory created yet)."""
@@ -317,6 +322,7 @@ async def test_close_before_fetch(model_factory):
     assert len(handle._shm_names) == 0
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cleanup_rpc_failure_is_logged(model_factory, caplog):
     """Test that RPC failures during cleanup are logged but don't crash."""
@@ -352,6 +358,7 @@ async def test_cleanup_rpc_failure_is_logged(model_factory, caplog):
     assert any("Failed to release shared memory" in record.message for record in caplog.records)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_fetch_after_close_behavior(model_factory):
     """Test behavior when fetch() is called after close().
@@ -384,6 +391,7 @@ async def test_fetch_after_close_behavior(model_factory):
         assert "close" in str(e).lower() or "fetch" in str(e).lower()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_close_with_finalize(model_factory):
     """Test that concurrent close() and finalize don't race.
@@ -422,6 +430,7 @@ async def test_concurrent_close_with_finalize(model_factory):
     assert handle._closed is True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_multiple_handles_independent_lifecycle(model_factory):
     """Test that multiple handles have independent lifecycles.
@@ -467,6 +476,7 @@ async def test_multiple_handles_independent_lifecycle(model_factory):
     assert all(h._closed for h in handles)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_no_shared_memory_no_cleanup_rpc(model_factory):
     """Test that closing handle without shared memory doesn't call cleanup RPC.
