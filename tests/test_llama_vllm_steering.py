@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 
 import pytest
+
+pytestmark = pytest.mark.slow
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from vllm import SamplingParams

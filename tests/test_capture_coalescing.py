@@ -10,6 +10,8 @@ Tests cover:
 """
 
 import pytest
+
+pytestmark = pytest.mark.slow
 import torch
 from vllm import SamplingParams
 from transformers import AutoTokenizer

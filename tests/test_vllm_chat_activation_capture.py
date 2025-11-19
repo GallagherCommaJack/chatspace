@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+
+pytestmark = pytest.mark.slow
 import torch
 from vllm import SamplingParams
 

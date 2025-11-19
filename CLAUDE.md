@@ -36,7 +36,16 @@ uv run chatspace embed-hf --dataset <name> [--subset <config>] [--model <model>]
 ### Common Development Commands
 
 ```bash
-# Run with uv
+# Run fast unit tests (skips slow integration tests)
+make test
+
+# Run all tests (including slow integration tests)
+make test-all
+
+# Run ONLY the slow integration tests
+make test-integration
+
+# Run with uv directly
 uv run python main.py
 
 # Run a specific example script

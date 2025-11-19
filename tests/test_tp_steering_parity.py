@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import torch
 import pytest
+
+pytestmark = pytest.mark.slow
 from vllm import SamplingParams
 
 from chatspace.generation.vllm_steer_model import (

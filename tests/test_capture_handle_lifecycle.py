@@ -13,6 +13,8 @@ Tests cover:
 import asyncio
 import gc
 import pytest
+
+pytestmark = pytest.mark.slow
 import warnings
 from unittest.mock import patch
 

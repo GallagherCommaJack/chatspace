@@ -14,6 +14,8 @@ import asyncio
 import logging
 import os
 import pytest
+
+pytestmark = pytest.mark.slow
 import time
 import warnings
 from multiprocessing.shared_memory import SharedMemory
