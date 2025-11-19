@@ -38,9 +38,6 @@ def test_fetch_batch_captures_records_profiler_summary(monkeypatch):
         hidden_size=4,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        layer_vectors={},
-        projection_caps={},
-        ablations={},
         active_capture_requests={"req": set()},
         request_captures={"req": {0: torch.randn(2, 4)}},
         request_prefill_buffers={"req": {}},
@@ -48,7 +45,7 @@ def test_fetch_batch_captures_records_profiler_summary(monkeypatch):
         request_token_counts={"req": 2},
         step_metadata={},
         global_step=0,
-        current_step_context=None,
+        request_steering_specs={},
     )
 
     worker = types.SimpleNamespace(_chatspace_steering=state)

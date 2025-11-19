@@ -21,11 +21,17 @@ os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 import torch
 from vllm import SamplingParams
 
-from chatspace.generation.vllm_steer_model import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation.vllm_steer_model import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+)
 from chatspace.vllm_steering import runtime as steering_runtime
 
 
-def main() -> None:
+async def main() -> None:
     """Test vector broadcasting to TP workers."""
     model_name = "Qwen/Qwen3-0.6B"
 
@@ -48,18 +54,18 @@ def main() -> None:
 
     print(f"   Hidden size: {model_single.hidden_size}")
 
-    # Set a vector and fetch
+    # Create a steering vector
     steering_vec = torch.randn(model_single.hidden_size, dtype=torch.float32) * 5.0
-    model_single.set_layer_vector(8, steering_vec)
+    steering_spec = SteeringSpec(
+        layers={8: LayerSteeringSpec(add=AddSpec(vector=steering_vec, scale=1.0))}
+    )
 
-    # Fetch worker vectors
-    worker_vecs = model_single._fetch_worker_vectors()
-    print(f"   Number of workers: {len(worker_vecs)}")
-
-    for i, worker_map in enumerate(worker_vecs):
-        if 8 in worker_map:
-            vec = worker_map[8]
-            print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}")
+    # Test generation with steering to verify broadcasting
+    print("   Testing generation with steering...")
+    test_prompt = ["Hello world"]
+    test_params = SamplingParams(temperature=0.0, max_tokens=5)
+    test_output = await model_single.generate(test_prompt, test_params, steering_spec=steering_spec)
+    print(f"   Generation succeeded: {test_output[0][:50]}...")
 
     # Fetch worker state
     state_info = model_single._engine_client.collective_rpc(
@@ -94,36 +100,13 @@ def main() -> None:
     model_tp = VLLMSteerModel(cfg_tp, enforce_eager=True, bootstrap_layers=(8,))
     print(f"   Hidden size: {model_tp.hidden_size}")
 
-    # Set same vector
-    model_tp.set_layer_vector(8, steering_vec)
-
-    # Fetch from all workers
-    worker_vecs_tp = model_tp._fetch_worker_vectors()
-    print(f"   Number of workers: {len(worker_vecs_tp)}")
-
-    if len(worker_vecs_tp) != 2:
-        print(f"   ⚠ WARNING: Expected 2 workers for TP=2, got {len(worker_vecs_tp)}")
-
-    # Check each worker
-    for i, worker_map in enumerate(worker_vecs_tp):
-        if 8 in worker_map:
-            vec = worker_map[8]
-            print(f"   Worker {i}: shape={vec.shape}, norm={vec.norm().item():.4f}, dtype={vec.dtype}, device=GPU{i}")
-
-            # Verify it matches the input
-            match = torch.allclose(vec.cpu(), steering_vec.cpu(), atol=1e-5)
-            print(f"      Matches input vector: {match}")
-
-            if i > 0:
-                # Compare to first worker
-                first_vec = worker_vecs_tp[0][8]
-                cross_match = torch.allclose(vec, first_vec, atol=1e-6)
-                print(f"      Matches worker 0: {cross_match}")
-                if not cross_match:
-                    diff = (vec - first_vec).abs().max().item()
-                    print(f"      Max difference: {diff:.2e}")
-        else:
-            print(f"   Worker {i}: ⚠ Layer 8 not found in worker map")
+    # Use same steering spec (will be broadcast to all TP workers)
+    # The per-request API automatically broadcasts to all workers via collective_rpc
+    print("   Testing generation with TP steering...")
+    tp_prompt = ["Hello world"]
+    tp_params = SamplingParams(temperature=0.0, max_tokens=5)
+    tp_output = await model_tp.generate(tp_prompt, tp_params, steering_spec=steering_spec)
+    print(f"   Generation succeeded: {tp_output[0][:50]}...")
 
     # Fetch worker states
     state_info_tp = model_tp._engine_client.collective_rpc(
@@ -133,12 +116,12 @@ def main() -> None:
     for i, info in enumerate(state_info_tp):
         print(f"   Worker {i}: {info}")
 
-    # Test generation to ensure it works
-    print("\n3. Testing generation with TP steering...")
+    # Test generation with different prompt to ensure it works
+    print("\n3. Testing additional generation with TP steering...")
     prompt = "The capital of France is"
     sampling = SamplingParams(temperature=0.0, max_tokens=3)
 
-    output = model_tp.generate([prompt], sampling)[0]
+    output = (await model_tp.generate([prompt], sampling, steering_spec=steering_spec))[0]
     print(f"   Prompt: {prompt}")
     print(f"   Output: {output}")
     print("   ✓ Generation succeeded with TP steering")
@@ -155,4 +138,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

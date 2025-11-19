@@ -159,7 +159,7 @@ Each run records:
   - HuggingFace parity validation (cosine similarity ~1.0, MAE <0.02)
   - Concurrent generation with temporal overlap verification
   - Capture isolation (concurrent requests don't mix)
-  - RWLock coordination (steering changes block during generation)
+  - Per-request steering (each request uses independent steering configuration)
 - Run this test when modifying steering logic, capture mechanisms, or concurrency handling
 - Expected runtime: ~20-25 seconds with CUDA available
 
@@ -169,6 +169,56 @@ Each run records:
 - Prefer type hints and module-level docstrings; mirror existing tone in `chatspace/hf_embed/pipeline.py`
 - Route diagnostics through `logging` module; avoid bare `print` except in CLI entry points
 - Keep shard and manifest writers immutable: create new files rather than mutating outputs in-place
+
+## Async/Await Patterns and Pitfalls
+
+**CRITICAL**: When migrating sync APIs to async, preserve the concurrency model!
+
+### The Sequential Loop Antipattern ❌
+
+```python
+# BAD: Processes prompts sequentially (destroys throughput)
+async def generate(self, prompts: list[str], ...):
+    results = []
+    for prompt in prompts:
+        async for output in self._engine.generate(prompt, ...):
+            final_output = output
+        results.append(final_output)
+    return results
+```
+
+This forces each request to complete before the next starts, preventing vLLM from batching them on the GPU. With 32 requests, this can cause 20-30x throughput loss.
+
+### Correct: Concurrent Processing ✅
+
+```python
+# GOOD: Processes prompts concurrently (maximum throughput)
+async def generate(self, prompts: list[str], ...):
+    async def process_one(prompt: str):
+        async for output in self._engine.generate(prompt, ...):
+            final_output = output
+        return final_output
+
+    tasks = [process_one(p) for p in prompts]
+    results = await asyncio.gather(*tasks)
+    return results
+```
+
+This allows vLLM's async engine to batch all requests together for maximum GPU utilization.
+
+### Why This Happens
+
+- **Sync APIs** (like `vllm.LLM.generate(prompts)`) handle batching internally
+- **Async APIs** (like `AsyncLLMEngine.generate(prompt)`) require explicit concurrent task launching
+- Simply adding `async`/`await` keywords without `asyncio.gather()` makes things sequential!
+
+### When This Matters
+
+- **Batched calls**: `model.generate([p1, p2, p3])` - MUST use gather internally
+- **Individual calls**: `asyncio.gather(model.generate(p1), ...)` - Already concurrent at call site
+- Always preserve the batched API's efficiency when migrating to async
+
+**Historical note**: VLLMSteerModel had this bug from Oct 2025 to Nov 2025, causing 97% throughput loss. The sync→async migration preserved functionality but broke the concurrency model. See JOURNAL.md 2025-11-19 entry for details.
 
 ## Commit Guidelines
 
@@ -185,18 +235,16 @@ Each run records:
 - Use `scripts/steering_smoke.py` for quick verification of steering behavior
 - **Qwen decoder layer fusion**: vLLM fuses RMSNorm with skip connection, returns `(mlp_delta, residual_before_mlp)` - must add `delta + residual` to mirror HuggingFace captures
 
-### Concurrency and Threading Model
+### Concurrency and Per-Request Steering
 
-**AsyncRWLock for Steering Configuration:**
-- `VLLMSteerModel` uses a readers-writer lock (`AsyncRWLock`) to coordinate concurrent operations
-- **Read operations** (concurrent): Multiple `generate()` calls can run simultaneously
-- **Write operations** (exclusive): Steering configuration changes block until all in-flight requests complete
-- Write operations include:
-  - `set_layer_vector()`, `set_layer_projection_cap()`, `set_layer_ablation()`
-  - `clear_layer_projection_cap()`, `clear_layer_ablation()`, `clear_all_vectors()`
-  - `apply_steering_spec()`
-- Writers signal intent via `_writer_waiting` flag to prevent reader starvation
-- Concurrent generation is safe and performant - requests don't block each other
+**Per-Request Steering Model:**
+- Steering configuration is passed per-request via the `steering_spec` parameter to `generate()`
+- No global state means no locking required - all requests are independent
+- Different requests in the same batch can use different steering configurations (heterogeneous batching)
+- **Concurrent generation**: Multiple requests can run simultaneously without coordination
+- Workers maintain per-request steering state keyed by request ID
+- Steering state is automatically cleaned up when request completes
+- **Migration note**: The old global API (`set_layer_vector()`, etc.) was removed in favor of per-request specs
 
 ### Hidden State Capture Behavior
 

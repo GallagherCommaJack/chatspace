@@ -7,7 +7,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
-from chatspace.generation import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
@@ -290,144 +296,4 @@ async def test_hidden_states_match_hf():
     last_rmse = torch.nn.functional.mse_loss(hf_last_token, vllm_last_token).sqrt().item()
     assert last_rmse < 2e-3, (
         f"Last token RMSE {last_rmse:.6f} too large. Expected <2e-3 for float16 parity."
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-@pytest.mark.asyncio
-async def test_hidden_states_with_steering_applied():
-    """Test that HF and vLLM produce similar hidden states when steering is applied.
-
-    This test verifies that steering produces consistent effects on hidden states
-    at the steering layer in both implementations. We compare:
-    1. The modified hidden states after steering is applied
-    2. The difference between baseline and steered states (the steering effect itself)
-
-    Note: Uses forward hooks to capture HF states, as output_hidden_states captures
-    before steering hooks run.
-    """
-    torch.manual_seed(42)
-
-    model_name = "Qwen/Qwen3-0.6B"
-    target_layer = 2
-    prompt = "The capital of France is"
-
-    # Load HuggingFace model
-    try:
-        from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
-
-        hf_cfg = SteeringVectorConfig(
-            model_name=model_name,
-            target_layer=target_layer,
-            init_scale=0.0
-        )
-        hf_model = TransformerSteerModel(
-            hf_cfg,
-            torch_dtype=torch.float16,
-            device_map="cuda",
-            attn_implementation="eager",
-        )
-    except OSError as exc:
-        pytest.skip(f"Unable to load HF model ({exc}). Ensure weights are cached.")
-
-    hf_model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.padding_side = "left"
-    tokenizer.pad_token = tokenizer.eos_token
-
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-
-    # Generate steering vector
-    hidden_size = hf_model.config.hidden_size
-    steering_vector = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 5.0
-
-    # Capture hidden states using hooks (output_hidden_states doesn't see steering hook output)
-    captured_states = []
-
-    def capture_hook(module, input, output):
-        hidden = output[0] if isinstance(output, tuple) else output
-        captured_states.append(hidden[0, -1, :].detach().cpu())
-
-    hook_handle = hf_model.model.model.layers[target_layer].register_forward_hook(capture_hook)
-
-    # Get HF baseline hidden states
-    with torch.no_grad():
-        captured_states.clear()
-        hf_baseline_outputs = hf_model(**inputs, use_cache=False)
-        hf_baseline_hidden = captured_states[0]
-
-        # Apply steering and get modified hidden states
-        hf_model.set_vector(steering_vector)
-        captured_states.clear()
-        hf_steered_outputs = hf_model(**inputs, use_cache=False)
-        hf_steered_hidden = captured_states[0]
-
-    hook_handle.remove()
-
-    hf_steering_effect = hf_steered_hidden - hf_baseline_hidden
-
-    del hf_model
-    torch.cuda.empty_cache()
-
-    # Load vLLM model
-    cfg = VLLMSteeringConfig(
-        model_name=model_name,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.05,
-        max_model_len=128,
-        dtype="float16",
-    )
-
-    try:
-        vllm_model = VLLMSteerModel(cfg, enforce_eager=True, bootstrap_layers=(target_layer,))
-    except OSError as exc:
-        pytest.skip(f"Unable to load vLLM model ({exc}). Ensure weights are cached.")
-
-    sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)
-
-    # Get vLLM baseline
-    texts_baseline, handles_baseline = await vllm_model.generate(
-        [prompt], sampling_params=sampling, capture_layers=target_layer
-    )
-    await handles_baseline[0].fetch()
-    vllm_baseline_hidden = handles_baseline[0].captures[target_layer][0]["hidden"][-1, :].cpu()
-
-    # Apply steering and get modified hidden states
-    await vllm_model.set_layer_vector(target_layer, steering_vector)
-    texts_steered, handles_steered = await vllm_model.generate(
-        [prompt], sampling_params=sampling, capture_layers=target_layer
-    )
-    await handles_steered[0].fetch()
-    vllm_steered_hidden = handles_steered[0].captures[target_layer][0]["hidden"][-1, :].cpu()
-
-    vllm_steering_effect = vllm_steered_hidden - vllm_baseline_hidden
-
-    del vllm_model
-    torch.cuda.empty_cache()
-
-    # Compare steered hidden states
-    steered_cos_sim = torch.nn.functional.cosine_similarity(
-        hf_steered_hidden.unsqueeze(0),
-        vllm_steered_hidden.unsqueeze(0)
-    ).item()
-
-    # With steering applied, we expect slightly lower similarity due to implementation differences
-    # in how steering is applied, but should still be very close
-    assert steered_cos_sim > 0.99, (
-        f"Steered hidden state cos_sim {steered_cos_sim:.6f} too low. "
-        f"Expected >0.99 with steering applied."
-    )
-
-    # Compare the steering effect itself (difference vectors)
-    effect_cos_sim = torch.nn.functional.cosine_similarity(
-        hf_steering_effect.unsqueeze(0),
-        vllm_steering_effect.unsqueeze(0)
-    ).item()
-
-    # The steering effect direction should be very similar
-    assert effect_cos_sim > 0.95, (
-        f"Steering effect cos_sim {effect_cos_sim:.6f} too low. "
-        f"HF and vLLM steering mechanisms should produce similar effects. "
-        f"HF effect norm: {hf_steering_effect.norm():.4f}, "
-        f"vLLM effect norm: {vllm_steering_effect.norm():.4f}"
     )

@@ -7,10 +7,17 @@ os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 import torch
 from vllm import SamplingParams
 
-from chatspace.generation.vllm_steer_model import VLLMSteerModel, VLLMSteeringConfig
+from chatspace.generation.vllm_steer_model import (
+    VLLMSteerModel,
+    VLLMSteeringConfig,
+    SteeringSpec,
+    LayerSteeringSpec,
+    AddSpec,
+    AblationSpec,
+)
 from chatspace.vllm_steering import runtime as steering_runtime
 
-def main():
+async def main():
     """Test Gemma patching."""
     model_name = "google/gemma-3-27b-it"  # Gemma3 27B on H200
 
@@ -33,25 +40,35 @@ def main():
 
     print(f"Model loaded. Hidden size: {model.hidden_size}")
 
-    # Set a steering vector
+    # Create steering spec with additive vector
     steering_vec = torch.randn(model.hidden_size, dtype=torch.float32) * 10.0
-    model.set_layer_vector(target_layer, steering_vec)
-    print(f"Set steering vector on layer {target_layer}")
+    unit_vector = steering_vec / (steering_vec.norm() + 1e-8)
+    vector_norm = steering_vec.norm().item()
+    print(f"Set steering vector on layer {target_layer} with norm {vector_norm:.4f}")
 
-    # Test ablation
+    # Create ablation spec with normalized vector
     ablation_vec = torch.randn(model.hidden_size, dtype=torch.float32)
-    model.set_layer_ablation(target_layer, ablation_vec, scale=0.5)
-    print(f"Set ablation on layer {target_layer}")
+    ablation_unit = ablation_vec / (ablation_vec.norm() + 1e-8)
+    print(f"Set ablation on layer {target_layer} with scale 0.5")
+
+    # Build steering spec with both add and ablation
+    steering_spec = SteeringSpec(layers={
+        target_layer: LayerSteeringSpec(
+            add=AddSpec(vector=unit_vector, scale=vector_norm),
+            ablation=AblationSpec(vector=ablation_unit, scale=0.5),
+        )
+    })
 
     # Run a generation to trigger patching
     prompt = "Hello"
     sampling = SamplingParams(temperature=0.0, max_tokens=2)
-    output = model.llm.generate([prompt], sampling_params=sampling, use_tqdm=False)[0]
-    print(f"Generated: {output.outputs[0].text}")
+    outputs = await model.generate([prompt], sampling_params=sampling, steering_spec=steering_spec)
+    print(f"Generated: {outputs[0]}")
 
     # Now check inspection
-    inspection = model._engine_client.collective_rpc(
-        steering_runtime.inspect_layer_vector, args=(target_layer,)
+    inspection = await model._engine_client.collective_rpc(
+        steering_runtime.STEERING_RPC_METHOD,
+        args=steering_runtime.rpc_args("inspect_layer_vector", target_layer),
     )
 
     if inspection:
@@ -71,4 +88,5 @@ def main():
     print("Test complete!")
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
