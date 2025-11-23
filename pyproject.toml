@@ -80,3 +80,6 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore:builtin type [sS]wig.* has no __module__ attribute:DeprecationWarning",
 ]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

@@ -23,6 +23,7 @@ from chatspace.steering.model import QwenSteerModel, SteeringVectorConfig
 from chatspace.vllm_steering import runtime as steering_runtime
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_steering_vector_round_trip():
@@ -107,6 +108,7 @@ async def test_vllm_steering_vector_round_trip():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_chat_respects_steering():
@@ -185,6 +187,7 @@ async def test_vllm_chat_respects_steering():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_matches_hf_logprob_shift():

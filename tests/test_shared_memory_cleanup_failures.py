@@ -70,6 +70,7 @@ async def model_factory(model_name):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_unlink_file_not_found_error(model_factory, caplog):
     """Test that FileNotFoundError during unlink doesn't crash worker.
@@ -122,6 +123,7 @@ async def test_unlink_file_not_found_error(model_factory, caplog):
     await handles2[0].close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_unlink_permission_error(model_factory, caplog):
     """Test that PermissionError during unlink doesn't crash worker.
@@ -158,6 +160,7 @@ async def test_unlink_permission_error(model_factory, caplog):
     assert any("Failed to close shared memory" in record.message for record in caplog.records)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_idempotent_close(model_factory):
     """Test that calling close() multiple times is safe."""
@@ -187,6 +190,7 @@ async def test_idempotent_close(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_close_without_fetch(model_factory):
     """Test that closing a handle before fetching is safe."""
@@ -213,6 +217,7 @@ async def test_close_without_fetch(model_factory):
     # Just ensure it doesn't crash
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_shared_memory_limit_fallback(model_factory):
     """Test graceful fallback to bytes encoding when limit is reached.
@@ -254,6 +259,7 @@ async def test_shared_memory_limit_fallback(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cleanup_after_fetch_exception(model_factory):
     """Test that shared memory is cleaned up even if fetch() raises."""
@@ -287,6 +293,7 @@ async def test_cleanup_after_fetch_exception(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_close_operations(model_factory):
     """Test that concurrent close() calls don't cause race conditions."""
@@ -314,6 +321,7 @@ async def test_concurrent_close_operations(model_factory):
     assert handle._closed is True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_threshold_boundary_conditions(model_factory):
     """Test shared memory vs bytes encoding at threshold boundary."""
@@ -367,6 +375,7 @@ async def test_threshold_boundary_conditions(model_factory):
     await handle2.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_multiple_handles_cleanup(model_factory):
     """Test cleanup of multiple handles with shared memory."""
@@ -400,6 +409,7 @@ async def test_multiple_handles_cleanup(model_factory):
         assert handle._closed is True
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_shared_memory_disabled_fallback(model_factory):
     """Test that system works correctly with shared memory disabled."""

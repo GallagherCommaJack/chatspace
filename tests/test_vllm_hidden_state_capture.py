@@ -16,6 +16,7 @@ from chatspace.generation import (
 )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_state_capture_basic():
@@ -67,6 +68,7 @@ async def test_hidden_state_capture_basic():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_state_capture_multiple_layers():
@@ -111,6 +113,7 @@ async def test_hidden_state_capture_multiple_layers():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_state_capture_batch_fetch():
@@ -149,6 +152,7 @@ async def test_hidden_state_capture_batch_fetch():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_state_capture_no_capture():
@@ -178,6 +182,7 @@ async def test_hidden_state_capture_no_capture():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_hidden_states_match_hf():

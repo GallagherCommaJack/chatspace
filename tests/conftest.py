@@ -18,6 +18,22 @@ warnings.filterwarnings(
 )
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-slow", action="store_true", default=False, help="run slow tests"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-slow"):
+        # --run-slow given in cli: do not skip slow tests
+        return
+    skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture(autouse=True, scope="function")
 def aggressive_cleanup(request):
     """Ensure proper cleanup after each test to prevent state pollution.
@@ -30,6 +46,10 @@ def aggressive_cleanup(request):
     4. Synchronizes CUDA operations
     """
     yield
+
+    # Only perform aggressive cleanup for slow integration tests that use the GPU/engine
+    if not request.node.get_closest_marker("slow"):
+        return
 
     # Give a moment for async cleanup to complete
     # Use time.sleep instead of await to avoid event loop issues

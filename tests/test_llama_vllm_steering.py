@@ -21,6 +21,7 @@ from chatspace.generation import (
 from chatspace.steering.model import TransformerSteerModel, SteeringVectorConfig
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [
@@ -142,6 +143,7 @@ async def test_llama_vllm_steering_vector_round_trip(model_name: str):
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [
@@ -229,6 +231,7 @@ async def test_llama_vllm_chat_respects_steering(model_name: str):
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [
@@ -307,6 +310,7 @@ async def test_llama_hidden_state_capture(model_name: str):
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering and HF baseline.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [

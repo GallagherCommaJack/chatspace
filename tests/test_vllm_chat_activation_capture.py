@@ -9,6 +9,7 @@ from vllm import SamplingParams
 from chatspace.generation import ChatResponse, VLLMSteerModel, VLLMSteeringConfig
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_basic_activation_capture():
@@ -63,6 +64,7 @@ async def test_chat_basic_activation_capture():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_message_boundaries_single_turn():
@@ -107,6 +109,7 @@ async def test_chat_message_boundaries_single_turn():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_message_boundaries_multi_turn():
@@ -168,6 +171,7 @@ async def test_chat_message_boundaries_multi_turn():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_get_message_activations():
@@ -239,6 +243,7 @@ async def test_chat_get_message_activations():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_get_message_activations_with_generated():
@@ -307,6 +312,7 @@ async def test_chat_get_message_activations_with_generated():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_batch_with_captures():
@@ -371,6 +377,7 @@ async def test_chat_batch_with_captures():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_multiple_layers_capture():
@@ -416,6 +423,7 @@ async def test_chat_multiple_layers_capture():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_without_capture_has_no_boundaries():
@@ -450,6 +458,7 @@ async def test_chat_without_capture_has_no_boundaries():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_get_message_activations_errors():
@@ -497,6 +506,7 @@ async def test_chat_get_message_activations_errors():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_compare_user_messages():
@@ -561,6 +571,7 @@ async def test_chat_compare_user_messages():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_raw_output_with_captures():
@@ -603,6 +614,7 @@ async def test_chat_raw_output_with_captures():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_assistant_prefill():
@@ -685,6 +697,7 @@ async def test_chat_assistant_prefill():
     del model
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_chat_assistant_prefill_with_capture():

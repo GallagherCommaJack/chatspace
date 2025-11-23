@@ -10,6 +10,7 @@ Tests cover:
 """
 
 import pytest
+
 import torch
 from vllm import SamplingParams
 from transformers import AutoTokenizer
@@ -96,6 +97,7 @@ async def model_factory(model_name):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_long_prompt_capture_continuity(model_factory, tokenizer):
     """Test that long prompts (triggering chunked prefill) produce continuous captures.
@@ -158,6 +160,7 @@ async def test_long_prompt_capture_continuity(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_prefill_to_decode_transition(model_factory, tokenizer):
     """Test that prefill-to-decode transition happens correctly.
@@ -215,6 +218,7 @@ async def test_prefill_to_decode_transition(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_decode_buffer_flush_behavior(model_factory, tokenizer):
     """Test that decode buffer flushes at correct intervals.
@@ -268,6 +272,7 @@ async def test_decode_buffer_flush_behavior(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_multiple_layers_coalesce_independently(model_factory, tokenizer):
     """Test that multiple captured layers coalesce independently.
@@ -324,6 +329,7 @@ async def test_multiple_layers_coalesce_independently(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_very_long_prompt_multiple_chunks(model_factory, tokenizer):
     """Test extremely long prompt that definitely requires multiple chunks.
@@ -366,6 +372,7 @@ async def test_very_long_prompt_multiple_chunks(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_requests_independent_coalescing(model_factory, tokenizer):
     """Test that concurrent requests coalesce independently.
@@ -434,6 +441,7 @@ async def test_concurrent_requests_independent_coalescing(model_factory, tokeniz
         f"Expected 3 distinct sequence lengths, got: {seq_lens}"
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_capture_with_no_decode_tokens(model_factory, tokenizer):
     """Test capture with minimal decode tokens (1 token).
@@ -484,6 +492,7 @@ async def test_capture_with_no_decode_tokens(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_small_decode_buffer_many_tokens(model_factory, tokenizer):
     """Test small decode buffer with many generated tokens.
@@ -536,6 +545,7 @@ async def test_small_decode_buffer_many_tokens(model_factory, tokenizer):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_coalescing_with_steering_applied(model_factory, tokenizer):
     """Test that coalescing works correctly when steering is also active.

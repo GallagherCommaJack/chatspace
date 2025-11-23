@@ -66,6 +66,7 @@ async def model_factory(model_name):
                 pass
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_empty_prompts_list(model_factory):
     """Test that empty prompts list returns empty results."""
@@ -79,6 +80,7 @@ async def test_empty_prompts_list(model_factory):
     assert len(results) == 0
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_empty_prompts_list_with_captures(model_factory):
     """Test that empty prompts list with capture_layers returns empty results and handles."""
@@ -93,6 +95,7 @@ async def test_empty_prompts_list_with_captures(model_factory):
     assert len(handles) == 0
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_empty_string_prompt(model_factory):
     """Test that empty string prompt is handled."""
@@ -112,6 +115,7 @@ async def test_empty_string_prompt(model_factory):
         assert "empty" in str(e).lower() or "prompt" in str(e).lower()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_layer_index_out_of_range_high(model_factory):
     """Test that layer index above layer_count raises helpful error."""
@@ -141,6 +145,7 @@ async def test_layer_index_out_of_range_high(model_factory):
     assert "layer" in error_msg or "range" in error_msg or "index" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_layer_index_negative(model_factory):
     """Test that negative layer index raises helpful error."""
@@ -166,6 +171,7 @@ async def test_layer_index_negative(model_factory):
     assert "layer" in error_msg or "range" in error_msg or "negative" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_capture_layer_out_of_range(model_factory):
     """Test that capture_layers with invalid index raises error."""
@@ -185,6 +191,7 @@ async def test_capture_layer_out_of_range(model_factory):
         )
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_zero_norm_steering_vector_raises(model_factory):
     """Test that zero-norm steering vector raises helpful error.
@@ -215,6 +222,7 @@ async def test_zero_norm_steering_vector_raises(model_factory):
     assert "norm" in error_msg or "zero" in error_msg or "magnitude" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_nan_steering_vector_raises(model_factory):
     """Test that NaN-containing steering vector raises helpful error."""
@@ -242,6 +250,7 @@ async def test_nan_steering_vector_raises(model_factory):
     assert "nan" in error_msg or "finite" in error_msg or "invalid" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_inf_steering_vector_raises(model_factory):
     """Test that Inf-containing steering vector raises helpful error."""
@@ -269,6 +278,7 @@ async def test_inf_steering_vector_raises(model_factory):
     assert "inf" in error_msg or "finite" in error_msg or "invalid" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_wrong_dimension_steering_vector_raises(model_factory):
     """Test that steering vector with wrong dimension raises helpful error."""
@@ -295,6 +305,7 @@ async def test_wrong_dimension_steering_vector_raises(model_factory):
     assert "dimension" in error_msg or "size" in error_msg or "shape" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_empty_steering_spec_is_no_op(model_factory):
     """Test that empty steering spec (no layers) is treated as no-op."""
@@ -316,6 +327,7 @@ async def test_empty_steering_spec_is_no_op(model_factory):
     assert len(results) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_all_layers_zero_scale_is_no_op(model_factory):
     """Test that steering spec with all scales=0.0 is effectively no-op."""
@@ -343,6 +355,7 @@ async def test_all_layers_zero_scale_is_no_op(model_factory):
     assert len(results) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_very_large_steering_scale(model_factory):
     """Test that very large steering scale doesn't crash (but heavily perturbs output)."""
@@ -370,6 +383,7 @@ async def test_very_large_steering_scale(model_factory):
     assert len(results) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_very_small_steering_scale(model_factory):
     """Test that very small steering scale works (nearly no-op)."""
@@ -397,6 +411,7 @@ async def test_very_small_steering_scale(model_factory):
     assert len(results) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_projection_cap_both_none_raises(model_factory):
     """Test that ProjectionCapSpec with both min and max None raises error."""
@@ -409,6 +424,7 @@ async def test_projection_cap_both_none_raises(model_factory):
         spec = VLLMSteerModel.simple_projection_cap(5, direction, min=None, max=None)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_projection_cap_zero_norm_raises(model_factory):
     """Test that ProjectionCapSpec with zero-norm vector raises error."""
@@ -424,6 +440,7 @@ async def test_projection_cap_zero_norm_raises(model_factory):
     assert "norm" in error_msg or "zero" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_ablation_zero_norm_raises(model_factory):
     """Test that AblationSpec with zero-norm vector raises error."""
@@ -439,6 +456,7 @@ async def test_ablation_zero_norm_raises(model_factory):
     assert "norm" in error_msg or "zero" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_chat_empty_messages_list(model_factory):
     """Test that chat() with empty messages list raises helpful error."""
@@ -456,6 +474,7 @@ async def test_chat_empty_messages_list(model_factory):
     # Or it might just fail in tokenizer - any error is acceptable
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_chat_malformed_message_dict(model_factory):
     """Test that chat() with malformed message dict raises helpful error."""
@@ -470,6 +489,7 @@ async def test_chat_malformed_message_dict(model_factory):
         await model.chat(messages, sampling_params)
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_capture_layers_empty_list(model_factory):
     """Test that capture_layers=[] is treated as no capture."""
@@ -492,6 +512,7 @@ async def test_capture_layers_empty_list(model_factory):
     await handles[0].close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_capture_layers_none_is_no_capture(model_factory):
     """Test that capture_layers=None means no capture."""
@@ -510,6 +531,7 @@ async def test_capture_layers_none_is_no_capture(model_factory):
     assert len(results) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_single_int_capture_layer(model_factory):
     """Test that capture_layers can be a single int (not list)."""
@@ -536,6 +558,7 @@ async def test_single_int_capture_layer(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_duplicate_capture_layers(model_factory):
     """Test that duplicate layer indices in capture_layers are handled."""
@@ -563,6 +586,7 @@ async def test_duplicate_capture_layers(model_factory):
     await handle.close()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_max_tokens_zero(model_factory):
     """Test that max_tokens=0 raises validation error."""
@@ -578,6 +602,7 @@ async def test_max_tokens_zero(model_factory):
     assert "max_tokens" in error_msg or "at least 1" in error_msg
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_steering_spec_none_is_no_steering(model_factory):
     """Test that steering_spec=None means no steering."""

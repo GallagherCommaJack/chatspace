@@ -82,6 +82,7 @@ def _apply_ablation(hidden: torch.Tensor, unit: torch.Tensor, *, scale: float) -
     return (flat + (scale - 1.0) * component).reshape_as(hidden)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_steering_combinations_match():
@@ -249,6 +250,7 @@ async def test_vllm_hf_steering_combinations_match():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_decode_steering_matches_hf_prefill():
@@ -482,6 +484,7 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_high_magnitude_steering():
@@ -646,6 +649,7 @@ async def test_vllm_hf_high_magnitude_steering():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_high_magnitude_ablation_and_capping():
@@ -844,6 +848,7 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_multi_magnitude_steering():
@@ -1002,6 +1007,7 @@ async def test_vllm_hf_multi_magnitude_steering():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_high_precision_steering():
@@ -1167,8 +1173,7 @@ async def test_vllm_hf_high_precision_steering():
         torch.cuda.empty_cache()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
-
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_delta_vs_residual_numerics():
@@ -1375,6 +1380,7 @@ async def test_delta_vs_residual_numerics():
     print("="*70)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_delta_vs_residual_instrumented():
@@ -1548,6 +1554,7 @@ async def test_delta_vs_residual_instrumented():
     assert diff < 1e-5, f"Delta and residual should give same results, got diff={diff:.6e}"
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_vllm_hf_multi_layer_steering_float32():
@@ -1880,6 +1887,7 @@ async def test_vllm_hf_multi_layer_steering_float32():
     assert every_pass, "Every-layer steering test failed - some layers showed divergence"
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for vLLM steering.")
 @pytest.mark.asyncio
 async def test_bf16_degradation_hf_vs_vllm():

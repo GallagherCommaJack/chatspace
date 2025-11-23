@@ -1267,6 +1267,7 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
 
     def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
         """Intercept execute_model to capture batch metadata."""
+        import sys  # For debug printing
         if not state.active_capture_requests and not state.request_steering_specs:
             return original_execute(model_input, *args, **kwargs)
         logger.debug(
@@ -1286,9 +1287,24 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
 
             # V1 engine: model_input is SchedulerOutput
             # It has scheduled_new_reqs (list) and scheduled_cached_reqs (CachedRequestData object)
+            # IMPORTANT: vLLM V1 orders the hidden state tensor as [CACHED, NEW], not [NEW, CACHED]!
             if hasattr(model_input, "scheduled_new_reqs") and hasattr(model_input, "scheduled_cached_reqs"):
                 logger.debug("Found scheduled_new_reqs and scheduled_cached_reqs attributes")
-                
+
+                request_ids = []
+                seq_lens = []
+
+                # Process CACHED requests FIRST (they appear first in the tensor)
+                cached_reqs_val = model_input.scheduled_cached_reqs
+                if cached_reqs_val and hasattr(cached_reqs_val, "req_ids"):
+                    cached = cached_reqs_val
+                    num_reqs = getattr(cached, "num_reqs", None)
+                    logger.debug(f"scheduled_cached_reqs: type={type(cached)}, num_reqs={num_reqs}, has req_ids={hasattr(cached, 'req_ids')}")
+                    if cached.num_reqs > 0 and cached.req_ids:
+                        request_ids.extend(cached.req_ids)
+                        seq_lens.extend([1] * len(cached.req_ids))
+
+                # Process NEW requests SECOND (they appear after cached in the tensor)
                 new_reqs_val = model_input.scheduled_new_reqs
                 if new_reqs_val:
                     new_reqs = new_reqs_val
@@ -1296,27 +1312,12 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
                     if not isinstance(new_reqs, list):
                         new_reqs = [new_reqs]
 
-                    request_ids = []
-                    seq_lens = []
                     for req in new_reqs:
                         logger.debug(f"Processing new_req: type={type(req).__name__}, has req_id={hasattr(req, 'req_id')}, has prompt_token_ids={hasattr(req, 'prompt_token_ids')}")
                         if hasattr(req, "req_id"):
                             request_ids.append(req.req_id)
                         if hasattr(req, "prompt_token_ids"):
                             seq_lens.append(len(req.prompt_token_ids))
-
-                cached_reqs_val = model_input.scheduled_cached_reqs
-                if cached_reqs_val and hasattr(cached_reqs_val, "req_ids"):
-                    cached = cached_reqs_val
-                    num_reqs = getattr(cached, "num_reqs", None)
-                    logger.debug(f"scheduled_cached_reqs: type={type(cached)}, num_reqs={num_reqs}, has req_ids={hasattr(cached, 'req_ids')}")
-                    if cached.num_reqs > 0 and cached.req_ids:
-                        if not request_ids:
-                            request_ids = []
-                            seq_lens = []
-
-                        request_ids.extend(cached.req_ids)
-                        seq_lens.extend([1] * len(cached.req_ids))
             else:
                 logger.debug(
                     f"model_input does not have expected attributes. "
