@@ -31,6 +31,7 @@ def test_profile_fetch_batch_attaches_summary(monkeypatch):
 
 @pytest.mark.skipif(runtime.torch_profile is None, reason="torch profiler unavailable")
 def test_fetch_batch_captures_records_profiler_summary(monkeypatch):
+    import threading
     monkeypatch.setattr(runtime, "_PROFILE_FETCH_ENABLED", True)
     monkeypatch.setattr(runtime, "_PROFILE_FETCH_TRACE_DIR", None)
 
@@ -46,6 +47,11 @@ def test_fetch_batch_captures_records_profiler_summary(monkeypatch):
         step_metadata={},
         global_step=0,
         request_steering_specs={},
+        # Shared memory fields (required for _create_shared_tensor)
+        active_shared_memory={},
+        shm_lock=threading.Lock(),
+        shm_max_gb=128.0,
+        shm_ttl_seconds=600,
     )
 
     worker = types.SimpleNamespace(_chatspace_steering=state)
