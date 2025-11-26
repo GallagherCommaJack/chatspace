@@ -52,7 +52,6 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Sequence
 
-import ml_dtypes  # For bfloat16 support in numpy
 import numpy as np
 import torch
 from torch import nn
@@ -291,9 +290,7 @@ class _SteeringState:
     shm_lock: threading.Lock = None  # Protects active_shared_memory dict access
     shm_cleanup_thread: Any = None  # threading.Thread for TTL cleanup
 
-    # Shared memory configuration
-    use_shared_memory: bool = False
-    shm_threshold_kb: int = 1024
+    # Shared memory configuration (SHM is always enabled for captures)
     shm_ttl_seconds: int = 600
     shm_max_gb: float = 128.0
 
@@ -1037,12 +1034,12 @@ def deserialize_tensor(
     dtype: torch.dtype | None = None,
     shm_objects_list: list[SharedMemory] | None = None
 ) -> torch.Tensor:
-    """Best-effort reconstruction of a tensor serialized via msgpack.
+    """Reconstruct a tensor from serialized format.
 
     Supports three payload formats:
     1. torch.Tensor - Direct passthrough (msgpack deserialization fallback)
-    2. dict with encoding="bytes" - Steering vectors (small, <32 KB)
-    3. dict with encoding="shm" - Activation captures (large, 30+ MB, zero-copy)
+    2. dict with encoding="bytes" - Steering vectors (client→worker RPC)
+    3. dict with encoding="shm" - Activation captures (worker→client, uint8 view)
 
     Parameters
     ----------
@@ -1051,7 +1048,7 @@ def deserialize_tensor(
     device : torch.device, optional
         Target device for the tensor
     dtype : torch.dtype, optional
-        Target dtype for the tensor
+        Target dtype for the tensor (overrides payload dtype if specified)
     shm_objects_list : list[SharedMemory], optional
         If provided and payload uses shared memory (encoding=="shm"),
         the SharedMemory object will be appended to this list to keep it alive
@@ -1062,65 +1059,66 @@ def deserialize_tensor(
         tensor = payload
     # Format 2 & 3: Dict with encoding metadata
     elif isinstance(payload, dict):
-        try:
-            dtype_str = payload["dtype"]
-            shape = payload["shape"]
-            data = payload["data"]
-        except KeyError as exc:
-            raise TypeError(f"Missing tensor metadata for key {exc}") from exc
+        encoding = payload.get("encoding")
+        dtype_str = payload.get("dtype")
+        shape = payload.get("shape")
+
+        if dtype_str is None or shape is None:
+            raise TypeError(f"Missing required tensor metadata: dtype={dtype_str}, shape={shape}")
+
         target_dtype = getattr(torch, dtype_str, None)
         if target_dtype is None:
-            raise TypeError(f"Unsupported tensor dtype payload: {dtype_str}")
+            raise TypeError(f"Unsupported tensor dtype: {dtype_str}")
         shape_tuple = tuple(int(dim) for dim in shape)
-        storage_dtype_str = payload.get("storage_dtype")
-        encoding = payload.get("encoding")
 
-        # Format 2: Bytes encoding (steering vectors)
+        # Format 2: Bytes encoding (steering vectors via RPC)
         if encoding == "bytes":
+            data = payload.get("data")
             if not isinstance(data, bytes):
                 raise TypeError(f"Expected bytes for encoding=bytes, got {type(data)}")
+            storage_dtype_str = payload.get("storage_dtype")
             storage_dtype = target_dtype
             if storage_dtype_str:
                 storage_dtype = getattr(torch, storage_dtype_str, None)
                 if not isinstance(storage_dtype, torch.dtype):
-                    raise TypeError(f"Unsupported storage dtype payload: {storage_dtype_str}")
+                    raise TypeError(f"Unsupported storage dtype: {storage_dtype_str}")
             # Create writable copy to avoid PyTorch warning about non-writable buffers
             tensor = torch.frombuffer(bytearray(data), dtype=storage_dtype).clone().reshape(shape_tuple)
             if storage_dtype != target_dtype:
                 tensor = tensor.to(dtype=target_dtype)
-        # Format 3: Shared memory encoding (activation captures, zero-copy)
-        elif encoding == "shm":
-            try:
-                shm_name = payload["shm_name"]
-            except KeyError as exc:
-                raise TypeError(f"Missing shm_name in shared memory payload") from exc
 
-            # Open existing shared memory segment (client-side)
+        # Format 3: Shared memory encoding (activation captures, uint8 view)
+        elif encoding == "shm":
+            shm_name = payload.get("shm_name")
+            nbytes = payload.get("nbytes")
+            if shm_name is None:
+                raise TypeError("Missing shm_name in shared memory payload")
+
+            # Open existing shared memory segment
             shm = SharedMemory(name=shm_name)
 
             # Track SharedMemory object to keep it alive if list provided
             if shm_objects_list is not None:
                 shm_objects_list.append(shm)
 
-            # Handle bfloat16: numpy doesn't support it natively, need ml_dtypes
-            if target_dtype == torch.bfloat16:
-                # Create numpy view as bfloat16
-                np_array = np.ndarray(shape_tuple, dtype=ml_dtypes.bfloat16, buffer=shm.buf)
-                # View as uint16 for torch conversion (torch doesn't support bfloat16 from numpy)
-                np_uint16 = np_array.view(np.uint16)
-                # Convert to torch and view as bfloat16
-                tensor = torch.from_numpy(np_uint16).view(torch.bfloat16)
+            # Read as uint8 bytes, reinterpret to target dtype
+            # If nbytes is provided (new format), use it; otherwise compute from shape
+            if nbytes is not None:
+                np_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
             else:
-                # Map torch dtype to numpy dtype
-                np_dtype = torch.empty(0, dtype=target_dtype).numpy().dtype
-                # Create numpy array backed by shared memory
-                np_array = np.ndarray(shape_tuple, dtype=np_dtype, buffer=shm.buf)
-                # Convert to torch tensor (zero-copy)
-                tensor = torch.from_numpy(np_array)
+                # Legacy fallback: compute nbytes from shape and dtype
+                element_size = torch.empty(0, dtype=target_dtype).element_size()
+                computed_nbytes = int(np.prod(shape_tuple)) * element_size
+                np_array = np.ndarray(computed_nbytes, dtype=np.uint8, buffer=shm.buf)
+
+            # Reconstruct tensor from uint8 buffer
+            tensor = torch.frombuffer(bytearray(np_array), dtype=torch.uint8)
+            tensor = tensor.view(target_dtype).reshape(shape_tuple).clone()
         else:
             raise TypeError(f"Unsupported tensor encoding: {encoding}")
     else:
         raise TypeError(f"Unexpected tensor payload type: {type(payload)}")
+
     if dtype is not None and tensor.dtype != dtype:
         tensor = tensor.to(dtype=dtype)
     if device is not None:
@@ -1155,29 +1153,27 @@ def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
 
 
 def _create_shared_tensor(
-    cpu_tensor: torch.Tensor,
+    tensor: torch.Tensor,
     state: _SteeringState,
-    threshold_kb: int = 1024,
 ) -> dict[str, Any]:
     """Create shared memory segment for tensor and return metadata.
 
+    All tensors are transferred via shared memory using a dtype-agnostic uint8 view.
+    This removes the dependency on ml-dtypes and works with any numpy version.
+
     Args:
-        cpu_tensor: CPU tensor to share (must already be on CPU)
+        tensor: Tensor to share (can be on any device, will be moved to CPU)
         state: Worker steering state for tracking active segments
-        threshold_kb: Minimum tensor size in KB to use shared memory
 
     Returns:
-        Metadata dict with encoding="shm" or encoding="bytes" (fallback)
-    """
-    # Check if shared memory is enabled
-    if not state.use_shared_memory:
-        return serialize_tensor(cpu_tensor)
+        Metadata dict with encoding="shm"
 
-    # Check size threshold
+    Raises:
+        RuntimeError: If shared memory creation fails (no fallback)
+    """
+    # Ensure tensor is on CPU and contiguous
+    cpu_tensor = tensor.detach().cpu().contiguous()
     nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
-    threshold_bytes = threshold_kb * 1024
-    if nbytes < threshold_bytes:
-        return serialize_tensor(cpu_tensor)
 
     # Check memory limit
     max_gb = state.shm_max_gb
@@ -1186,44 +1182,40 @@ def _create_shared_tensor(
             shm.size for shm, _ in state.active_shared_memory.values()
         )
     if (total_shm_bytes + nbytes) / (1024**3) > max_gb:
-        logger.warning(
-            f"Shared memory limit reached ({max_gb}GB), falling back to bytes"
+        raise RuntimeError(
+            f"Shared memory limit reached ({max_gb}GB, current={total_shm_bytes/(1024**3):.2f}GB, "
+            f"requested={nbytes/(1024**3):.2f}GB). Increase CHATSPACE_MAX_SHM_GB or reduce batch size."
         )
-        return serialize_tensor(cpu_tensor)
+
+    # Generate unique name
+    shm_name = f"chatspace_{uuid.uuid4().hex}"
 
     try:
-        # Generate unique name
-        shm_name = f"chatspace_{uuid.uuid4().hex}"
-
         # Create shared memory segment
         shm = SharedMemory(create=True, size=nbytes, name=shm_name)
 
-        # Handle bfloat16: torch doesn't support .numpy() for bfloat16, need to view as uint16
-        if cpu_tensor.dtype == torch.bfloat16:
-            # View as uint16, convert to numpy, then view as bfloat16
-            np_array = cpu_tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
-        else:
-            np_array = cpu_tensor.numpy()
+        # View tensor as flat uint8 bytes (works for any dtype including bfloat16)
+        byte_view = cpu_tensor.view(torch.uint8).flatten()
 
-        # Copy tensor data to shared memory
-        shm_array = np.ndarray(np_array.shape, dtype=np_array.dtype, buffer=shm.buf)
-        shm_array[:] = np_array
+        # Create uint8 numpy array backed by shared memory and copy data
+        shm_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
+        shm_array[:] = byte_view.numpy()
 
         # Track in state with timestamp
         with state.shm_lock:
             state.active_shared_memory[shm_name] = (shm, time.time())
 
-        # Return metadata
+        # Return metadata with dtype as string for reconstruction
         dtype_name = str(cpu_tensor.dtype).removeprefix("torch.")
         return {
             "encoding": "shm",
             "shm_name": shm_name,
             "shape": list(cpu_tensor.shape),
             "dtype": dtype_name,
+            "nbytes": nbytes,
         }
     except Exception as e:
-        logger.warning(f"Failed to create shared memory: {e}, falling back to bytes")
-        # Clean up partial state if needed
+        # Clean up partial state if segment was created
         shm_to_cleanup = None
         with state.shm_lock:
             if shm_name in state.active_shared_memory:
@@ -1232,9 +1224,12 @@ def _create_shared_tensor(
             try:
                 shm_to_cleanup.close()
                 shm_to_cleanup.unlink()
-            except Exception as e:
-                logger.debug(f"Failed to cleanup shared memory: {e}")
-        return serialize_tensor(cpu_tensor)
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Failed to create shared memory segment ({nbytes} bytes): {e}. "
+            f"Check /dev/shm space and CHATSPACE_MAX_SHM_GB setting."
+        ) from e
 
 
 def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
@@ -1373,13 +1368,14 @@ def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
 def initialize_worker_state(
     worker: Any,
     layer_indices: Sequence[int] | None = None,
-    use_shared_memory: bool = False,
-    shm_threshold_kb: int = 1024,
     shm_ttl_seconds: int = 600,
     shm_max_gb: float = 128.0,
     decode_buffer_size: int = 128,
 ) -> dict[str, Any]:
-    """Install steering patch on worker after model load."""
+    """Install steering patch on worker after model load.
+
+    Shared memory is always used for activation captures. There is no bytes fallback.
+    """
     ensure_layer_patch_installed()
     model = worker.model_runner.model
     layers = _resolve_layers(model)
@@ -1416,36 +1412,33 @@ def initialize_worker_state(
         active_shared_memory={},
         shm_lock=threading.Lock(),
         shm_cleanup_thread=None,
-        use_shared_memory=use_shared_memory,
-        shm_threshold_kb=shm_threshold_kb,
         shm_ttl_seconds=shm_ttl_seconds,
         shm_max_gb=shm_max_gb,
         decode_buffer_size=decode_buffer_size,
     )
     worker._chatspace_steering = state
 
-    # Start shared memory cleanup thread if enabled
-    if use_shared_memory:
-        stop_event = threading.Event()
-        cleanup_thread = threading.Thread(
-            target=_cleanup_stale_shared_memory,
-            args=(state, stop_event),
-            daemon=True,
-            name="chatspace-shm-cleanup"
-        )
-        cleanup_thread.start()
-        state.shm_cleanup_thread = (cleanup_thread, stop_event)
+    # Start shared memory cleanup thread (always enabled)
+    stop_event = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=_cleanup_stale_shared_memory,
+        args=(state, stop_event),
+        daemon=True,
+        name="chatspace-shm-cleanup"
+    )
+    cleanup_thread.start()
+    state.shm_cleanup_thread = (cleanup_thread, stop_event)
 
-        # Register atexit handler to stop thread on shutdown
-        def _stop_cleanup_thread():
-            if state.shm_cleanup_thread:
-                thread, event = state.shm_cleanup_thread
-                event.set()
-                thread.join(timeout=5.0)
-                logger.info("Shared memory cleanup thread stopped (atexit)")
+    # Register atexit handler to stop thread on shutdown
+    def _stop_cleanup_thread():
+        if state.shm_cleanup_thread:
+            thread, event = state.shm_cleanup_thread
+            event.set()
+            thread.join(timeout=5.0)
+            logger.info("Shared memory cleanup thread stopped (atexit)")
 
-        atexit.register(_stop_cleanup_thread)
-        logger.info("Started shared memory cleanup thread")
+    atexit.register(_stop_cleanup_thread)
+    logger.info("Started shared memory cleanup thread")
 
     # Patch model runner to capture batch metadata for per-request activation tracking
     logger.info(f"About to patch model runner. worker.model_runner type: {type(worker.model_runner).__name__}")
@@ -1673,7 +1666,7 @@ def unregister_steering_spec(worker: Any, request_id: str) -> None:
 
 
 def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
-    """Fetch activations, coalesce any remaining chunks, serialize, and cleanup."""
+    """Fetch activations, coalesce any remaining chunks, serialize via SHM, and cleanup."""
     state = _ensure_state(worker)
 
     # Coalesce any remaining prefill chunks
@@ -1681,10 +1674,10 @@ def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
     # Flush any remaining decode buffers
     _flush_decode_buffers(state, request_id)
 
-    # Serialize captures
+    # Serialize captures via shared memory
     captures = state.request_captures.pop(request_id, {})
     serialized = {
-        layer_idx: serialize_tensor(tensor)
+        layer_idx: _create_shared_tensor(tensor, state)
         for layer_idx, tensor in captures.items()
     }
 
@@ -1797,15 +1790,9 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             for layer_idx in captures.keys():
                 cpu_tensor, _, tensor_bytes = transfer_data[(req_id, layer_idx)]
 
-                # Time serialization (shared memory or bytes)
+                # Time serialization to shared memory
                 t_numpy_start = time.perf_counter()
-
-                # Use shared memory if enabled and tensor is large enough
-                payload = _create_shared_tensor(
-                    cpu_tensor,
-                    state,
-                    threshold_kb=state.shm_threshold_kb
-                )
+                payload = _create_shared_tensor(cpu_tensor, state)
 
                 total_numpy_time += time.perf_counter() - t_numpy_start
                 serialized[layer_idx] = payload

@@ -623,8 +623,6 @@ class VLLMSteerModel:
         cfg: VLLMSteeringConfig,
         *,
         bootstrap_layers: Sequence[int] | None = None,
-        use_shared_memory: bool | None = None,
-        shm_threshold_kb: int | None = None,
         shm_ttl_seconds: int | None = None,
         shm_max_gb: float | None = None,
         decode_buffer_size: int | None = None,
@@ -633,15 +631,8 @@ class VLLMSteerModel:
         self.cfg = cfg
 
         # Shared memory configuration (default from env vars if not specified)
+        # Note: Shared memory is always enabled for activation captures (no bytes fallback)
         import os
-        self._use_shared_memory = (
-            use_shared_memory if use_shared_memory is not None
-            else bool(int(os.getenv("CHATSPACE_SHARED_MEMORY", "0")))
-        )
-        self._shm_threshold_kb = (
-            shm_threshold_kb if shm_threshold_kb is not None
-            else int(os.getenv("CHATSPACE_SHM_THRESHOLD_KB", "1024"))
-        )
         self._shm_ttl_seconds = (
             shm_ttl_seconds if shm_ttl_seconds is not None
             else int(os.getenv("CHATSPACE_SHM_TTL", "600"))
@@ -750,12 +741,10 @@ class VLLMSteerModel:
             self._engine = AsyncLLMEngine.from_engine_args(self._engine_args)
             self._engine_client = self._engine  # AsyncLLMEngine has collective_rpc directly
 
-            # Initialize worker state with shared memory and capture config
+            # Initialize worker state with shared memory config
             setup_info = await self._collective_rpc(
                 "initialize_worker_state",
                 self._init_layers,
-                self._use_shared_memory,
-                self._shm_threshold_kb,
                 self._shm_ttl_seconds,
                 self._shm_max_gb,
                 self._decode_buffer_size,
@@ -1433,29 +1422,36 @@ class VLLMSteerModel:
 
                     # Check if this is shared memory or bytes encoding
                     if tensor_data.get("encoding") == "shm":
-                        # Shared memory path: open shm and create tensor view
+                        # Shared memory path: open shm and reconstruct tensor from uint8 view
                         shm_name = tensor_data["shm_name"]
                         shape = tuple(tensor_data["shape"])
                         dtype_str = tensor_data["dtype"]
+                        nbytes = tensor_data.get("nbytes")
 
                         try:
                             shm = SharedMemory(name=shm_name)
 
-                            # Handle bfloat16 specially
-                            if dtype_str == "bfloat16":
-                                import ml_dtypes
-                                # Create numpy array view as bfloat16
-                                np_array = np.ndarray(shape, dtype=ml_dtypes.bfloat16, buffer=shm.buf)
-                                # Convert to torch: view as uint16, then reinterpret as bfloat16
-                                tensor = torch.from_numpy(np_array.view(np.uint16)).view(torch.bfloat16)
-                            else:
-                                # Standard dtypes
-                                np_dtype = getattr(np, dtype_str.replace("torch.", ""))
-                                np_array = np.ndarray(shape, dtype=np_dtype, buffer=shm.buf)
-                                tensor = torch.from_numpy(np_array)
+                            # Parse dtype
+                            target_dtype = getattr(torch, dtype_str, None)
+                            if target_dtype is None:
+                                raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-                            # Convert to desired dtype
-                            tensor = tensor.to(dtype=self._vector_dtype)
+                            # Read as uint8 bytes, reinterpret to target dtype
+                            if nbytes is not None:
+                                np_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
+                            else:
+                                # Legacy fallback: compute nbytes from shape and dtype
+                                element_size = torch.empty(0, dtype=target_dtype).element_size()
+                                computed_nbytes = int(np.prod(shape)) * element_size
+                                np_array = np.ndarray(computed_nbytes, dtype=np.uint8, buffer=shm.buf)
+
+                            # Reconstruct tensor from uint8 buffer
+                            tensor = torch.frombuffer(bytearray(np_array), dtype=torch.uint8)
+                            tensor = tensor.view(target_dtype).reshape(shape).clone()
+
+                            # Convert to desired dtype if different
+                            if tensor.dtype != self._vector_dtype:
+                                tensor = tensor.to(dtype=self._vector_dtype)
 
                             # Track SharedMemory object to keep it alive
                             shm_tracking[request_id].append(shm)

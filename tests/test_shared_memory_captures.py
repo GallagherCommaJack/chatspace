@@ -10,7 +10,8 @@ Tests cover:
 - Concurrent access
 - Memory leak detection
 - Performance benchmarks
-- Fallback behavior
+
+Note: Shared memory is always enabled for activation captures (no bytes fallback).
 """
 
 import asyncio
@@ -37,7 +38,7 @@ async def model_factory(model_name):
     """Factory for creating VLLMSteerModel with custom config."""
     created_models = []
 
-    async def _make_model(use_shared_memory=False, shm_threshold_kb=1024, shm_ttl_seconds=600, shm_max_gb=128.0):
+    async def _make_model(shm_ttl_seconds=600, shm_max_gb=128.0):
         config = VLLMSteeringConfig(
             model_name=model_name,
             gpu_memory_utilization=0.4,
@@ -46,8 +47,6 @@ async def model_factory(model_name):
         m = VLLMSteerModel(
             config,
             bootstrap_layers=(5,),
-            use_shared_memory=use_shared_memory,
-            shm_threshold_kb=shm_threshold_kb,
             shm_ttl_seconds=shm_ttl_seconds,
             shm_max_gb=shm_max_gb,
             enforce_eager=True,  # Pass to VLLMSteerModel, not config
@@ -67,8 +66,7 @@ async def model_factory(model_name):
 @pytest.mark.asyncio
 async def test_shared_memory_basic_roundtrip(model_factory):
     """Test basic shared memory creation and retrieval."""
-    # Create model with shared memory enabled
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Once upon a time"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -89,7 +87,7 @@ async def test_shared_memory_basic_roundtrip(model_factory):
     assert handle._captures is not None
     assert len(handle._captures) > 0
 
-    # Verify shared memory was used
+    # Verify shared memory was used (always enabled now)
     assert len(handle._shm_names) > 0, "Expected shared memory to be used"
 
     # Verify tensor data integrity
@@ -108,7 +106,7 @@ async def test_shared_memory_basic_roundtrip(model_factory):
 @pytest.mark.asyncio
 async def test_shared_memory_context_manager(model_factory):
     """Test async context manager cleanup."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Hello world"]
     sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
@@ -135,62 +133,9 @@ async def test_shared_memory_context_manager(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_bytes_fallback_when_disabled(model_factory):
-    """Test fallback to bytes encoding when shared memory disabled."""
-    # Create model with shared memory explicitly disabled
-    model = await model_factory(use_shared_memory=False)
-
-    prompts = ["Test prompt"]
-    sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
-
-    results, handles = await model.generate(
-        prompts,
-        sampling_params,
-        capture_layers=[5],
-    )
-
-    handle = handles[0]
-    await model.fetch_captures_batch([handle])
-
-    # Verify no shared memory was used
-    assert len(handle._shm_names) == 0, "Should not use shared memory when disabled"
-
-    # But captures should still work
-    assert handle._captures is not None
-    assert len(handle._captures) > 0
-
-
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_bytes_fallback_below_threshold(model_factory):
-    """Test fallback to bytes encoding for small tensors."""
-    # Set very high threshold so nothing uses shared memory (1GB threshold)
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1000000)
-
-    prompts = ["Short"]
-    sampling_params = SamplingParams(max_tokens=3, temperature=0.0)
-
-    results, handles = await model.generate(
-        prompts,
-        sampling_params,
-        capture_layers=[5],
-    )
-
-    handle = handles[0]
-    await model.fetch_captures_batch([handle])
-
-    # Small tensors should fall back to bytes
-    assert len(handle._shm_names) == 0, "Small tensors should use bytes encoding"
-
-    # But captures should still work
-    assert handle._captures is not None
-
-
-@pytest.mark.slow
-@pytest.mark.asyncio
 async def test_concurrent_access_isolation(model_factory):
     """Test that concurrent requests maintain proper isolation."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["First prompt", "Second prompt"]
     sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
@@ -276,7 +221,7 @@ async def test_data_integrity(model_factory):
     torch.cuda.empty_cache()
 
     # vLLM with shared memory
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
     results, handles = await model.generate(
@@ -332,7 +277,7 @@ async def test_data_integrity(model_factory):
 @pytest.mark.asyncio
 async def test_memory_leak_detection(model_factory):
     """Test that repeated capture cycles don't leak memory."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     import gc
 
@@ -368,7 +313,7 @@ async def test_memory_leak_detection(model_factory):
 @pytest.mark.asyncio
 async def test_explicit_close_vs_context_manager(model_factory):
     """Test both cleanup methods work correctly."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["A", "B"]
     sampling_params = SamplingParams(max_tokens=3, temperature=0.0)

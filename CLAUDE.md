@@ -286,13 +286,15 @@ This allows vLLM's async engine to batch all requests together for maximum GPU u
 **Performance Optimization:**
 - Traditional activation fetch serializes tensors via `.numpy().tobytes()`, taking ~12.3s for 8GB of captures
 - Shared memory IPC eliminates serialization overhead, achieving ~3.8ms for the same 8GB (3176x speedup)
-- Enabled via `CHATSPACE_SHARED_MEMORY=1` environment variable (disabled by default)
+- Shared memory is always enabled for activation captures (no bytes fallback)
 
 **How It Works:**
-1. Worker copies tensor data to shared memory once: `tensor.numpy()` → `shm.buf`
-2. Worker returns metadata only (shm_name, shape, dtype) instead of raw bytes
-3. Client memory-maps shared memory and creates tensor view (zero-copy): `np.ndarray(..., buffer=shm.buf)` → `torch.from_numpy()`
+1. Worker views tensor as uint8 bytes and copies to shared memory: `tensor.view(torch.uint8).numpy()` → `shm.buf`
+2. Worker returns metadata only (shm_name, shape, dtype, nbytes) instead of raw bytes
+3. Client memory-maps shared memory and reconstructs tensor: `np.ndarray(..., buffer=shm.buf)` → `torch.frombuffer()` → `.view(dtype)`
 4. Client releases shared memory when done via explicit cleanup or context manager
+
+**Note:** Using uint8 view for all dtypes (including bfloat16) eliminates the dependency on ml-dtypes and works with numpy>=1.20.
 
 **Usage Patterns:**
 
@@ -320,8 +322,6 @@ await handle.close()  # Explicit release
 **Configuration:**
 
 Environment variables control shared memory behavior:
-- `CHATSPACE_SHARED_MEMORY=1` - Enable shared memory (default: 0, disabled)
-- `CHATSPACE_SHM_THRESHOLD_KB=1024` - Minimum tensor size in KB to use shared memory (default: 1MB)
 - `CHATSPACE_SHM_TTL=600` - Worker-side timeout in seconds for stale segment cleanup (default: 10 minutes)
 - `CHATSPACE_MAX_SHM_GB=128` - Maximum total shared memory usage in GB (default: 128GB)
 
@@ -336,18 +336,14 @@ Three layers of cleanup prevent memory leaks:
 
 **Performance Characteristics:**
 - Best for large batches with many layers (e.g., 32 requests × 64 layers = 2048 tensors)
-- Minimal overhead for tensors ≥1MB (default threshold)
-- Automatic fallback to bytes encoding for:
-  - Tensors below size threshold
-  - When shared memory limit is reached
-  - When shared memory creation fails
-  - When feature is disabled
+- No size threshold - all activation captures use shared memory
+- If shared memory limit is reached, a RuntimeError is raised (fail-fast, no silent fallback)
 
 **Troubleshooting:**
 - If you see ResourceWarning: "CaptureHandle held N shared memory regions but was never accessed"
   - Use `async with handle:` context manager or call `await handle.close()` explicitly
 - Check worker logs for "TTL expired" warnings if shared memory isn't being released promptly
-- Verify `CHATSPACE_SHARED_MEMORY=1` is set if expecting zero-copy behavior
+- If you get RuntimeError about shared memory limit, increase `CHATSPACE_MAX_SHM_GB` or reduce batch size
 - Monitor `/dev/shm` usage if concerned about memory consumption
 
 ## Code Cleanup and Technical Debt Management
