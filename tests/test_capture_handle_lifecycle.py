@@ -33,7 +33,7 @@ async def model_factory(model_name):
     """Factory for creating VLLMSteerModel with custom config."""
     created_models = []
 
-    async def _make_model(use_shared_memory=False):
+    async def _make_model():
         config = VLLMSteeringConfig(
             model_name=model_name,
             gpu_memory_utilization=0.4,
@@ -42,8 +42,6 @@ async def model_factory(model_name):
         m = VLLMSteerModel(
             config,
             bootstrap_layers=(5,),
-            use_shared_memory=use_shared_memory,
-            shm_threshold_kb=1,  # Always use shm when enabled
             enforce_eager=True,
         )
         created_models.append(m)
@@ -69,7 +67,7 @@ async def test_finalizer_warns_for_unaccessed_handles(model_factory):
     1. Access the .captures property
     2. Call close() or use context manager
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -136,7 +134,7 @@ async def test_finalizer_no_warning_when_accessed(model_factory):
     If user accesses .captures but forgets to close(), finalizer should
     still clean up but NOT emit warning (user clearly intended to use it).
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -182,7 +180,7 @@ async def test_finalizer_no_warning_when_accessed(model_factory):
 @pytest.mark.asyncio
 async def test_context_manager_automatic_cleanup(model_factory):
     """Test that async context manager properly cleans up resources."""
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -215,7 +213,7 @@ async def test_context_manager_automatic_cleanup(model_factory):
 @pytest.mark.asyncio
 async def test_context_manager_cleanup_on_exception(model_factory):
     """Test that context manager cleans up even if exception is raised."""
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -245,7 +243,7 @@ async def test_context_manager_cleanup_on_exception(model_factory):
 @pytest.mark.asyncio
 async def test_access_captures_before_fetch_raises(model_factory):
     """Test that accessing .captures before fetch() raises helpful error."""
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -270,7 +268,7 @@ async def test_access_captures_before_fetch_raises(model_factory):
 @pytest.mark.asyncio
 async def test_double_close_is_safe(model_factory):
     """Test that calling close() multiple times is idempotent."""
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -301,7 +299,7 @@ async def test_double_close_is_safe(model_factory):
 @pytest.mark.asyncio
 async def test_close_before_fetch(model_factory):
     """Test that closing before fetching is safe (no shared memory created yet)."""
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -328,7 +326,7 @@ async def test_cleanup_rpc_failure_is_logged(model_factory, caplog):
     """Test that RPC failures during cleanup are logged but don't crash."""
     import logging
 
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -366,7 +364,7 @@ async def test_fetch_after_close_behavior(model_factory):
     This tests an edge case where user might try to re-fetch after closing.
     Expected behavior: Should be safe (no crash) but may return empty or error.
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -399,7 +397,7 @@ async def test_concurrent_close_with_finalize(model_factory):
     This simulates the edge case where user calls close() while
     garbage collector is running finalizer.
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -437,7 +435,7 @@ async def test_multiple_handles_independent_lifecycle(model_factory):
 
     Closing one handle shouldn't affect others.
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -483,7 +481,7 @@ async def test_no_shared_memory_no_cleanup_rpc(model_factory):
 
     This verifies optimization where bytes encoding doesn't trigger RPC.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)

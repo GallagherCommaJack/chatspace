@@ -37,8 +37,6 @@ async def model_factory(model_name):
     created_models = []
 
     async def _make_model(
-        use_shared_memory=False,
-        shm_threshold_kb=1024,
         shm_ttl_seconds=600,
         shm_max_gb=128.0,
     ):
@@ -50,8 +48,6 @@ async def model_factory(model_name):
         m = VLLMSteerModel(
             config,
             bootstrap_layers=(5,),
-            use_shared_memory=use_shared_memory,
-            shm_threshold_kb=shm_threshold_kb,
             shm_ttl_seconds=shm_ttl_seconds,
             shm_max_gb=shm_max_gb,
             enforce_eager=True,
@@ -78,7 +74,7 @@ async def test_unlink_file_not_found_error(model_factory, caplog):
     This simulates the case where shared memory was already unlinked
     (e.g., by another process or TTL cleanup) before client calls close().
     """
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Once upon a time"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -130,7 +126,7 @@ async def test_unlink_permission_error(model_factory, caplog):
 
     This simulates the case where /dev/shm has incorrect permissions.
     """
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -164,7 +160,7 @@ async def test_unlink_permission_error(model_factory, caplog):
 @pytest.mark.asyncio
 async def test_idempotent_close(model_factory):
     """Test that calling close() multiple times is safe."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -194,7 +190,7 @@ async def test_idempotent_close(model_factory):
 @pytest.mark.asyncio
 async def test_close_without_fetch(model_factory):
     """Test that closing a handle before fetching is safe."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -219,22 +215,21 @@ async def test_close_without_fetch(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_shared_memory_limit_fallback(model_factory):
-    """Test graceful fallback to bytes encoding when limit is reached.
+async def test_shared_memory_limit_raises_error(model_factory):
+    """Test that exceeding CHATSPACE_MAX_SHM_GB raises RuntimeError.
 
-    This simulates hitting CHATSPACE_MAX_SHM_GB limit.
+    Shared memory is always used (no bytes fallback), so exceeding
+    the limit should fail fast with a clear error message.
     """
-    # Set very low limit to trigger fallback
+    # Set very low limit to trigger error
     model = await model_factory(
-        use_shared_memory=True,
-        shm_threshold_kb=1,
-        shm_max_gb=0.0001,  # 100 KB limit
+        shm_max_gb=0.0001,  # 100 KB limit - will be exceeded
     )
 
     prompts = ["Once upon a time, in a land far away, there lived a"]
     sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
 
-    # Generate multiple captures to exceed limit
+    # Generate with multiple capture layers to exceed limit
     results, handles = await model.generate(
         prompts,
         sampling_params,
@@ -242,28 +237,18 @@ async def test_shared_memory_limit_fallback(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
 
-    # Should still have captures (via bytes encoding fallback)
-    assert handle._captures is not None
-    assert len(handle._captures) > 0
-
-    # Verify captures are valid
-    for layer_idx, captures_list in handle._captures.items():
-        for capture in captures_list:
-            hidden = capture["hidden"]
-            assert hidden.shape[0] > 0
-            assert hidden.shape[1] == model.hidden_size
-            assert not torch.isnan(hidden).any()
-
-    await handle.close()
+    # Fetch should raise Exception when shared memory limit is exceeded
+    # (RuntimeError from worker gets wrapped in Exception through RPC)
+    with pytest.raises(Exception, match="Shared memory limit reached"):
+        await model.fetch_captures_batch([handle])
 
 
 @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cleanup_after_fetch_exception(model_factory):
     """Test that shared memory is cleaned up even if fetch() raises."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -297,7 +282,7 @@ async def test_cleanup_after_fetch_exception(model_factory):
 @pytest.mark.asyncio
 async def test_concurrent_close_operations(model_factory):
     """Test that concurrent close() calls don't cause race conditions."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -323,19 +308,11 @@ async def test_concurrent_close_operations(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_threshold_boundary_conditions(model_factory):
-    """Test shared memory vs bytes encoding at threshold boundary."""
-    # Set threshold exactly at expected tensor size
-    # For a small model with hidden_size=896 and ~20 tokens:
-    # Tensor size ≈ 896 * 20 * 4 bytes = ~70KB per layer per request
+async def test_shared_memory_always_used(model_factory):
+    """Test that shared memory is always used for captures."""
+    model = await model_factory()
 
-    model = await model_factory(
-        use_shared_memory=True,
-        shm_threshold_kb=50,  # Below tensor size - should use shm
-    )
-
-    # Use longer prompt to ensure tensor exceeds threshold
-    # Repeat "Test " many times to get enough tokens
+    # Use longer prompt to get a decent tensor size
     prompts = ["Test " * 100]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
 
@@ -348,38 +325,17 @@ async def test_threshold_boundary_conditions(model_factory):
     handle = handles[0]
     await model.fetch_captures_batch([handle])
 
-    # Should use shared memory (tensor is above threshold)
-    assert len(handle._shm_names) > 0, "Expected shared memory for large tensor"
+    # Shared memory should always be used
+    assert len(handle._shm_names) > 0, "Expected shared memory for captures"
 
     await handle.close()
-
-    # Now test with threshold above tensor size
-    model2 = await model_factory(
-        use_shared_memory=True,
-        shm_threshold_kb=1000,  # Above tensor size - should use bytes
-    )
-
-    results2, handles2 = await model2.generate(
-        prompts,
-        sampling_params,
-        capture_layers=[5],
-    )
-
-    handle2 = handles2[0]
-    await model2.fetch_captures_batch([handle2])
-
-    # Should use bytes encoding (tensor is below threshold)
-    # Note: Might still use shm if implementation batches segments
-    # This is more of a performance hint than strict requirement
-
-    await handle2.close()
 
 
 @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_multiple_handles_cleanup(model_factory):
     """Test cleanup of multiple handles with shared memory."""
-    model = await model_factory(use_shared_memory=True, shm_threshold_kb=1)
+    model = await model_factory()
 
     prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -411,9 +367,9 @@ async def test_multiple_handles_cleanup(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_shared_memory_disabled_fallback(model_factory):
-    """Test that system works correctly with shared memory disabled."""
-    model = await model_factory(use_shared_memory=False)
+async def test_basic_capture_with_shared_memory(model_factory):
+    """Test that basic captures work with shared memory (always enabled)."""
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -427,10 +383,10 @@ async def test_shared_memory_disabled_fallback(model_factory):
     handle = handles[0]
     await model.fetch_captures_batch([handle])
 
-    # Should not use shared memory
-    assert len(handle._shm_names) == 0, "Expected bytes encoding, not shared memory"
+    # Shared memory is always used
+    assert len(handle._shm_names) > 0, "Expected shared memory for captures"
 
-    # Captures should still be valid
+    # Captures should be valid
     assert handle._captures is not None
     assert 5 in handle._captures
 

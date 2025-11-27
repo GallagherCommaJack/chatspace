@@ -32,7 +32,7 @@ async def model_factory(model_name):
     """Factory for creating VLLMSteerModel with custom config."""
     created_models = []
 
-    async def _make_model(use_shared_memory=False):
+    async def _make_model():
         config = VLLMSteeringConfig(
             model_name=model_name,
             gpu_memory_utilization=0.4,
@@ -41,7 +41,6 @@ async def model_factory(model_name):
         m = VLLMSteerModel(
             config,
             bootstrap_layers=(5,),
-            use_shared_memory=use_shared_memory,
             enforce_eager=True,
         )
         created_models.append(m)
@@ -65,7 +64,7 @@ async def test_capture_fetch_timeout(model_factory):
 
     This simulates the case where worker is slow to respond to fetch RPC.
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -104,7 +103,7 @@ async def test_steering_registration_timeout(model_factory):
 
     This simulates the case where worker is slow to register steering spec.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     # Create steering spec
     steering_vector = torch.randn(model.hidden_size)
@@ -146,7 +145,7 @@ async def test_cleanup_rpc_timeout_is_not_fatal(model_factory, caplog):
     """
     import logging
 
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -195,7 +194,7 @@ async def test_system_functional_after_timeout(model_factory):
 
     This verifies that timeout doesn't leave system in broken state.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -238,7 +237,7 @@ async def test_concurrent_rpcs_with_one_timeout(model_factory):
 
     This verifies that RPC operations don't have global locks.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     prompts = ["Test prompt"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
@@ -279,7 +278,7 @@ async def test_unregister_steering_timeout_handling(model_factory, caplog):
     """
     import logging
 
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
@@ -328,7 +327,7 @@ async def test_multiple_concurrent_timeouts(model_factory):
 
     This stress tests the timeout handling to ensure no deadlocks.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     # Initialize engine once before concurrent operations to avoid race condition
     init_prompts = ["Init"]
@@ -381,7 +380,7 @@ async def test_rpc_exception_propagation(model_factory):
 
     This ensures that errors don't get swallowed silently.
     """
-    model = await model_factory(use_shared_memory=False)
+    model = await model_factory()
 
     # Store original method before mocking
     original_rpc = model._collective_rpc
@@ -418,7 +417,7 @@ async def test_fetch_captures_batch_parallel_timeout(model_factory):
 
     This tests the parallel fetch path in fetch_captures_batch().
     """
-    model = await model_factory(use_shared_memory=True)
+    model = await model_factory()
 
     prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
