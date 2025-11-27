@@ -3,18 +3,20 @@
 This module provides the VLLMSteeringModel class which wraps vLLM's AsyncLLMEngine
 with steering vector injection and activation capture capabilities.
 
-Note: This implementation currently delegates to chatspace's vLLM steering runtime.
-A clean rewrite is planned for v0.2.
+This is a standalone implementation that does not depend on chatspace.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import uuid
 import weakref
-from dataclasses import dataclass
+from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 
 from steerllm.core.capture import CaptureHandle, ChatResponse, MessageBoundary
@@ -27,40 +29,162 @@ from steerllm.core.specs import (
     ProjectionCapSpec,
     SteeringSpec,
 )
+from steerllm.backends.vllm import runtime as steering_runtime
 
 logger = logging.getLogger(__name__)
 
 
-def _convert_to_chatspace_spec(spec: SteeringSpec) -> Any:
-    """Convert steerllm SteeringSpec to chatspace format.
+def _parse_dtype(dtype_str: str) -> torch.dtype:
+    """Parse dtype string to torch.dtype."""
+    if not dtype_str.startswith("torch."):
+        raise ValueError(f"Unexpected dtype format: {dtype_str}")
+    name = dtype_str.split(".", maxsplit=1)[1]
+    dtype = getattr(torch, name, None)
+    if dtype is None:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+    return dtype
 
-    The chatspace specs have the same structure, so this is mostly
-    a namespace conversion.
+
+class _VLLMCaptureHandle:
+    """Internal capture handle that wraps vLLM worker captures.
+
+    This handle fetches captures from workers via shared memory IPC
+    and provides access to the captured tensors.
     """
-    # Import chatspace specs
-    from chatspace.generation.vllm_steer_model import (
-        SteeringSpec as CSSteeringSpec,
-        LayerSteeringSpec as CSLayerSteeringSpec,
-        AddSpec as CSAddSpec,
-        ProjectionCapSpec as CSProjectionCapSpec,
-        AblationSpec as CSAblationSpec,
-    )
 
-    cs_layers = {}
-    for layer_idx, layer_spec in spec.layers.items():
-        cs_ops = []
-        for op in layer_spec.operations:
-            if isinstance(op, AddSpec):
-                cs_ops.append(CSAddSpec(vector=op.vector, scale=op.scale))
-            elif isinstance(op, ProjectionCapSpec):
-                cs_ops.append(CSProjectionCapSpec(
-                    vector=op.vector, min=op.min, max=op.max
-                ))
-            elif isinstance(op, AblationSpec):
-                cs_ops.append(CSAblationSpec(vector=op.vector, scale=op.scale))
-        cs_layers[layer_idx] = CSLayerSteeringSpec(operations=cs_ops)
+    def __init__(
+        self,
+        request_id: str,
+        layer_indices: tuple[int, ...],
+        model: "VLLMSteeringModel",
+        message_boundaries: tuple[MessageBoundary, ...] | None = None,
+    ) -> None:
+        self.request_id = request_id
+        self.layer_indices = layer_indices
+        self.message_boundaries = message_boundaries
+        self._model_ref = weakref.ref(model)
+        self._captures: dict[int, list[dict[str, Any]]] | None = None
+        self._shm_objects: list[SharedMemory] = []
+        self._shm_names: list[str] = []
+        self._closed = False
+        self._accessed = False
 
-    return CSSteeringSpec(layers=cs_layers)
+        # Create mutable container for finalizer tracking
+        self._accessed_container = [False]
+
+        # Weak finalizer for cleanup
+        def _cleanup_handler(
+            shm_objects: list[SharedMemory],
+            model_ref: weakref.ref,
+            shm_names: list[str],
+            request_id: str,
+            accessed_container: list[bool],
+        ):
+            # Emit warning if handle had shared memory but was never accessed
+            if shm_objects and not accessed_container[0]:
+                import warnings
+
+                warnings.warn(
+                    f"CaptureHandle for request {request_id} held {len(shm_objects)} "
+                    "shared memory regions but was never accessed. Use 'async with handle:' "
+                    "or call 'await handle.close()' to properly release resources.",
+                    ResourceWarning,
+                    stacklevel=2,
+                )
+
+            # Client-side cleanup
+            for shm in shm_objects:
+                try:
+                    shm.close()
+                except Exception:
+                    pass
+
+            # Worker-side cleanup (best-effort)
+            model = model_ref()
+            if model is not None and shm_names:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.create_task(
+                            model._collective_rpc("release_shared_memory", shm_names)
+                        )
+                except Exception:
+                    pass
+
+        self._finalizer = weakref.finalize(
+            self,
+            _cleanup_handler,
+            self._shm_objects,
+            self._model_ref,
+            self._shm_names,
+            self.request_id,
+            self._accessed_container,
+        )
+
+    async def __aenter__(self) -> "_VLLMCaptureHandle":
+        """Async context manager entry."""
+        await self.fetch()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    async def close(self) -> None:
+        """Release shared memory and cleanup resources."""
+        if self._closed:
+            return
+
+        self._closed = True
+
+        # Client-side cleanup: unmap shared memory
+        for shm in self._shm_objects:
+            try:
+                shm.close()
+            except Exception as e:
+                logger.warning(f"Failed to close shared memory {shm.name}: {e}")
+
+        # Worker-side cleanup: send RPC to unlink shared memory segments
+        model = self._model_ref()
+        if model is not None and self._shm_names:
+            try:
+                await model._collective_rpc("release_shared_memory", self._shm_names)
+                logger.debug(f"Released {len(self._shm_names)} shared memory segments")
+            except Exception as e:
+                logger.warning(f"Failed to release shared memory: {e}")
+
+        # Clear references
+        self._shm_objects.clear()
+
+        # Detach finalizer since we cleaned up explicitly
+        self._finalizer.detach()
+
+    async def fetch(self) -> dict[int, list[dict[str, Any]]]:
+        """Fetch captures from workers (idempotent)."""
+        if self._captures is None:
+            model = self._model_ref()
+            if model is None:
+                raise RuntimeError("Model has been garbage collected")
+            self._captures = await model._fetch_request_captures(
+                self.request_id,
+                shm_objects_list=self._shm_objects,
+            )
+            # Extract names for cleanup RPC
+            self._shm_names = [shm.name for shm in self._shm_objects]
+        return self._captures
+
+    @property
+    def captures(self) -> dict[int, list[dict[str, Any]]]:
+        """Get captures (must call fetch() first)."""
+        if self._captures is None:
+            raise RuntimeError(
+                f"Captures not fetched yet for request {self.request_id}. "
+                "Call: await handle.fetch()"
+            )
+        # Mark as accessed for finalizer tracking
+        self._accessed = True
+        self._accessed_container[0] = True
+        return self._captures
 
 
 class VLLMSteeringModel(SyncWrapperMixin):
@@ -106,60 +230,97 @@ class VLLMSteeringModel(SyncWrapperMixin):
         max_model_len: int | None = None,
         dtype: str = "auto",
         bootstrap_layers: tuple[int, ...] = (),
-        shm_ttl_seconds: int = 600,
-        shm_max_gb: float = 128.0,
+        shm_ttl_seconds: int | None = None,
+        shm_max_gb: float | None = None,
+        decode_buffer_size: int | None = None,
         **vllm_kwargs: Any,
     ) -> None:
         # Lazy import to check for vLLM
         try:
-            from vllm import SamplingParams
+            from vllm import SamplingParams, AsyncEngineArgs
         except ImportError as e:
             raise BackendError(
                 "vLLM backend requires vllm. "
                 "Install with: pip install steerllm[vllm]"
             ) from e
 
-        # Import chatspace's VLLMSteerModel
-        try:
-            from chatspace.generation.vllm_steer_model import (
-                VLLMSteerModel as CSVLLMSteerModel,
-                VLLMSteeringConfig,
+        # Shared memory configuration (default from env vars if not specified)
+        self._shm_ttl_seconds = (
+            shm_ttl_seconds
+            if shm_ttl_seconds is not None
+            else int(os.getenv("STEERLLM_SHM_TTL", "600"))
+        )
+        self._shm_max_gb = (
+            shm_max_gb
+            if shm_max_gb is not None
+            else float(os.getenv("STEERLLM_MAX_SHM_GB", "128"))
+        )
+        self._decode_buffer_size = (
+            decode_buffer_size
+            if decode_buffer_size is not None
+            else int(os.getenv("STEERLLM_DECODE_BUFFER_SIZE", "128"))
+        )
+
+        # Ensure eager execution (required for steering patches)
+        enforce_eager = vllm_kwargs.get("enforce_eager", True)
+        if not enforce_eager:
+            logger.warning(
+                "vLLM steering requires enforce_eager=True; overriding user-supplied value."
             )
-        except ImportError as e:
-            raise BackendError(
-                "VLLMSteeringModel currently requires chatspace. "
-                "Install chatspace or wait for steerllm v0.2 with standalone vLLM support."
-            ) from e
+            enforce_eager = True
 
-        # Create chatspace config
-        config = VLLMSteeringConfig(
-            model_name=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-            dtype=dtype,
-            bootstrap_layers=bootstrap_layers,
+        llm_kwargs = {
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "dtype": dtype,
+            "enforce_eager": enforce_eager,
+        }
+        if max_model_len is not None:
+            llm_kwargs["max_model_len"] = max_model_len
+        llm_kwargs.update(vllm_kwargs)
+        llm_kwargs.setdefault(
+            "worker_extension_cls", steering_runtime.STEERING_WORKER_EXTENSION
         )
 
-        # Initialize chatspace model
-        self._cs_model = CSVLLMSteerModel(
-            config,
-            shm_ttl_seconds=shm_ttl_seconds,
-            shm_max_gb=shm_max_gb,
-            **vllm_kwargs,
-        )
+        # Install patches before engine creation
+        steering_runtime.ensure_layer_patch_installed()
+        steering_runtime.ensure_collective_rpc_gateway_installed()
+
+        # Create engine args (engine initialized on first use)
+        self._engine_args = AsyncEngineArgs(model=model_name, **llm_kwargs)
+        self._engine = None
+        self._engine_init_lock = asyncio.Lock()
 
         self._model_name = model_name
+        self._init_layers = tuple(int(idx) for idx in bootstrap_layers)
+
+        # Load model config to get dimensions before engine init
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+        # Handle multimodal models where hidden_size is nested
+        if hasattr(model_config, "text_config") and hasattr(
+            model_config.text_config, "hidden_size"
+        ):
+            self._hidden_size = model_config.text_config.hidden_size
+            self._layer_count = model_config.text_config.num_hidden_layers
+        else:
+            self._hidden_size = model_config.hidden_size
+            self._layer_count = model_config.num_hidden_layers
+
+        self._vector_dtype: torch.dtype | None = None
+        self._tokenizer = None
 
     @property
     def hidden_size(self) -> int:
         """Model's hidden dimension."""
-        return self._cs_model.hidden_size
+        return self._hidden_size
 
     @property
     def layer_count(self) -> int:
         """Number of transformer layers."""
-        return self._cs_model.layer_count
+        return self._layer_count
 
     @property
     def model_name(self) -> str:
@@ -168,8 +329,186 @@ class VLLMSteeringModel(SyncWrapperMixin):
 
     @property
     def tokenizer(self) -> Any:
-        """Tokenizer instance."""
-        return self._cs_model.tokenizer
+        """Tokenizer instance (lazy-loaded)."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        return self._tokenizer
+
+    async def _ensure_engine_initialized(self) -> None:
+        """Initialize AsyncLLMEngine and workers on first use."""
+        async with self._engine_init_lock:
+            if self._engine is not None:
+                return
+
+            from vllm import AsyncLLMEngine
+
+            # Create async engine
+            self._engine = AsyncLLMEngine.from_engine_args(self._engine_args)
+
+            # Initialize worker state with shared memory config
+            setup_info = await self._collective_rpc(
+                "initialize_worker_state",
+                self._init_layers,
+                self._shm_ttl_seconds,
+                self._shm_max_gb,
+                self._decode_buffer_size,
+            )
+            if not setup_info:
+                raise RuntimeError("Failed to initialize steering state on workers.")
+
+            first = setup_info[0]
+            # Verify dimensions match what we loaded from config
+            worker_hidden_size = int(first["hidden_size"])
+            worker_layer_count = int(first["layer_count"])
+            if worker_hidden_size != self._hidden_size:
+                raise RuntimeError(
+                    f"Worker hidden_size {worker_hidden_size} doesn't match config {self._hidden_size}"
+                )
+            if worker_layer_count != self._layer_count:
+                raise RuntimeError(
+                    f"Worker layer_count {worker_layer_count} doesn't match config {self._layer_count}"
+                )
+            self._vector_dtype = _parse_dtype(first["dtype"])
+
+    async def _collective_rpc(
+        self,
+        op: str,
+        *args: Any,
+        timeout: float | None = None,
+    ) -> list[Any]:
+        """Call a steering RPC on all workers."""
+        if self._engine is None:
+            raise RuntimeError("Engine not initialized. Call an async method first.")
+        return await self._engine.collective_rpc(
+            steering_runtime.STEERING_RPC_METHOD,
+            timeout=timeout,
+            args=steering_runtime.rpc_args(op, *args),
+        )
+
+    def _serialize_steering_spec(self, spec: SteeringSpec) -> dict[str, Any]:
+        """Serialize a SteeringSpec for RPC transmission."""
+        # Validate layer indices before serialization
+        for layer_idx in spec.layers.keys():
+            if layer_idx < 0 or layer_idx >= self._layer_count:
+                raise ValueError(
+                    f"Layer index {layer_idx} out of range [0, {self._layer_count}). "
+                    f"Model {self._model_name} has {self._layer_count} layers."
+                )
+
+        serialized_layers = {}
+        for layer_idx, layer_spec in spec.layers.items():
+            serialized_ops = []
+
+            for op in layer_spec.operations:
+                if isinstance(op, AddSpec):
+                    # Materialize and send pre-scaled vector
+                    vector = op.materialize()
+                    if vector.numel() != self._hidden_size:
+                        raise ValueError(
+                            f"Steering vector dimension mismatch at layer {layer_idx}: "
+                            f"expected {self._hidden_size}, got {vector.numel()}."
+                        )
+                    # Send pre-scaled vector as bytes
+                    vec_cpu = vector.to(dtype=self._vector_dtype).cpu().contiguous()
+                    serialized_ops.append(
+                        {
+                            "type": "add",
+                            "vector": vec_cpu.numpy().tobytes(),
+                            "dtype": str(vec_cpu.dtype),
+                            "params": None,  # Scale already applied
+                        }
+                    )
+
+                elif isinstance(op, ProjectionCapSpec):
+                    if op.vector.numel() != self._hidden_size:
+                        raise ValueError(
+                            f"Projection cap vector dimension mismatch at layer {layer_idx}: "
+                            f"expected {self._hidden_size}, got {op.vector.numel()}."
+                        )
+                    vec_cpu = op.vector.to(dtype=torch.float32).cpu().contiguous()
+                    serialized_ops.append(
+                        {
+                            "type": "cap",
+                            "vector": vec_cpu.numpy().tobytes(),
+                            "dtype": str(vec_cpu.dtype),
+                            "params": (op.min, op.max),
+                        }
+                    )
+
+                elif isinstance(op, AblationSpec):
+                    if op.vector.numel() != self._hidden_size:
+                        raise ValueError(
+                            f"Ablation vector dimension mismatch at layer {layer_idx}: "
+                            f"expected {self._hidden_size}, got {op.vector.numel()}."
+                        )
+                    vec_cpu = op.vector.to(dtype=torch.float32).cpu().contiguous()
+                    serialized_ops.append(
+                        {
+                            "type": "ablation",
+                            "vector": vec_cpu.numpy().tobytes(),
+                            "dtype": str(vec_cpu.dtype),
+                            "params": float(op.scale),
+                        }
+                    )
+
+            serialized_layers[int(layer_idx)] = {"operations": serialized_ops}
+
+        return {"layers": serialized_layers}
+
+    async def _fetch_request_captures(
+        self,
+        request_id: str,
+        shm_objects_list: list[SharedMemory],
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Fetch captures from workers via shared memory."""
+        results = await self._collective_rpc("fetch_captures", request_id)
+
+        # Process first worker's result (all workers have same captures for single-GPU)
+        if not results or results[0] is None:
+            return {}
+
+        worker_result = results[0]
+        captures: dict[int, list[dict[str, Any]]] = {}
+
+        for layer_idx_str, capture_data in worker_result.items():
+            layer_idx = int(layer_idx_str)
+
+            # Reconstruct tensor from shared memory
+            if "shm_name" in capture_data:
+                shm_name = capture_data["shm_name"]
+                shape = tuple(capture_data["shape"])
+                dtype_str = capture_data["dtype"]
+                nbytes = capture_data["nbytes"]
+
+                # Map shared memory
+                shm = SharedMemory(name=shm_name, create=False)
+                shm_objects_list.append(shm)
+
+                # Reconstruct tensor
+                dtype = _parse_dtype(dtype_str)
+                np_dtype = np.dtype(str(dtype).replace("torch.", ""))
+                arr = np.ndarray(shape, dtype=np_dtype, buffer=shm.buf[:nbytes])
+                tensor = torch.from_numpy(arr.copy())
+
+            elif "data" in capture_data:
+                # Fallback: bytes transport
+                shape = tuple(capture_data["shape"])
+                dtype_str = capture_data["dtype"]
+                data = capture_data["data"]
+
+                dtype = _parse_dtype(dtype_str)
+                np_dtype = np.dtype(str(dtype).replace("torch.", ""))
+                arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
+                tensor = torch.from_numpy(arr.copy())
+
+            else:
+                continue
+
+            captures[layer_idx] = [{"hidden": tensor}]
+
+        return captures
 
     async def generate(
         self,
@@ -201,9 +540,11 @@ class VLLMSteeringModel(SyncWrapperMixin):
         Returns
         -------
         tuple[list[str], list[CaptureHandle] | None]
-            Generated texts and capture handles.
+            Generated texts and capture handles (or None if no capture).
         """
         from vllm import SamplingParams
+
+        await self._ensure_engine_initialized()
 
         # Create sampling params
         params = SamplingParams(
@@ -212,31 +553,91 @@ class VLLMSteeringModel(SyncWrapperMixin):
             **sampling_kwargs,
         )
 
-        # Convert steering spec if provided
-        cs_spec = None
-        if steering_spec is not None and not steering_spec.is_empty():
-            cs_spec = _convert_to_chatspace_spec(steering_spec)
+        # Convert capture_layers to tuple
+        layers_tuple: tuple[int, ...] | None = None
+        if capture_layers is not None:
+            if isinstance(capture_layers, int):
+                layers_tuple = (capture_layers,)
+            else:
+                layers_tuple = tuple(capture_layers)
 
-        # Call chatspace model
-        outputs, cs_handles = await self._cs_model.generate(
-            prompts,
-            params,
-            steering_spec=cs_spec,
-            capture_layers=capture_layers,
-        )
+            # Validate layer indices
+            for layer_idx in layers_tuple:
+                if layer_idx < 0 or layer_idx >= self._layer_count:
+                    raise ValueError(
+                        f"Capture layer index {layer_idx} is out of range. "
+                        f"Model has {self._layer_count} layers (valid range: 0-{self._layer_count - 1})"
+                    )
 
-        # Extract texts
-        texts = [out.outputs[0].text for out in outputs]
+        # Generate request IDs
+        request_ids = [f"steerllm_{uuid.uuid4().hex}" for _ in prompts]
 
-        # Convert handles
+        # Register captures
         handles: list[CaptureHandle] | None = None
-        if cs_handles is not None:
+        if layers_tuple is not None:
             handles = []
-            for cs_handle in cs_handles:
-                handle = self._wrap_capture_handle(cs_handle)
+            for req_id in request_ids:
+                await self._collective_rpc("register_capture", req_id, list(layers_tuple))
+                internal_handle = _VLLMCaptureHandle(
+                    request_id=req_id,
+                    layer_indices=layers_tuple,
+                    model=self,
+                )
+                # Wrap in CaptureHandle
+                handle = CaptureHandle(
+                    request_id=req_id,
+                    layer_indices=layers_tuple,
+                    fetch_fn=internal_handle.fetch,
+                    cleanup_fn=internal_handle.close,
+                )
                 handles.append(handle)
 
-        return texts, handles
+        # Register steering specs
+        serialized_spec = None
+        if steering_spec is not None and not steering_spec.is_empty():
+            serialized_spec = self._serialize_steering_spec(steering_spec)
+            for req_id in request_ids:
+                await self._collective_rpc(
+                    "register_steering_spec", req_id, serialized_spec
+                )
+
+        try:
+            # Generate all prompts concurrently
+            async def process_one(i: int, prompt: str) -> str:
+                req_id = request_ids[i]
+                final_output = None
+                async for output in self._engine.generate(
+                    prompt, params, request_id=req_id
+                ):
+                    final_output = output
+
+                if final_output is None:
+                    raise RuntimeError(f"No output for prompt: {prompt}")
+
+                return final_output.outputs[0].text
+
+            # Launch all requests concurrently
+            tasks = [process_one(i, p) for i, p in enumerate(prompts)]
+            texts = await asyncio.gather(*tasks)
+
+            return list(texts), handles
+
+        finally:
+            # Clean up steering specs
+            if serialized_spec is not None:
+                cleanup_tasks = [
+                    self._collective_rpc("unregister_steering_spec", req_id)
+                    for req_id in request_ids
+                ]
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Steering cleanup timed out for batch of {len(request_ids)} requests"
+                    )
 
     async def chat(
         self,
@@ -246,6 +647,7 @@ class VLLMSteeringModel(SyncWrapperMixin):
         temperature: float = 1.0,
         steering_spec: SteeringSpec | None = None,
         capture_layers: Sequence[int] | None = None,
+        chat_options: dict[str, Any] | None = None,
         **sampling_kwargs: Any,
     ) -> tuple[list[ChatResponse], list[CaptureHandle] | None]:
         """Chat-style generation with optional steering and capture.
@@ -262,6 +664,8 @@ class VLLMSteeringModel(SyncWrapperMixin):
             Optional steering configuration.
         capture_layers :
             Optional layer indices to capture.
+        chat_options :
+            Options passed to apply_chat_template().
         **sampling_kwargs :
             Additional sampling parameters.
 
@@ -270,87 +674,72 @@ class VLLMSteeringModel(SyncWrapperMixin):
         tuple[list[ChatResponse], list[CaptureHandle] | None]
             Chat responses and capture handles.
         """
-        from vllm import SamplingParams
+        # Normalize to batch format
+        single_conversation = isinstance(messages, list) and (
+            len(messages) == 0 or isinstance(messages[0], dict)
+        )
+        conversations = [messages] if single_conversation else messages
 
-        # Normalize to list of conversations
-        if messages and isinstance(messages[0], dict):
-            conversations = [messages]
-        else:
-            conversations = messages
+        # Format prompts using chat template
+        chat_kwargs = {"add_generation_prompt": True, "tokenize": False}
+        if chat_options:
+            chat_kwargs.update(chat_options)
 
-        # Create sampling params
-        params = SamplingParams(
+        prompts = []
+        for conv in conversations:
+            prompt = self.tokenizer.apply_chat_template(conv, **chat_kwargs)
+            prompts.append(prompt)
+
+        # Generate
+        texts, handles = await self.generate(
+            prompts,
             max_tokens=max_tokens,
             temperature=temperature,
+            steering_spec=steering_spec,
+            capture_layers=capture_layers,
             **sampling_kwargs,
         )
 
-        # Convert steering spec if provided
-        cs_spec = None
-        if steering_spec is not None and not steering_spec.is_empty():
-            cs_spec = _convert_to_chatspace_spec(steering_spec)
-
-        # Call chatspace model
-        cs_responses, cs_handles = await self._cs_model.chat(
-            conversations,
-            params,
-            steering_spec=cs_spec,
-            capture_layers=capture_layers,
-        )
-
-        # Convert responses
+        # Convert to ChatResponse
         responses = []
-        for cs_resp in cs_responses:
-            if hasattr(cs_resp, 'prefill'):
-                resp = ChatResponse(prefill=cs_resp.prefill, generated=cs_resp.generated)
-            else:
-                resp = ChatResponse(prefill="", generated=str(cs_resp))
-            responses.append(resp)
+        for i, text in enumerate(texts):
+            prompt = prompts[i]
+            responses.append(ChatResponse(prefill=prompt, generated=text))
 
-        # Convert handles
-        handles: list[CaptureHandle] | None = None
-        if cs_handles is not None:
-            handles = []
-            for i, cs_handle in enumerate(cs_handles):
-                # Convert message boundaries if available
-                boundaries = None
-                if cs_handle.message_boundaries:
-                    boundaries = tuple(
-                        MessageBoundary(
-                            role=b.role,
-                            content=b.content,
-                            start_token=b.start_token,
-                            end_token=b.end_token,
-                        )
-                        for b in cs_handle.message_boundaries
-                    )
-                handle = self._wrap_capture_handle(cs_handle, boundaries)
-                handles.append(handle)
+        # Add message boundaries to handles if capturing
+        if handles is not None:
+            for i, handle in enumerate(handles):
+                boundaries = self._compute_message_boundaries(
+                    conversations[i], chat_kwargs
+                )
+                handle._message_boundaries = boundaries
 
         return responses, handles
 
-    def _wrap_capture_handle(
+    def _compute_message_boundaries(
         self,
-        cs_handle: Any,
-        message_boundaries: tuple[MessageBoundary, ...] | None = None,
-    ) -> CaptureHandle:
-        """Wrap a chatspace CaptureHandle in a steerllm CaptureHandle."""
+        messages: list[dict[str, Any]],
+        chat_kwargs: dict[str, Any],
+    ) -> tuple[MessageBoundary, ...]:
+        """Compute token boundaries for each message."""
+        boundaries: list[MessageBoundary] = []
+        current_offset = 0
 
-        async def fetch_fn():
-            return await cs_handle.fetch()
+        for i, msg in enumerate(messages):
+            partial_conv = messages[: i + 1]
+            partial_text = self.tokenizer.apply_chat_template(
+                partial_conv, tokenize=False, **chat_kwargs
+            )
+            partial_tokens = self.tokenizer(partial_text, return_tensors="pt")
+            total_len = partial_tokens.input_ids.shape[1]
 
-        async def cleanup_fn():
-            await cs_handle.close()
+            boundary = MessageBoundary(
+                role=msg.get("role", "unknown"),
+                content=msg.get("content", ""),
+                start_token=current_offset,
+                end_token=total_len,
+            )
+            boundaries.append(boundary)
+            current_offset = total_len
 
-        handle = CaptureHandle(
-            request_id=cs_handle.request_id,
-            layer_indices=cs_handle.layer_indices,
-            fetch_fn=fetch_fn,
-            cleanup_fn=cleanup_fn,
-            message_boundaries=message_boundaries,
-        )
-        return handle
-
-    async def _collective_rpc(self, method: str, *args: Any) -> Any:
-        """Proxy to chatspace's collective RPC for advanced usage."""
-        return await self._cs_model._collective_rpc(method, *args)
+        return tuple(boundaries)

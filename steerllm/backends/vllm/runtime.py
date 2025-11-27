@@ -9,6 +9,7 @@ Note: This is a standalone reimplementation for steerllm, not dependent on chats
 
 from __future__ import annotations
 
+import atexit
 import importlib
 import logging
 import os
@@ -162,6 +163,26 @@ def set_worker_state(state: _SteeringState) -> None:
     """Set the current worker's steering state."""
     global _WORKER_STATE
     _WORKER_STATE = state
+
+
+class _SteeredModelWrapper(nn.Module):
+    """Wrap vLLM model to apply steering after forward execution."""
+
+    def __init__(self, model: nn.Module, state: _SteeringState) -> None:
+        super().__init__()
+        object.__setattr__(self, "_wrapped_model", model)
+        self._steering_state = state
+
+    def __getattr__(self, name: str) -> Any:
+        if name in {"_wrapped_model", "_steering_state"}:
+            return object.__getattribute__(self, name)
+        return getattr(self._wrapped_model, name)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self._wrapped_model(*args, **kwargs)
+
+    def unwrap(self) -> nn.Module:
+        return self._wrapped_model
 
 
 # =============================================================================
@@ -549,31 +570,268 @@ def _resolve_layers(model: Any) -> list[Any]:
     raise ValueError(f"Cannot find layers in model {type(model).__name__}")
 
 
+def _cleanup_stale_shared_memory(state: _SteeringState, stop_event: threading.Event) -> None:
+    """Background thread that periodically cleans up stale shared memory segments.
+
+    Parameters
+    ----------
+    state : _SteeringState
+        Worker steering state containing active_shared_memory dict.
+    stop_event : threading.Event
+        Event to signal thread shutdown.
+    """
+    ttl_seconds = state.shm_ttl_seconds
+    scan_interval = 60  # Scan every 60 seconds
+
+    logger.info(f"Starting shared memory cleanup thread (TTL: {ttl_seconds}s, scan: {scan_interval}s)")
+
+    while not stop_event.wait(scan_interval):
+        # Snapshot current shared memory state with lock
+        with state.shm_lock:
+            if not state.active_shared_memory:
+                continue
+            active_items = list(state.active_shared_memory.items())
+
+        now = time.time()
+        stale_names = []
+
+        # Find stale segments (outside lock)
+        for shm_name, (shm, timestamp) in active_items:
+            age = now - timestamp
+            if age > ttl_seconds:
+                stale_names.append(shm_name)
+
+        # Clean up stale segments
+        for shm_name in stale_names:
+            # Pop from dict with lock held
+            with state.shm_lock:
+                if shm_name not in state.active_shared_memory:
+                    continue  # Already cleaned up
+                shm, timestamp = state.active_shared_memory.pop(shm_name)
+
+            # Close and unlink outside lock
+            try:
+                age = now - timestamp
+                shm.close()
+                shm.unlink()
+                logger.warning(
+                    f"TTL expired: {shm_name} (age: {age:.1f}s, "
+                    f"size: {shm.size / (1024**2):.2f}MB)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to cleanup stale shared memory {shm_name}: {e}")
+
+    logger.info("Shared memory cleanup thread stopped")
+
+
+def _patch_model_runner(worker: Any, state: _SteeringState) -> None:
+    """Patch GPUModelRunner.execute_model to capture per-step batch metadata."""
+    if not _CAPTURE_METADATA_ENABLED:
+        logger.info("STEERLLM_CAPTURE_METADATA=0; skipping model runner patch.")
+        return
+
+    model_runner = worker.model_runner
+    logger.info(
+        f"_patch_model_runner: model_runner type={type(model_runner).__name__}, "
+        f"has execute_model={hasattr(model_runner, 'execute_model')}"
+    )
+
+    if not hasattr(model_runner, "execute_model"):
+        logger.error(
+            f"model_runner does not have execute_model method! "
+            f"Available methods: {[m for m in dir(model_runner) if not m.startswith('_')][:20]}"
+        )
+        return
+
+    original_execute = getattr(model_runner, "_original_execute_model", None)
+    if original_execute is not None:
+        # Already patched
+        logger.info("Model runner already patched, skipping")
+        return
+
+    original_execute = model_runner.execute_model
+    logger.info(
+        f"Patching model_runner.execute_model: original={original_execute}, "
+        f"model_runner type={type(model_runner).__name__}"
+    )
+
+    def patched_execute_model(model_input: Any, *args: Any, **kwargs: Any) -> Any:
+        """Intercept execute_model to capture batch metadata."""
+        if not state.active_capture_requests and not state.request_steering_specs:
+            return original_execute(model_input, *args, **kwargs)
+
+        # Extract request IDs and sequence lengths from model_input
+        try:
+            request_ids = None
+            seq_lens = None
+
+            # V1 engine: model_input is SchedulerOutput
+            # IMPORTANT: vLLM V1 orders the hidden state tensor as [CACHED, NEW]
+            if hasattr(model_input, "scheduled_new_reqs") and hasattr(model_input, "scheduled_cached_reqs"):
+                request_ids = []
+                seq_lens = []
+
+                # Process CACHED requests FIRST (they appear first in the tensor)
+                cached_reqs_val = model_input.scheduled_cached_reqs
+                if cached_reqs_val and hasattr(cached_reqs_val, "req_ids"):
+                    cached = cached_reqs_val
+                    if cached.num_reqs > 0 and cached.req_ids:
+                        request_ids.extend(cached.req_ids)
+                        seq_lens.extend([1] * len(cached.req_ids))
+
+                # Process NEW requests SECOND (they appear after cached in the tensor)
+                new_reqs_val = model_input.scheduled_new_reqs
+                if new_reqs_val:
+                    new_reqs = new_reqs_val
+                    if not isinstance(new_reqs, list):
+                        new_reqs = [new_reqs]
+
+                    for req in new_reqs:
+                        if hasattr(req, "req_id"):
+                            request_ids.append(req.req_id)
+                        if hasattr(req, "prompt_token_ids"):
+                            seq_lens.append(len(req.prompt_token_ids))
+
+            if request_ids:
+                # Store metadata for this step
+                current_step = state.global_step
+                state.step_metadata[current_step] = {
+                    "request_ids": request_ids,
+                    "seq_lens": seq_lens,
+                    "step": current_step,
+                }
+                state.global_step += 1
+
+                # Clean up old metadata (keep last 1000 steps)
+                if len(state.step_metadata) > 1000:
+                    old_steps = sorted(state.step_metadata.keys())[:-1000]
+                    for step in old_steps:
+                        state.step_metadata.pop(step, None)
+
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            logger.warning(
+                f"Failed to extract metadata from model_input: {type(e).__name__}: {e}",
+                exc_info=True
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in metadata extraction: {type(e).__name__}: {e}",
+                exc_info=True
+            )
+            raise
+
+        # Call original execute_model
+        return original_execute(model_input, *args, **kwargs)
+
+    model_runner.execute_model = patched_execute_model
+    model_runner._original_execute_model = original_execute
+
+
 def initialize_worker_state(
-    model: nn.Module,
-    hidden_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
+    worker: Any,
+    layer_indices: Sequence[int] | None = None,
     shm_ttl_seconds: int = 600,
     shm_max_gb: float = 128.0,
-) -> _SteeringState:
-    """Initialize steering state for a worker and attach to layers."""
+    decode_buffer_size: int = 128,
+) -> dict[str, Any]:
+    """Install steering patch on worker after model load.
+
+    This is called via RPC on each worker to initialize steering infrastructure.
+
+    Parameters
+    ----------
+    worker :
+        vLLM worker instance with model_runner attribute.
+    layer_indices :
+        Optional list of layer indices to initialize (unused, for compatibility).
+    shm_ttl_seconds :
+        TTL for shared memory segments in seconds.
+    shm_max_gb :
+        Maximum shared memory usage in GB.
+    decode_buffer_size :
+        Buffer size for decode token batching.
+
+    Returns
+    -------
+    dict[str, Any]
+        Metadata about the initialized worker state.
+    """
+    ensure_layer_patch_installed()
+    model = worker.model_runner.model
+    layers = _resolve_layers(model)
+
+    # Handle multimodal models where config is nested
+    config = model.config
+    if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
+        hidden_size = config.text_config.hidden_size
+    elif hasattr(config, "hidden_size"):
+        hidden_size = config.hidden_size
+    else:
+        raise RuntimeError(f"Could not resolve hidden_size from config of type {type(config)}")
+
+    first_param = next(model.parameters(), None)
+    if first_param is None:
+        raise RuntimeError("Model has no parameters to infer device/dtype.")
+    device = first_param.device
+    dtype = first_param.dtype
+
     state = _SteeringState(
-        hidden_size=hidden_size,
+        hidden_size=int(hidden_size),
         dtype=dtype,
         device=device,
         shm_ttl_seconds=shm_ttl_seconds,
         shm_max_gb=shm_max_gb,
+        decode_buffer_size=decode_buffer_size,
     )
 
-    # Attach state to all layers
-    layers = _resolve_layers(model)
-    for idx, layer in enumerate(layers):
-        layer._steerllm_state = state
-        layer._steerllm_layer_index = idx
+    # Create CUDA stream for async transfers if available
+    if device.type == "cuda":
+        state.transfer_stream = torch.cuda.Stream(device=device)
 
+    worker._steerllm_steering = state
     set_worker_state(state)
-    return state
+
+    # Start shared memory cleanup thread
+    stop_event = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=_cleanup_stale_shared_memory,
+        args=(state, stop_event),
+        daemon=True,
+        name="steerllm-shm-cleanup",
+    )
+    cleanup_thread.start()
+    state.shm_cleanup_thread = (cleanup_thread, stop_event)
+
+    # Register atexit handler to stop thread on shutdown
+    def _stop_cleanup_thread():
+        if state.shm_cleanup_thread:
+            thread, event = state.shm_cleanup_thread
+            event.set()
+            thread.join(timeout=5.0)
+            logger.info("Shared memory cleanup thread stopped (atexit)")
+
+    atexit.register(_stop_cleanup_thread)
+    logger.info("Started shared memory cleanup thread")
+
+    # Patch model runner to capture batch metadata
+    _patch_model_runner(worker, state)
+
+    # Wrap model if not already wrapped
+    if not isinstance(worker.model_runner.model, _SteeredModelWrapper):
+        worker.model_runner.model = _SteeredModelWrapper(model, state)
+
+    # Attach state and layer indices to all layers
+    layers = _resolve_layers(worker.model_runner.model)
+    for layer_idx, layer in enumerate(layers):
+        setattr(layer, "_steerllm_state", state)
+        setattr(layer, "_steerllm_layer_index", layer_idx)
+
+    return {
+        "hidden_size": hidden_size,
+        "layer_count": len(layers),
+        "dtype": str(dtype),
+        "device": str(device),
+    }
 
 
 # =============================================================================
@@ -843,3 +1101,11 @@ def _rpc_set_step_metadata(
 
 
 _register_rpc("set_step_metadata", _rpc_set_step_metadata)
+
+
+# Register initialize_worker_state as an RPC handler
+_register_rpc("initialize_worker_state", initialize_worker_state)
+
+
+# Install RPC gateway at module load time
+ensure_collective_rpc_gateway_installed()
