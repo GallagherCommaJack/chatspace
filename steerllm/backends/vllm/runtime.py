@@ -27,6 +27,44 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Tensor Serialization
+# =============================================================================
+
+def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
+    """Serialize tensor for RPC transport."""
+    arr = tensor.detach().cpu().contiguous()
+    dtype_name = str(arr.dtype).removeprefix("torch.")
+
+    if arr.numel() == 0:
+        buffer = b""
+    else:
+        try:
+            buffer = arr.numpy().tobytes()
+        except TypeError:
+            # Some dtypes (like bfloat16) need conversion
+            arr = arr.to(dtype=torch.float32)
+            dtype_name = str(arr.dtype).removeprefix("torch.")
+            buffer = arr.numpy().tobytes()
+
+    return {
+        "dtype": dtype_name,
+        "shape": list(arr.shape),
+        "data": buffer,
+    }
+
+
+def deserialize_tensor(data: dict[str, Any]) -> torch.Tensor:
+    """Deserialize tensor from RPC transport."""
+    dtype_name = data["dtype"]
+    shape = data["shape"]
+    buffer = data["data"]
+
+    dtype = getattr(torch, dtype_name)
+    arr = np.frombuffer(buffer, dtype=np.dtype(str(dtype).replace("torch.", "")))
+    return torch.from_numpy(arr.copy()).reshape(shape).to(dtype=dtype)
+
+
 def _get_env_int(name: str, default: int) -> int:
     """Parse integer environment variable safely."""
     try:
