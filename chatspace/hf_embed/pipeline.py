@@ -182,10 +182,7 @@ def _encoder_worker(
         # Load model inside the encoder process
         logging.info("Encoder process: loading model %s", cfg.model_name)
         model = _load_model(cfg)
-        try:
-            model.max_seq_length = cfg.bucket_max_tokens
-        except Exception:
-            logging.debug("Unable to set model.max_seq_length explicitly; using model default.")
+        model.max_seq_length = cfg.bucket_max_tokens
 
         model_runner = _ModelRunner(model, cfg.compile_model, cfg.compile_mode)
 
@@ -214,7 +211,7 @@ def _encoder_worker(
 
             text_value = str(item.get(cfg.text_field, ""))
             if not text_value:
-                # Send skipped row update
+                logging.warning("Skipping row with empty or missing text_field '%s'", cfg.text_field)
                 _send_stats_update(stats_queue, rows_skipped=1)
                 continue
 
@@ -428,11 +425,7 @@ def run_sentence_transformer(cfg: SentenceTransformerConfig) -> dict[str, Any]:
             pass
 
     # Retrieve shard metadata from writer process
-    try:
-        shards = shard_metadata_queue.get(timeout=5.0)
-    except Exception:
-        logging.warning("Failed to retrieve shard metadata from writer, using empty list")
-        shards = []
+    shards = shard_metadata_queue.get(timeout=5.0)
 
     duration = time.time() - start_time
 

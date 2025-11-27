@@ -268,12 +268,12 @@ async def test_tp_ablation_matches_single_gpu():
     # Build steering spec with normalized direction
     dir_unit = direction / direction.norm()
     steering_spec_single = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            ablation=AblationSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AblationSpec(
                 vector=dir_unit,
                 scale=scale,
             )
-        )
+        ])
     })
     ablated_single = await _get_final_output(
         model_single, prompt, sampling, steering_spec=steering_spec_single

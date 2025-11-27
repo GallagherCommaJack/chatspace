@@ -42,6 +42,8 @@ def test_fetch_batch_captures_records_profiler_summary(monkeypatch):
         active_capture_requests={"req": set()},
         request_captures={"req": {0: torch.randn(2, 4)}},
         request_prefill_buffers={"req": {}},
+        request_decode_buffers={"req": {}},
+        request_pending_transfers={"req": {}},
         request_last_phase={"req": "decode"},
         request_token_counts={"req": 2},
         step_metadata={},

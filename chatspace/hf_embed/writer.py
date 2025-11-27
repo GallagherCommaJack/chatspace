@@ -112,9 +112,13 @@ class _ShardWriter:
         file_size = shard_path.stat().st_size
         checksum = _compute_sha256(shard_path)
 
-        shard_min_norm = min(shard_norms) if shard_norms else None
-        shard_max_norm = max(shard_norms) if shard_norms else None
-        embedding_dim = len(shard_rows[0]["embedding"]) if shard_rows and shard_rows[0].get("embedding") is not None else None
+        if not shard_norms:
+            raise ValueError("Cannot write shard with empty norms list")
+        if not shard_rows or shard_rows[0].get("embedding") is None:
+            raise ValueError("Cannot write shard with missing embeddings")
+        shard_min_norm = min(shard_norms)
+        shard_max_norm = max(shard_norms)
+        embedding_dim = len(shard_rows[0]["embedding"])
 
         self._shards.append(
             {
@@ -123,8 +127,8 @@ class _ShardWriter:
                 "bytes": file_size,
                 "sha256": checksum,
                 "embedding_dim": embedding_dim,
-                "min_norm": float(shard_min_norm) if shard_min_norm is not None else None,
-                "max_norm": float(shard_max_norm) if shard_max_norm is not None else None,
+                "min_norm": float(shard_min_norm),
+                "max_norm": float(shard_max_norm),
                 "created_at": shard_created_at,
                 "shard_index": self._shard_index,
                 "tool": {

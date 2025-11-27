@@ -395,9 +395,9 @@ async def test_rpc_exception_propagation(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
+            ])
         }
     )
 

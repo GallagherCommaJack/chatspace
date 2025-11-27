@@ -107,24 +107,24 @@ def test_extract_from_object_with_attribute(sample_hidden):
 
 
 def test_extract_from_empty_tuple():
-    """Test extraction from empty tuple returns None."""
+    """Test extraction from empty tuple raises TypeError."""
     output = ()
-    result = runtime._extract_hidden_from_output(output)
-    assert result is None
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_extract_from_empty_list():
-    """Test extraction from empty list returns None."""
+    """Test extraction from empty list raises TypeError."""
     output = []
-    result = runtime._extract_hidden_from_output(output)
-    assert result is None
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_extract_from_tuple_with_non_tensor():
-    """Test extraction from tuple with non-tensor elements."""
+    """Test extraction from tuple with non-tensor elements raises TypeError."""
     output = ("not a tensor", "also not a tensor")
-    result = runtime._extract_hidden_from_output(output)
-    assert result is None
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_extract_from_tuple_mixed_types(sample_hidden):
@@ -137,35 +137,35 @@ def test_extract_from_tuple_mixed_types(sample_hidden):
 
 
 def test_extract_from_dict_without_key():
-    """Test extraction from dict without 'last_hidden_state' key returns None."""
+    """Test extraction from dict without 'last_hidden_state' key raises TypeError."""
     output = {"other_key": torch.randn(4, 8, 512)}
-    result = runtime._extract_hidden_from_output(output)
-    assert result is None
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_extract_from_object_without_attribute():
-    """Test extraction from object without last_hidden_state attribute returns None."""
+    """Test extraction from object without last_hidden_state attribute raises TypeError."""
     output = type("MockBadOutput", (), {})()
-    result = runtime._extract_hidden_from_output(output)
-    assert result is None
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_extract_from_none():
-    """Test extraction from None returns None."""
-    result = runtime._extract_hidden_from_output(None)
-    assert result is None
+    """Test extraction from None raises TypeError."""
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(None)
 
 
 def test_extract_from_scalar():
-    """Test extraction from scalar value returns None."""
-    result = runtime._extract_hidden_from_output(42)
-    assert result is None
+    """Test extraction from scalar value raises TypeError."""
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(42)
 
 
 def test_extract_from_string():
-    """Test extraction from string returns None."""
-    result = runtime._extract_hidden_from_output("not a valid output")
-    assert result is None
+    """Test extraction from string raises TypeError."""
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output("not a valid output")
 
 
 def test_is_qwen_layer_output_positive(qwen_output):
@@ -223,12 +223,12 @@ def test_extract_from_dict_with_non_tensor_value():
 
 
 def test_extract_from_object_with_non_tensor_attribute():
-    """Test extraction from object where last_hidden_state is not a tensor."""
+    """Test extraction from object where last_hidden_state is not a tensor raises TypeError."""
     output = MockOutput("not a tensor")
-    result = runtime._extract_hidden_from_output(output)
 
-    # The code checks isinstance(hidden, torch.Tensor) so should return None
-    assert result is None
+    # The code checks isinstance(hidden, torch.Tensor) so should raise TypeError
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)
 
 
 def test_reconstruct_output_with_hidden_tensor():
@@ -429,17 +429,13 @@ def test_extract_with_mismatched_tensor_shapes():
 
 
 def test_extract_from_nested_tuple():
-    """Test extraction from nested tuple structure.
+    """Test extraction from nested tuple structure raises TypeError.
 
-    Should handle nested structures by taking first element recursively.
+    The code doesn't recursively descend into nested tuples.
     """
     inner_hidden = torch.randn(4, 8, 512)
     output = ((inner_hidden, "extra"),)
 
-    result = runtime._extract_hidden_from_output(output)
-
-    # Should extract the nested tuple and then first element of that
-    # Actually, looking at the code, it will extract output[0] which is a tuple
-    # Then check if it's a tensor (it's not), so will return None
-    # The code doesn't recursively descend
-    assert result is None
+    # output[0] is a tuple, not a tensor, so raises TypeError
+    with pytest.raises(TypeError):
+        runtime._extract_hidden_from_output(output)

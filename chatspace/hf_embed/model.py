@@ -90,9 +90,12 @@ class _ModelRunner:
         self._compiled_forward: Optional[Any] = None
         self._compiled_cache: dict[int, Any] = {}
 
-        pad_token_id = getattr(getattr(model, "tokenizer", None), "pad_token_id", 0)
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError(f"Model {model} does not have a tokenizer attribute")
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
         if pad_token_id is None:
-            pad_token_id = 0
+            raise ValueError(f"Tokenizer {tokenizer} does not have a pad_token_id")
         self.pad_values: dict[str, int] = {
             "input_ids": pad_token_id,
             "attention_mask": 0,
@@ -100,19 +103,13 @@ class _ModelRunner:
         }
 
         if self.compile_enabled and not hasattr(torch, "compile"):
-            logging.warning("torch.compile requested but not available in this PyTorch build; disabling compilation.")
-            self.compile_enabled = False
+            raise RuntimeError("torch.compile requested but not available in this PyTorch build")
 
         if self.compile_enabled:
-            try:
-                def forward_fn(features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-                    return model.forward(features)
+            def forward_fn(features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+                return model.forward(features)
 
-                self._compiled_forward = torch.compile(forward_fn, mode=self.compile_mode)
-            except Exception:
-                logging.warning("torch.compile failed; continuing without compilation", exc_info=True)
-                self.compile_enabled = False
-                self._compiled_forward = None
+            self._compiled_forward = torch.compile(forward_fn, mode=self.compile_mode)
 
         self.model.eval()
 

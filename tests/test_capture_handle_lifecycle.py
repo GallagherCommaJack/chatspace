@@ -476,10 +476,10 @@ async def test_multiple_handles_independent_lifecycle(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_no_shared_memory_no_cleanup_rpc(model_factory):
-    """Test that closing handle without shared memory doesn't call cleanup RPC.
+async def test_shared_memory_cleanup_rpc_called(model_factory):
+    """Test that closing handle with shared memory triggers cleanup RPC.
 
-    This verifies optimization where bytes encoding doesn't trigger RPC.
+    Shared memory is always used for activation captures.
     """
     model = await model_factory()
 
@@ -495,8 +495,8 @@ async def test_no_shared_memory_no_cleanup_rpc(model_factory):
     handle = handles[0]
     await model.fetch_captures_batch([handle])
 
-    # Should not have shared memory
-    assert len(handle._shm_names) == 0
+    # Shared memory is always used
+    assert len(handle._shm_names) > 0
 
     # Mock RPC to track calls
     rpc_calls = []
@@ -509,5 +509,5 @@ async def test_no_shared_memory_no_cleanup_rpc(model_factory):
     with patch.object(model, "_collective_rpc", tracking_rpc):
         await handle.close()
 
-    # Should not have called release_shared_memory RPC
-    assert "release_shared_memory" not in rpc_calls
+    # Should have called release_shared_memory RPC
+    assert "release_shared_memory" in rpc_calls

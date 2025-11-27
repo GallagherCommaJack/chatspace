@@ -27,9 +27,12 @@ def _extract_first_assistant_response(conversation: list[dict[str, Any]]) -> Opt
 
     Returns:
         The content of the first assistant response, or None if not found
+
+    Raises:
+        TypeError: If conversation is not a list
     """
     if not isinstance(conversation, list):
-        return None
+        raise TypeError(f"Expected conversation to be a list, got {type(conversation).__name__}")
 
     for turn in conversation:
         if not isinstance(turn, dict):

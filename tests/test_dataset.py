@@ -70,8 +70,15 @@ def test_extract_first_assistant_response_empty_content():
 
 def test_extract_first_assistant_response_invalid_input():
     """Test with invalid input types."""
-    assert _extract_first_assistant_response(None) is None
-    assert _extract_first_assistant_response("not a list") is None
+    import pytest
+
+    # Non-list inputs raise TypeError
+    with pytest.raises(TypeError):
+        _extract_first_assistant_response(None)
+    with pytest.raises(TypeError):
+        _extract_first_assistant_response("not a list")
+
+    # Valid list inputs return None when no assistant response found
     assert _extract_first_assistant_response([]) is None
     assert _extract_first_assistant_response([{"invalid": "structure"}]) is None
 

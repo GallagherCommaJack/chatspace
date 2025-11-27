@@ -441,7 +441,7 @@ def _extract_hidden_from_output(output: Any) -> torch.Tensor | None:
         hidden = output.last_hidden_state
         if isinstance(hidden, torch.Tensor):
             return hidden
-    return None
+    raise TypeError(f"Cannot extract hidden state from output of type {type(output).__name__}")
 
 
 def _is_qwen_layer_output(output: Any) -> bool:
@@ -1013,11 +1013,7 @@ def ensure_layer_patch_installed() -> None:
         layer_cls = getattr(module, class_name, None)
         if layer_cls is None:
             continue
-        try:
-            _patch_decoder_layer_class(layer_cls)
-        except Exception as e:
-            logger.warning(f"Failed to patch {class_name}: {e}")
-            continue
+        _patch_decoder_layer_class(layer_cls)
     _PATCH_INSTALLED = True
 
 
@@ -1583,14 +1579,6 @@ def register_capture_request(
         return
     state = _ensure_state(worker)
 
-    # Ensure decode buffers dict exists (migration from older state)
-    if not hasattr(state, 'request_decode_buffers') or state.request_decode_buffers is None:
-        state.request_decode_buffers = {}
-
-    # Ensure pending transfers dict exists (migration from older state)
-    if not hasattr(state, 'request_pending_transfers') or state.request_pending_transfers is None:
-        state.request_pending_transfers = {}
-
     logger.debug(f"register_capture_request: request_id={request_id}, layer_indices={layer_indices}")
     state.active_capture_requests[request_id] = set(layer_indices)
     state.request_captures[request_id] = {}
@@ -1674,11 +1662,9 @@ def register_steering_spec(
 def unregister_steering_spec(worker: Any, request_id: str) -> None:
     """Unregister a per-request steering spec from the worker."""
     state = _ensure_state(worker)
-    spec = state.request_steering_specs.pop(request_id, None)
-    if spec is None:
-        logger.warning(f"unregister_steering_spec called for unknown request_id={request_id}")
-    else:
-        logger.debug(f"unregister_steering_spec: request_id={request_id}")
+    # Raise if request_id doesn't exist - indicates bug in caller's request tracking
+    state.request_steering_specs.pop(request_id)
+    logger.debug(f"unregister_steering_spec: request_id={request_id}")
 
 
 def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
@@ -1700,8 +1686,7 @@ def fetch_request_activations(worker: Any, request_id: str) -> dict[int, Any]:
     # Cleanup
     state.active_capture_requests.pop(request_id, None)
     state.request_prefill_buffers.pop(request_id, None)
-    if state.request_decode_buffers is not None:
-        state.request_decode_buffers.pop(request_id, None)
+    state.request_decode_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
 
@@ -1753,7 +1738,7 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             # CUDA path: use async transfers
             for req_id in request_ids:
                 # First check for pre-transferred data from Phase 2 streaming
-                pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
+                pending = state.request_pending_transfers.get(req_id, {})
 
                 # Get current captures (may include data not yet transferred)
                 captures = state.request_captures.get(req_id, {})
@@ -1779,7 +1764,7 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
         else:
             # Non-CUDA path: synchronous transfers
             for req_id in request_ids:
-                pending = state.request_pending_transfers.get(req_id, {}) if state.request_pending_transfers else {}
+                pending = state.request_pending_transfers.get(req_id, {})
                 captures = state.request_captures.get(req_id, {})
 
                 for layer_idx, tensor in captures.items():
@@ -1818,10 +1803,8 @@ def fetch_batch_captures(worker: Any, request_ids: list[str]) -> dict[str, dict[
             state.request_prefill_buffers.pop(req_id, None)
             state.request_last_phase.pop(req_id, None)
             state.request_token_counts.pop(req_id, None)
-            if state.request_decode_buffers is not None:
-                state.request_decode_buffers.pop(req_id, None)
-            if state.request_pending_transfers is not None:
-                state.request_pending_transfers.pop(req_id, None)
+            state.request_decode_buffers.pop(req_id, None)
+            state.request_pending_transfers.pop(req_id, None)
 
             result[req_id] = serialized
 
@@ -1865,12 +1848,10 @@ def unregister_capture_request(worker: Any, request_id: str) -> None:
     state.request_captures.pop(request_id, None)
     state.active_capture_requests.pop(request_id, None)
     state.request_prefill_buffers.pop(request_id, None)
-    if state.request_decode_buffers is not None:
-        state.request_decode_buffers.pop(request_id, None)
+    state.request_decode_buffers.pop(request_id, None)
     state.request_last_phase.pop(request_id, None)
     state.request_token_counts.pop(request_id, None)
-    if state.request_pending_transfers is not None:
-        state.request_pending_transfers.pop(request_id, None)
+    state.request_pending_transfers.pop(request_id, None)
 
 
 def fetch_last_profile(worker: Any) -> dict[str, Any]:
