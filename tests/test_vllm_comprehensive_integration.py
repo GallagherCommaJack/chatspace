@@ -168,28 +168,28 @@ async def test_comprehensive_vllm_integration():
     # Layer 2: Additive + Projection Cap
     # Layer 5: Ablation + Projection Cap
     steering_spec = SteeringSpec(layers={
-        layer_2_config["layer"]: LayerSteeringSpec(
-            add=AddSpec(
+        layer_2_config["layer"]: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(layer_2_config["add_vector"]),
                 scale=float(torch.norm(layer_2_config["add_vector"]).item()),
             ),
-            projection_cap=ProjectionCapSpec(
+            ProjectionCapSpec(
                 vector=_normalize(layer_2_config["cap_vector"]),
                 min=layer_2_config["cap_min"],
                 max=layer_2_config["cap_max"],
             ),
-        ),
-        layer_5_config["layer"]: LayerSteeringSpec(
-            ablation=AblationSpec(
+        ]),
+        layer_5_config["layer"]: LayerSteeringSpec(operations=[
+            AblationSpec(
                 vector=_normalize(layer_5_config["ablation_vector"]),
                 scale=layer_5_config["ablation_scale"],
             ),
-            projection_cap=ProjectionCapSpec(
+            ProjectionCapSpec(
                 vector=_normalize(layer_5_config["cap_vector"]),
                 min=layer_5_config["cap_min"],
                 max=layer_5_config["cap_max"],
             ),
-        ),
+        ]),
     })
 
     # Generate with steering and capture
@@ -618,9 +618,9 @@ async def test_vllm_heterogeneous_batch_steering():
         heavy_unit = heavy_vector / heavy_norm
 
         heavy_steering = SteeringSpec(layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=heavy_unit, scale=heavy_norm)
-            )
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=heavy_unit, scale=heavy_norm)
+            ])
         })
 
         # Config 2: Moderate additive steering
@@ -629,9 +629,9 @@ async def test_vllm_heterogeneous_batch_steering():
         moderate_unit = moderate_vector / moderate_norm
 
         moderate_steering = SteeringSpec(layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=moderate_unit, scale=moderate_norm)
-            )
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=moderate_unit, scale=moderate_norm)
+            ])
         })
 
         # Config 3: No steering (baseline)

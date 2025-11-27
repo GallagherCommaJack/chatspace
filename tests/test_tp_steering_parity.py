@@ -90,9 +90,9 @@ async def test_tp_additive_steering_matches_single_gpu():
     vec_unit = steering_vec / steering_vec.norm()
     vec_scale = steering_vec.norm().item()
     steering_spec_single = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=vec_unit, scale=vec_scale)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=vec_unit, scale=vec_scale)
+        ])
     })
     steered_single = await _get_final_output(
         model_single, prompt, sampling, steering_spec=steering_spec_single
@@ -185,13 +185,13 @@ async def test_tp_projection_cap_matches_single_gpu():
     # Build steering spec with normalized direction
     dir_unit = direction / direction.norm()
     steering_spec_single = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            projection_cap=ProjectionCapSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            ProjectionCapSpec(
                 vector=dir_unit,
                 min=min_val,
                 max=max_val,
             )
-        )
+        ])
     })
     capped_single = await _get_final_output(
         model_single, prompt, sampling, steering_spec=steering_spec_single

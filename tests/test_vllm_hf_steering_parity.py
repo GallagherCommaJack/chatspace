@@ -188,31 +188,32 @@ async def test_vllm_hf_steering_combinations_match():
             # vLLM path
             # ------------------------------------------------------------------
             # Build steering spec for this case (only at target layer)
-            layer_spec = LayerSteeringSpec()
+            operations = []
 
             if case["vector"] is not None:
                 # Normalize vector: unit = vec / vec.norm(), scale = vec.norm()
                 norm = torch.norm(case["vector"]).item()
                 unit_vec = case["vector"] / torch.norm(case["vector"])
-                layer_spec.add = AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                operations.append(AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm))
 
             if case["cap"] is not None:
                 # Normalize cap vector
                 cap_unit = _normalize(case["cap"].vector).to(dtype=torch.float32)
-                layer_spec.projection_cap = ProjectionCapSpec(
+                operations.append(ProjectionCapSpec(
                     vector=cap_unit,
                     min=case["cap"].min,
                     max=case["cap"].max,
-                )
+                ))
 
             if case["ablation"] is not None:
                 # Normalize ablation vector
                 ablation_unit = _normalize(case["ablation"].vector).to(dtype=torch.float32)
-                layer_spec.ablation = AblationSpec(
+                operations.append(AblationSpec(
                     vector=ablation_unit,
                     scale=case["ablation"].scale,
-                )
+                ))
 
+            layer_spec = LayerSteeringSpec(operations=operations)
             steering_spec = SteeringSpec(layers={target_layer: layer_spec})
 
             texts, handles = await vllm_model.generate(
@@ -307,9 +308,9 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     unit_vec = steering_vector / torch.norm(steering_vector)
     steering_spec = SteeringSpec(
         layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-            )
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            ])
         }
     )
 
@@ -574,9 +575,9 @@ async def test_vllm_hf_high_magnitude_steering():
     unit_vec = steering_vector / torch.norm(steering_vector)
     steering_spec = SteeringSpec(
         layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-            )
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            ])
         }
     )
 
@@ -763,18 +764,18 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
 
     steering_spec = SteeringSpec(
         layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm),
-                projection_cap=ProjectionCapSpec(
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm),
+                ProjectionCapSpec(
                     vector=cap_unit,
                     min=projection_spec.min,
                     max=projection_spec.max,
                 ),
-                ablation=AblationSpec(
+                AblationSpec(
                     vector=ablation_unit,
                     scale=ablation_spec.scale,
                 ),
-            )
+            ])
         }
     )
 
@@ -946,9 +947,9 @@ async def test_vllm_hf_multi_magnitude_steering():
             unit_vec = steering_vector / torch.norm(steering_vector)
             steering_spec = SteeringSpec(
                 layers={
-                    target_layer: LayerSteeringSpec(
-                        add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-                    )
+                    target_layer: LayerSteeringSpec(operations=[
+                        AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                    ])
                 }
             )
 
@@ -1097,9 +1098,9 @@ async def test_vllm_hf_high_precision_steering():
     unit_vec = steering_vector / torch.norm(steering_vector)
     steering_spec = SteeringSpec(
         layers={
-            target_layer: LayerSteeringSpec(
-                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-            )
+            target_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            ])
         }
     )
 
@@ -1282,9 +1283,9 @@ async def test_delta_vs_residual_numerics():
                 unit_vec = steering_vector / torch.norm(steering_vector)
                 steering_spec = SteeringSpec(
                     layers={
-                        target_layer: LayerSteeringSpec(
-                            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-                        )
+                        target_layer: LayerSteeringSpec(operations=[
+                            AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                        ])
                     }
                 )
 
@@ -1485,9 +1486,9 @@ async def test_delta_vs_residual_instrumented():
             unit_vec = steering_vector / torch.norm(steering_vector)
             steering_spec = SteeringSpec(
                 layers={
-                    target_layer: LayerSteeringSpec(
-                        add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-                    )
+                    target_layer: LayerSteeringSpec(operations=[
+                        AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+                    ])
                 }
             )
 
@@ -1669,9 +1670,9 @@ async def test_vllm_hf_multi_layer_steering_float32():
     for layer_idx, vector in steering_vectors.items():
         norm = torch.norm(vector).item()
         unit_vec = vector / torch.norm(vector)
-        layers_dict[layer_idx] = LayerSteeringSpec(
-            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-        )
+        layers_dict[layer_idx] = LayerSteeringSpec(operations=[
+            AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+        ])
     steering_spec = SteeringSpec(layers=layers_dict)
 
     # Generate with capture on all layers we want to check
@@ -1820,9 +1821,9 @@ async def test_vllm_hf_multi_layer_steering_float32():
     for layer_idx, vector in every_layer_vectors.items():
         norm = torch.norm(vector).item()
         unit_vec = vector / torch.norm(vector)
-        every_layers_dict[layer_idx] = LayerSteeringSpec(
-            add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-        )
+        every_layers_dict[layer_idx] = LayerSteeringSpec(operations=[
+            AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+        ])
     every_steering_spec = SteeringSpec(layers=every_layers_dict)
 
     # Generate with capture on all layers
@@ -2066,9 +2067,9 @@ async def test_bf16_degradation_hf_vs_vllm():
         for layer_idx, vector in steering_vectors.items():
             norm = torch.norm(vector).item()
             unit_vec = vector / torch.norm(vector)
-            vllm_layers_dict[layer_idx] = LayerSteeringSpec(
-                add=AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
-            )
+            vllm_layers_dict[layer_idx] = LayerSteeringSpec(operations=[
+                AddSpec(vector=unit_vec.to(dtype=torch.float32), scale=norm)
+            ])
         vllm_steering_spec = SteeringSpec(layers=vllm_layers_dict)
 
         sampling = SamplingParams(temperature=0.0, max_tokens=1, logprobs=0)

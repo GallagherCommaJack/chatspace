@@ -146,7 +146,7 @@ def load_legacy_role_trait_config(path: str | Path) -> list[LegacyExperiment]:
                 raise ValueError(
                     f"Legacy experiment '{experiment_id}' defines multiple interventions for layer {layer_idx}"
                 )
-            layers[layer_idx] = LayerSteeringSpec(add=None, projection_cap=projection_cap)
+            layers[layer_idx] = LayerSteeringSpec(operations=[projection_cap])
 
         experiments.append(LegacyExperiment(id=experiment_id, spec=SteeringSpec(layers=layers)))
 

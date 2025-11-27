@@ -50,9 +50,9 @@ async def test_vllm_steering_vector_round_trip():
     unit_vector = vector / (vector.norm() + 1e-8)
 
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=unit_vector, scale=vector_norm)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=unit_vector, scale=vector_norm)
+        ])
     })
 
     # Generate with steering to verify it's applied per-request
@@ -69,11 +69,11 @@ async def test_vllm_steering_vector_round_trip():
     ablation_unit = ablation_vector / (ablation_vector.norm() + 1e-8)
 
     steering_spec_full = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=unit_vector, scale=vector_norm),
-            projection_cap=ProjectionCapSpec(vector=cap_unit, min=-0.5, max=0.75),
-            ablation=AblationSpec(vector=ablation_unit, scale=0.4),
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=unit_vector, scale=vector_norm),
+            ProjectionCapSpec(vector=cap_unit, min=-0.5, max=0.75),
+            AblationSpec(vector=ablation_unit, scale=0.4),
+        ])
     })
 
     # NOTE: inspect_layer_vector() and fetch_worker_state() were removed with global API
@@ -93,8 +93,8 @@ async def test_vllm_steering_vector_round_trip():
     extra_unit = extra_vector / (extra_vector.norm() + 1e-8)
 
     multi_layer_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(add=AddSpec(vector=unit_vector, scale=vector_norm)),
-        other_layer: LayerSteeringSpec(add=AddSpec(vector=extra_unit, scale=extra_norm)),
+        target_layer: LayerSteeringSpec(operations=[AddSpec(vector=unit_vector, scale=vector_norm)]),
+        other_layer: LayerSteeringSpec(operations=[AddSpec(vector=extra_unit, scale=extra_norm)]),
     })
 
     texts_multi = await model.generate([prompt], sampling_params=sampling, steering_spec=multi_layer_spec)
@@ -144,9 +144,9 @@ async def test_vllm_chat_respects_steering():
     random_unit = random_vector / (random_vector.norm() + 1e-8)
 
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=random_unit, scale=scale)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=random_unit, scale=scale)
+        ])
     })
 
     # Generate with steering
@@ -258,9 +258,9 @@ async def test_vllm_matches_hf_logprob_shift():
 
     # Build steering spec for vLLM
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=steering_unit, scale=steering_norm)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=steering_unit, scale=steering_norm)
+        ])
     })
 
     steered_out = (await vllm_model.generate([prompt], sampling_params=sampling, raw_output=True, steering_spec=steering_spec))[0].outputs[0]

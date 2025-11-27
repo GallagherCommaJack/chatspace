@@ -127,9 +127,9 @@ async def test_layer_index_out_of_range_high(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
         layers={
-            invalid_layer: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
-            )
+            invalid_layer: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
+            ])
         }
     )
 
@@ -154,9 +154,9 @@ async def test_layer_index_negative(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
         layers={
-            -5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
-            )
+            -5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
+            ])
         }
     )
 
@@ -291,9 +291,9 @@ async def test_wrong_dimension_steering_vector_raises(model_factory):
     with pytest.raises((ValueError, RuntimeError)) as exc_info:
         steering_spec = SteeringSpec(
             layers={
-                5: LayerSteeringSpec(
-                    add=AddSpec(vector=wrong_dim_vector / wrong_dim_vector.norm(), scale=1.0)
-                )
+                5: LayerSteeringSpec(operations=[
+                    AddSpec(vector=wrong_dim_vector / wrong_dim_vector.norm(), scale=1.0)
+                ])
             }
         )
 
@@ -336,9 +336,9 @@ async def test_all_layers_zero_scale_is_no_op(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     zero_scale_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=0.0)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=0.0)
+            ])
         }
     )
 
@@ -364,9 +364,9 @@ async def test_very_large_steering_scale(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     large_scale_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1e6)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1e6)
+            ])
         }
     )
 
@@ -392,9 +392,9 @@ async def test_very_small_steering_scale(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     small_scale_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1e-12)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1e-12)
+            ])
         }
     )
 

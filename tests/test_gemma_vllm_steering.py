@@ -64,9 +64,9 @@ async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
     scale = float(torch.norm(vector).item())
 
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=unit, scale=scale)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=unit, scale=scale)
+        ])
     })
 
     # Run generation with steering
@@ -81,25 +81,25 @@ async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
     # Test 2: Projection cap only
     cap_vector = torch.randn(hidden_size, dtype=torch.float32)
     steering_spec_cap = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            projection_cap=ProjectionCapSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            ProjectionCapSpec(
                 vector=_normalize(cap_vector),
                 min=-0.5,
                 max=0.75
             )
-        )
+        ])
     })
     await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_cap, use_tqdm=False)
 
     # Test 3: Ablation only
     ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
     steering_spec_ablation = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            ablation=AblationSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AblationSpec(
                 vector=_normalize(ablation_vector),
                 scale=0.4
             )
-        )
+        ])
     })
     await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_ablation, use_tqdm=False)
 
@@ -109,8 +109,8 @@ async def test_gemma_vllm_steering_vector_round_trip(model_name: str):
     vector_b = torch.randn(hidden_size, dtype=torch.float32)
 
     steering_spec_multi = SteeringSpec(layers={
-        layer_a: LayerSteeringSpec(add=AddSpec(vector=_normalize(vector_a), scale=float(torch.norm(vector_a).item()))),
-        layer_b: LayerSteeringSpec(add=AddSpec(vector=_normalize(vector_b), scale=float(torch.norm(vector_b).item()))),
+        layer_a: LayerSteeringSpec(operations=[AddSpec(vector=_normalize(vector_a), scale=float(torch.norm(vector_a).item()))]),
+        layer_b: LayerSteeringSpec(operations=[AddSpec(vector=_normalize(vector_b), scale=float(torch.norm(vector_b).item()))]),
     })
     await model.generate([prompt], sampling_params=sampling_params, steering_spec=steering_spec_multi, use_tqdm=False)
 
@@ -161,9 +161,9 @@ async def test_gemma_vllm_chat_respects_steering(model_name: str):
     scale = float(torch.norm(steering_vec).item())
 
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=unit, scale=scale)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=unit, scale=scale)
+        ])
     })
 
     # Steered generation
@@ -252,12 +252,12 @@ async def test_gemma_hidden_state_capture(model_name: str):
     # Also test with steering applied
     steering_vec = torch.randn(model.hidden_size, dtype=torch.float32)
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(steering_vec),
                 scale=float(torch.norm(steering_vec).item())
             )
-        )
+        ])
     })
     texts_steered, handles_steered = await model.generate(
         [prompt],
@@ -321,9 +321,9 @@ async def test_gemma_vllm_matches_hf_logprob_shift(model_name: str):
     scale = float(torch.norm(steering_vec).item())
 
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=unit, scale=scale)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=unit, scale=scale)
+        ])
     })
 
     vllm_steered = (await vllm_model.generate([prompt], sampling_params, steering_spec=steering_spec, raw_output=True, use_tqdm=False))[0]

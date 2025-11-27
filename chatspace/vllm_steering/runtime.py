@@ -792,7 +792,9 @@ def _apply_per_request_steering(
             req_id = request_ids[0]
             spec = state.request_steering_specs.get(req_id)
             if spec is not None and layer_idx in spec.layers:
-                return _apply_layer_steering_to_output(output, spec.layers[layer_idx], state)
+                layer_spec = spec.layers[layer_idx]
+                if layer_spec.operations:  # Non-empty operations list
+                    return _apply_layer_steering_to_output(output, layer_spec, state)
         return output
 
     # Slice hidden states per request
@@ -808,7 +810,8 @@ def _apply_per_request_steering(
         spec = state.request_steering_specs.get(req_id)
         if spec is not None and layer_idx in spec.layers:
             layer_spec = spec.layers[layer_idx]
-            req_hidden = _apply_layer_steering_to_hidden(req_hidden, layer_spec, state)
+            if layer_spec.operations:  # Non-empty operations list
+                req_hidden = _apply_layer_steering_to_hidden(req_hidden, layer_spec, state)
 
         request_slices.append(req_hidden)
         start_idx = end_idx
@@ -825,32 +828,46 @@ def _apply_layer_steering_to_hidden(
     layer_spec: Any,  # DeserializedLayerSpec from register_steering_spec
     state: _SteeringState,
 ) -> torch.Tensor:
-    """Apply steering operations (add, projection_cap, ablation) to a hidden state tensor."""
-    # Apply additive steering
-    if layer_spec.add is not None:
-        # layer_spec.add is already a tensor on the correct device/dtype
-        hidden = hidden + layer_spec.add
+    """Apply steering operations to a hidden state tensor.
 
-    # Apply projection cap
-    if layer_spec.projection_cap is not None:
-        # layer_spec.projection_cap is (cap_vector, min, max)
-        cap_vector, cap_min, cap_max = layer_spec.projection_cap
-        cap_config = _ProjectionCapConfig(
-            unit_vector=cap_vector,
-            min=cap_min,
-            max=cap_max,
-        )
-        hidden = _apply_projection_cap(hidden, cap_config)
+    Operations are applied in sequence order from layer_spec.operations.
+    Each operation is a tuple: (op_type, vector, params)
+    - "add": (vector, None)
+    - "cap": (vector, (min, max))
+    - "ablation": (vector, scale)
+    """
+    ops = layer_spec.operations
+    if not ops:
+        return hidden
 
-    # Apply ablation
-    if layer_spec.ablation is not None:
-        # layer_spec.ablation is (abl_vector, scale)
-        abl_vector, abl_scale = layer_spec.ablation
-        ablation_config = _AblationConfig(
-            unit_vector=abl_vector,
-            scale=abl_scale,
-        )
-        hidden = _apply_ablation(hidden, ablation_config)
+    # Fast path: single operation (most common case)
+    if len(ops) == 1:
+        op_type, vec, params = ops[0]
+        if op_type == "add":
+            return hidden + vec
+        elif op_type == "cap":
+            cap_min, cap_max = params
+            return _apply_projection_cap(
+                hidden, _ProjectionCapConfig(unit_vector=vec, min=cap_min, max=cap_max)
+            )
+        else:  # ablation
+            return _apply_ablation(
+                hidden, _AblationConfig(unit_vector=vec, scale=params)
+            )
+
+    # General path: multiple operations in sequence
+    for op_type, vec, params in ops:
+        if op_type == "add":
+            hidden = hidden + vec
+        elif op_type == "cap":
+            cap_min, cap_max = params
+            hidden = _apply_projection_cap(
+                hidden, _ProjectionCapConfig(unit_vector=vec, min=cap_min, max=cap_max)
+            )
+        else:  # ablation
+            hidden = _apply_ablation(
+                hidden, _AblationConfig(unit_vector=vec, scale=params)
+            )
 
     return hidden
 
@@ -942,8 +959,10 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
             for req_id in request_ids:
                 spec = state.request_steering_specs.get(req_id)
                 if spec is not None and layer_idx in spec.layers:
-                    has_per_request_steering = True
-                    break
+                    layer_spec = spec.layers[layer_idx]
+                    if layer_spec.operations:  # Non-empty operations list
+                        has_per_request_steering = True
+                        break
 
         # Extract hidden state once for both steering and capture
         # This avoids double extraction when both are active
@@ -1598,9 +1617,11 @@ def register_steering_spec(
         {
             "layers": {
                 layer_idx: {
-                    "add": {"vector": bytes},
-                    "projection_cap": {"vector": bytes, "min": float, "max": float},
-                    "ablation": {"vector": bytes, "scale": float}
+                    "operations": [
+                        {"type": "add", "vector": bytes},
+                        {"type": "cap", "vector": bytes, "min": float, "max": float},
+                        {"type": "ablation", "vector": bytes, "scale": float},
+                    ]
                 }
             }
         }
@@ -1609,15 +1630,17 @@ def register_steering_spec(
     logger.debug(f"register_steering_spec: request_id={request_id}")
 
     # Deserialize the steering spec
-    from dataclasses import dataclass
+    from dataclasses import dataclass, field
     from typing import Any as AnyType
 
     # Simple dataclass to hold deserialized layer specs
+    # operations: list of (op_type, vector, params) tuples
+    # - "add": (vector, None)
+    # - "cap": (vector, (min, max))
+    # - "ablation": (vector, scale)
     @dataclass
     class DeserializedLayerSpec:
-        add: torch.Tensor | None = None
-        projection_cap: tuple[torch.Tensor, float | None, float | None] | None = None
-        ablation: tuple[torch.Tensor, float] | None = None
+        operations: list[tuple[str, torch.Tensor, AnyType]] = field(default_factory=list)
 
     @dataclass
     class DeserializedSteeringSpec:
@@ -1626,28 +1649,21 @@ def register_steering_spec(
     deserialized_layers = {}
     for layer_idx_str, layer_data in serialized_spec["layers"].items():
         layer_idx = int(layer_idx_str)
-        layer_spec = DeserializedLayerSpec()
+        operations = []
 
-        if "add" in layer_data:
-            vector_bytes = layer_data["add"]["vector"]
-            vector = deserialize_tensor(vector_bytes, dtype=state.dtype, device=state.device)
-            layer_spec.add = vector
+        for op in layer_data.get("operations", []):
+            op_type = op["type"]
+            if op_type == "add":
+                vector = deserialize_tensor(op["vector"], dtype=state.dtype, device=state.device)
+                operations.append(("add", vector, None))
+            elif op_type == "cap":
+                vector = deserialize_tensor(op["vector"], dtype=torch.float32, device=state.device)
+                operations.append(("cap", vector, (op["min"], op["max"])))
+            elif op_type == "ablation":
+                vector = deserialize_tensor(op["vector"], dtype=torch.float32, device=state.device)
+                operations.append(("ablation", vector, op["scale"]))
 
-        if "projection_cap" in layer_data:
-            cap_data = layer_data["projection_cap"]
-            cap_vector = deserialize_tensor(
-                cap_data["vector"], dtype=torch.float32, device=state.device
-            )
-            layer_spec.projection_cap = (cap_vector, cap_data["min"], cap_data["max"])
-
-        if "ablation" in layer_data:
-            abl_data = layer_data["ablation"]
-            abl_vector = deserialize_tensor(
-                abl_data["vector"], dtype=torch.float32, device=state.device
-            )
-            layer_spec.ablation = (abl_vector, abl_data["scale"])
-
-        deserialized_layers[layer_idx] = layer_spec
+        deserialized_layers[layer_idx] = DeserializedLayerSpec(operations=operations)
 
     # Store the deserialized spec in the state
     state.request_steering_specs[request_id] = DeserializedSteeringSpec(

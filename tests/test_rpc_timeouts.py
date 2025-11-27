@@ -110,9 +110,9 @@ async def test_steering_registration_timeout(model_factory):
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
+            ])
         }
     )
 
@@ -284,9 +284,9 @@ async def test_unregister_steering_timeout_handling(model_factory, caplog):
     steering_vector = torch.randn(model.hidden_size)
     steering_spec = SteeringSpec(
         layers={
-            5: LayerSteeringSpec(
-                add=AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
-            )
+            5: LayerSteeringSpec(operations=[
+                AddSpec(vector=steering_vector / steering_vector.norm(), scale=1.0)
+            ])
         }
     )
 

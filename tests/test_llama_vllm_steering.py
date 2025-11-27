@@ -63,12 +63,12 @@ async def test_llama_vllm_steering_vector_round_trip(model_name: str):
     vector = torch.randn(hidden_size, dtype=torch.float32)
     vector_norm = float(torch.norm(vector).item())
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(vector),
                 scale=vector_norm,
             ),
-        ),
+        ]),
     })
 
     texts, handles = await model.generate(
@@ -83,13 +83,13 @@ async def test_llama_vllm_steering_vector_round_trip(model_name: str):
     cap_vector = torch.randn(hidden_size, dtype=torch.float32)
     cap_norm = float(torch.norm(cap_vector).item())
     steering_spec_cap = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            projection_cap=ProjectionCapSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            ProjectionCapSpec(
                 vector=_normalize(cap_vector),
                 min=-0.5,
                 max=0.75,
             ),
-        ),
+        ]),
     })
 
     texts_cap, handles_cap = await model.generate(
@@ -102,12 +102,12 @@ async def test_llama_vllm_steering_vector_round_trip(model_name: str):
     # Test 3: Ablation steering
     ablation_vector = torch.randn(hidden_size, dtype=torch.float32)
     steering_spec_abl = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            ablation=AblationSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AblationSpec(
                 vector=_normalize(ablation_vector),
                 scale=0.4,
             ),
-        ),
+        ]),
     })
 
     texts_abl, handles_abl = await model.generate(
@@ -119,17 +119,17 @@ async def test_llama_vllm_steering_vector_round_trip(model_name: str):
 
     # Test 4: Multi-method steering (add + projection cap)
     steering_spec_multi = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(vector),
                 scale=vector_norm,
             ),
-            projection_cap=ProjectionCapSpec(
+            ProjectionCapSpec(
                 vector=_normalize(cap_vector),
                 min=-0.3,
                 max=0.3,
             ),
-        ),
+        ]),
     })
 
     texts_multi, handles_multi = await model.generate(
@@ -192,12 +192,12 @@ async def test_llama_vllm_chat_respects_steering(model_name: str):
     scale = 5_000.0
     random_vector = torch.randn(model.hidden_size, dtype=torch.float32)
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(random_vector),
                 scale=scale,
             ),
-        ),
+        ]),
     })
 
     # Generate with steering
@@ -268,12 +268,12 @@ async def test_llama_hidden_state_capture(model_name: str):
     vector = torch.randn(model.hidden_size, dtype=torch.float32) * 0.5
     vector_norm = float(torch.norm(vector).item())
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(vector),
                 scale=vector_norm,
             ),
-        ),
+        ]),
     })
 
     prompt = "Once upon a time"
@@ -406,12 +406,12 @@ async def test_llama_vllm_matches_hf_logprob_shift(model_name: str):
     # Build steering spec with per-request API
     steering_vector_norm = float(torch.norm(steering_vector).item())
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(
                 vector=_normalize(steering_vector),
                 scale=steering_vector_norm,
             ),
-        ),
+        ]),
     })
 
     # Generation with steering
