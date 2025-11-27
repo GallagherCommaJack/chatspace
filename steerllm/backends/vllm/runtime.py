@@ -33,37 +33,160 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
-    """Serialize tensor for RPC transport."""
+    """Serialize tensor for RPC transport (client→worker).
+
+    Uses uint8 view for all dtypes - simpler single pipeline that works
+    uniformly for float32, float16, bfloat16, etc.
+    """
     arr = tensor.detach().cpu().contiguous()
     dtype_name = str(arr.dtype).removeprefix("torch.")
 
     if arr.numel() == 0:
         buffer = b""
     else:
-        try:
-            buffer = arr.numpy().tobytes()
-        except TypeError:
-            # Some dtypes (like bfloat16) need conversion
-            arr = arr.to(dtype=torch.float32)
-            dtype_name = str(arr.dtype).removeprefix("torch.")
-            buffer = arr.numpy().tobytes()
+        # uint8 view works for all dtypes uniformly
+        buffer = arr.view(torch.uint8).numpy().tobytes()
 
     return {
+        "encoding": "bytes",
         "dtype": dtype_name,
         "shape": list(arr.shape),
         "data": buffer,
     }
 
 
-def deserialize_tensor(data: dict[str, Any]) -> torch.Tensor:
-    """Deserialize tensor from RPC transport."""
-    dtype_name = data["dtype"]
-    shape = data["shape"]
-    buffer = data["data"]
+def deserialize_tensor(
+    payload: dict[str, Any],
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+    shm_objects_list: list[SharedMemory] | None = None,
+) -> torch.Tensor:
+    """Deserialize tensor from either bytes or shm encoding.
 
-    dtype = getattr(torch, dtype_name)
-    arr = np.frombuffer(buffer, dtype=np.dtype(str(dtype).replace("torch.", "")))
-    return torch.from_numpy(arr.copy()).reshape(shape).to(dtype=dtype)
+    Parameters
+    ----------
+    payload :
+        Serialized tensor data with encoding metadata.
+    device :
+        Target device for the tensor.
+    dtype :
+        Target dtype for the tensor (overrides payload dtype if specified).
+    shm_objects_list :
+        If provided and payload uses shared memory, the SharedMemory object
+        will be appended to this list to keep it alive.
+    """
+    encoding = payload.get("encoding", "bytes")  # Default for legacy
+    dtype_str = payload.get("dtype")
+    shape = payload.get("shape")
+
+    if dtype_str is None or shape is None:
+        raise TypeError(f"Missing required tensor metadata: dtype={dtype_str}, shape={shape}")
+
+    target_dtype = getattr(torch, dtype_str, None)
+    if target_dtype is None:
+        raise TypeError(f"Unsupported tensor dtype: {dtype_str}")
+    shape_tuple = tuple(int(dim) for dim in shape)
+
+    if encoding == "bytes":
+        data = payload.get("data")
+        if not isinstance(data, bytes):
+            raise TypeError(f"Expected bytes for encoding=bytes, got {type(data)}")
+        # Handle empty tensors (frombuffer fails on empty data)
+        if len(data) == 0:
+            tensor = torch.empty(shape_tuple, dtype=target_dtype)
+        else:
+            # All dtypes serialized via uint8 view - reinterpret to target dtype
+            tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+            tensor = tensor.view(target_dtype).reshape(shape_tuple).clone()
+
+    elif encoding == "shm":
+        shm_name = payload.get("shm_name")
+        nbytes = payload.get("nbytes")
+        if shm_name is None:
+            raise TypeError("Missing shm_name in shared memory payload")
+        if nbytes is None:
+            raise TypeError("Missing nbytes in shared memory payload")
+
+        # Open existing shared memory segment
+        shm = SharedMemory(name=shm_name, create=False)
+        if shm_objects_list is not None:
+            shm_objects_list.append(shm)
+
+        # Read as uint8 bytes, reinterpret to target dtype
+        np_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
+        tensor = torch.frombuffer(bytearray(np_array), dtype=torch.uint8)
+        tensor = tensor.view(target_dtype).reshape(shape_tuple).clone()
+
+    else:
+        raise TypeError(f"Unknown tensor encoding: {encoding}")
+
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype=dtype)
+    if device is not None:
+        tensor = tensor.to(device=device)
+    return tensor
+
+
+def _create_shared_tensor(
+    tensor: torch.Tensor,
+    state: _SteeringState,
+    stream: torch.cuda.Stream | None = None,
+) -> dict[str, Any]:
+    """Create shared memory segment for tensor with direct GPU→shm transfer.
+
+    Uses torch.from_numpy() on shm buffer and copy_() for direct DMA transfer,
+    eliminating intermediate CPU tensor allocation.
+
+    NOTE: Does NOT sync - caller must sync the stream after all copies are queued.
+
+    Parameters
+    ----------
+    tensor :
+        Tensor to share (can be on any device).
+    state :
+        Worker steering state for tracking active segments.
+    stream :
+        CUDA stream to use for async copy. If None and tensor is on GPU,
+        uses default stream (blocking).
+
+    Returns
+    -------
+    dict
+        Metadata dict with encoding="shm".
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    shm_name = f"steerllm_{uuid.uuid4().hex}"
+
+    # Create shared memory segment
+    shm = SharedMemory(create=True, size=nbytes, name=shm_name)
+
+    # Create shm-backed tensor via uint8 view (works for any dtype)
+    shm_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
+    shm_tensor = torch.from_numpy(shm_array)
+
+    # View source tensor as uint8 for dtype-agnostic transfer
+    byte_view = tensor.detach().contiguous().view(torch.uint8).flatten()
+
+    # Direct GPU→shm copy via DMA (or CPU→shm if already on CPU)
+    if tensor.device.type == "cuda" and stream is not None:
+        with torch.cuda.stream(stream):
+            shm_tensor.copy_(byte_view, non_blocking=True)
+    else:
+        shm_tensor.copy_(byte_view)
+
+    # Track in state with timestamp
+    with state.shm_lock:
+        state.active_shared_memory[shm_name] = (shm, time.time())
+
+    dtype_name = str(tensor.dtype).removeprefix("torch.")
+    return {
+        "encoding": "shm",
+        "shm_name": shm_name,
+        "shape": list(tensor.shape),
+        "dtype": dtype_name,
+        "nbytes": nbytes,
+    }
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -939,7 +1062,8 @@ def _rpc_register_steering_spec(
 
     spec_data is a dict with:
     - layers: dict[int, layer_spec]
-    - Each layer_spec has operations: list of (op_type, vector_bytes, dtype, params)
+    - Each layer_spec has operations: list of {type, vector, params}
+      where vector is a serialized tensor payload (encoding=bytes)
     """
     state = get_worker_state()
     if state is None:
@@ -952,14 +1076,15 @@ def _rpc_register_steering_spec(
         ops = []
         for op_data in layer_data.get("operations", []):
             op_type = op_data["type"]
-            vec_bytes = op_data["vector"]
-            dtype_str = op_data["dtype"]
+            vector_payload = op_data["vector"]
             params = op_data.get("params")
 
-            # Reconstruct tensor (uint8 view encoding for bfloat16 support)
-            dtype = getattr(torch, dtype_str.replace("torch.", ""))
-            vec = torch.frombuffer(bytearray(vec_bytes), dtype=torch.uint8).view(dtype).clone()
-            vec = vec.to(device=state.device, dtype=state.dtype)
+            # Use unified deserialize_tensor (handles bytes encoding)
+            vec = deserialize_tensor(
+                vector_payload,
+                device=state.device,
+                dtype=state.dtype,
+            )
 
             # Scale vector for additive steering
             if op_type == "add" and params is not None:
@@ -1008,7 +1133,11 @@ def _rpc_fetch_captures(
     worker: Any,
     request_id: str,
 ) -> dict[str, Any] | None:
-    """Fetch captures for a request, using shared memory for zero-copy."""
+    """Fetch captures using zero-copy shared memory with batch sync.
+
+    Uses _create_shared_tensor() with transfer_stream for direct GPU→shm DMA
+    transfer, syncing the stream once after all copies are queued.
+    """
     state = get_worker_state()
     if state is None:
         return None
@@ -1017,36 +1146,16 @@ def _rpc_fetch_captures(
     if captures is None:
         return None
 
+    # Queue all GPU→shm copies on transfer_stream (non-blocking)
     result = {}
     for layer_idx, tensor in captures.items():
-        # Create shared memory segment
-        shm_name = f"steerllm_{request_id}_{layer_idx}_{uuid.uuid4().hex[:8]}"
-        # Use uint8 view for bfloat16 support (numpy doesn't support bfloat16)
-        tensor_cpu = tensor.cpu().contiguous()
-        tensor_bytes = tensor_cpu.view(torch.uint8).numpy().tobytes()
+        result[str(layer_idx)] = _create_shared_tensor(
+            tensor, state, stream=state.transfer_stream
+        )
 
-        try:
-            shm = SharedMemory(name=shm_name, create=True, size=len(tensor_bytes))
-            shm.buf[:len(tensor_bytes)] = tensor_bytes
-
-            # Track for cleanup
-            with state.shm_lock:
-                state.active_shared_memory[shm_name] = (shm, time.time())
-
-            result[str(layer_idx)] = {
-                "shm_name": shm_name,
-                "shape": list(tensor_cpu.shape),
-                "dtype": str(tensor_cpu.dtype),
-                "nbytes": len(tensor_bytes),
-            }
-        except Exception as e:
-            logger.warning(f"Failed to create shared memory: {e}")
-            # Fall back to bytes
-            result[str(layer_idx)] = {
-                "data": tensor_bytes,
-                "shape": list(tensor_cpu.shape),
-                "dtype": str(tensor_cpu.dtype),
-            }
+    # Sync transfer_stream ONCE after all copies queued
+    if state.transfer_stream is not None:
+        state.transfer_stream.synchronize()
 
     return result
 

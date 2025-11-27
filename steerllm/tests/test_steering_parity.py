@@ -40,13 +40,13 @@ class TestTensorSerialization:
         assert torch.allclose(original.float(), reconstructed.float(), rtol=1e-3)
 
     def test_bfloat16_roundtrip(self):
-        """Test bfloat16 tensor falls back to float32."""
+        """Test bfloat16 tensor roundtrip preserves dtype."""
         original = torch.randn(64, dtype=torch.bfloat16)
         serialized = serialize_tensor(original)
-        # bfloat16 gets converted to float32
+        # bfloat16 is preserved via storage_dtype fallback
         reconstructed = deserialize_tensor(serialized)
-        assert reconstructed.dtype == torch.float32
-        assert torch.allclose(original.float(), reconstructed, rtol=1e-2)
+        assert reconstructed.dtype == torch.bfloat16
+        assert torch.allclose(original.float(), reconstructed.float(), rtol=1e-2)
 
     def test_2d_tensor(self):
         """Test 2D tensor roundtrip."""

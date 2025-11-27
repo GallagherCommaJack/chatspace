@@ -16,7 +16,6 @@ import weakref
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Sequence
 
-import numpy as np
 import torch
 
 from steerllm.core.capture import CaptureHandle, ChatResponse, MessageBoundary
@@ -410,13 +409,13 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Steering vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {vector.numel()}."
                         )
-                    # Send pre-scaled vector as bytes (uint8 view for bfloat16 support)
-                    vec_cpu = vector.to(dtype=self._vector_dtype).cpu().contiguous()
+                    # Use serialize_tensor for unified encoding
                     serialized_ops.append(
                         {
                             "type": "add",
-                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
-                            "dtype": str(vec_cpu.dtype),
+                            "vector": steering_runtime.serialize_tensor(
+                                vector.to(dtype=self._vector_dtype)
+                            ),
                             "params": None,  # Scale already applied
                         }
                     )
@@ -427,13 +426,13 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Projection cap vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    # Use model dtype for consistency (uint8 view for bfloat16 support)
-                    vec_cpu = op.vector.to(dtype=self._vector_dtype).cpu().contiguous()
+                    # Use serialize_tensor for unified encoding
                     serialized_ops.append(
                         {
                             "type": "cap",
-                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
-                            "dtype": str(vec_cpu.dtype),
+                            "vector": steering_runtime.serialize_tensor(
+                                op.vector.to(dtype=self._vector_dtype)
+                            ),
                             "params": (op.min, op.max),
                         }
                     )
@@ -444,13 +443,13 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Ablation vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    # Use model dtype for consistency (uint8 view for bfloat16 support)
-                    vec_cpu = op.vector.to(dtype=self._vector_dtype).cpu().contiguous()
+                    # Use serialize_tensor for unified encoding
                     serialized_ops.append(
                         {
                             "type": "ablation",
-                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
-                            "dtype": str(vec_cpu.dtype),
+                            "vector": steering_runtime.serialize_tensor(
+                                op.vector.to(dtype=self._vector_dtype)
+                            ),
                             "params": float(op.scale),
                         }
                     )
@@ -477,38 +476,11 @@ class VLLMSteeringModel(SyncWrapperMixin):
         for layer_idx_str, capture_data in worker_result.items():
             layer_idx = int(layer_idx_str)
 
-            # Reconstruct tensor from shared memory (uint8 encoding for bfloat16 support)
-            if "shm_name" in capture_data:
-                shm_name = capture_data["shm_name"]
-                shape = tuple(capture_data["shape"])
-                dtype_str = capture_data["dtype"]
-                nbytes = capture_data["nbytes"]
-
-                # Map shared memory
-                shm = SharedMemory(name=shm_name, create=False)
-                shm_objects_list.append(shm)
-
-                # Reconstruct tensor using uint8 view (works for bfloat16)
-                dtype = _parse_dtype(dtype_str)
-                arr = np.ndarray((nbytes,), dtype=np.uint8, buffer=shm.buf[:nbytes])
-                tensor = torch.frombuffer(
-                    bytearray(arr), dtype=torch.uint8
-                ).view(dtype).reshape(shape).clone()
-
-            elif "data" in capture_data:
-                # Fallback: bytes transport (uint8 encoding for bfloat16 support)
-                shape = tuple(capture_data["shape"])
-                dtype_str = capture_data["dtype"]
-                data = capture_data["data"]
-
-                dtype = _parse_dtype(dtype_str)
-                tensor = torch.frombuffer(
-                    bytearray(data), dtype=torch.uint8
-                ).view(dtype).reshape(shape).clone()
-
-            else:
-                continue
-
+            # Use unified deserialize_tensor (handles both "shm" and "bytes" encodings)
+            tensor = steering_runtime.deserialize_tensor(
+                capture_data,
+                shm_objects_list=shm_objects_list,
+            )
             captures[layer_idx] = [{"hidden": tensor}]
 
         return captures
