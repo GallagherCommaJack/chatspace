@@ -469,6 +469,7 @@ dependencies = [
     { name = "seaborn" },
     { name = "sentence-transformers" },
     { name = "simple-gpu-scheduler" },
+    { name = "steerllm" },
     { name = "tiktoken" },
     { name = "torch" },
     { name = "tqdm" },
@@ -512,6 +513,7 @@ requires-dist = [
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "sentence-transformers", specifier = ">=5.1.1" },
     { name = "simple-gpu-scheduler", specifier = ">=0.1.4" },
+    { name = "steerllm", directory = "steerllm" },
     { name = "tiktoken", specifier = ">=0.11.0" },
     { name = "torch", specifier = ">=2.8.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
@@ -4267,6 +4269,29 @@ sdist = { url = "https://files.pythonhosted.org/packages/a7/a5/d6f429d43394057b6
 wheels = [
     { url = "https://files.pythonhosted.org/packages/be/72/2db2f49247d0a18b4f1bb9a5a39a0162869acf235f3a96418363947b3d46/starlette-0.48.0-py3-none-any.whl", hash = "sha256:0764ca97b097582558ecb498132ed0c7d942f233f365b86ba37770e026510659", size = 73736, upload-time = "2025-09-13T08:41:03.869Z" },
 ]
+
+[[package]]
+name = "steerllm"
+version = "0.1.0"
+source = { directory = "steerllm" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", marker = "extra == 'huggingface'", specifier = ">=0.25.0" },
+    { name = "numpy", specifier = ">=1.20" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
+    { name = "steerllm", extras = ["huggingface"], marker = "extra == 'training'" },
+    { name = "steerllm", extras = ["vllm", "huggingface", "training"], marker = "extra == 'all'" },
+    { name = "torch", specifier = ">=2.0.0" },
+    { name = "transformers", marker = "extra == 'huggingface'", specifier = ">=4.40.0" },
+    { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.11.0" },
+]
+provides-extras = ["vllm", "huggingface", "training", "all", "dev"]
 
 [[package]]
 name = "stopit"

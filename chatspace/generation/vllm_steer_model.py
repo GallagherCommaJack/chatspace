@@ -12,9 +12,9 @@ Typical usage::
     # Create steering spec
     from chatspace.generation.vllm_steer_model import SteeringSpec, LayerSteeringSpec, AddSpec
     steering_spec = SteeringSpec(layers={
-        target_layer: LayerSteeringSpec(
-            add=AddSpec(vector=torch.randn(model.hidden_size), scale=1.0)
-        )
+        target_layer: LayerSteeringSpec(operations=[
+            AddSpec(vector=torch.randn(model.hidden_size), scale=1.0)
+        ])
     })
 
     # Generate with per-request steering
@@ -38,7 +38,7 @@ import os
 import weakref
 import warnings
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Literal, Sequence, cast, overload
 import logging
@@ -48,7 +48,20 @@ import torch
 from vllm import SamplingParams
 
 from chatspace.vllm_steering import runtime as steering_runtime
-# SteerableModel ABC removed - only vLLM implementation exists
+
+# Import steering specs and types from steerllm
+from steerllm.core.specs import (
+    AddSpec,
+    ProjectionCapSpec,
+    AblationSpec,
+    LayerSteeringSpec,
+    SteeringSpec,
+    SteeringOp,
+)
+from steerllm.core.capture import (
+    MessageBoundary,
+    ChatResponse,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,225 +77,6 @@ class VLLMSteeringConfig:
     max_model_len: int | None = None
     dtype: str = "auto"
     bootstrap_layers: tuple[int, ...] = ()
-
-
-@dataclass
-class AddSpec:
-    """Describe an additive steering vector with its magnitude.
-
-    Parameters
-    ----------
-    vector :
-        L2-normalised direction stored on CPU in ``float32`` for numerical
-        stability.  The norm is maintained separately via ``scale`` so the
-        direction can be reused.
-    scale :
-        Magnitude applied to the direction when broadcasting to workers.
-    The helper L2-normalises ``vector`` when constructing the spec; ``scale``
-    therefore captures the original norm.  Supplying ``scale=0`` represents a
-    cleared steering vector.
-    """
-
-    vector: torch.Tensor
-    scale: float = 1.0
-
-    def __post_init__(self):
-        """Validate steering vector."""
-        if not torch.isfinite(self.vector).all():
-            raise ValueError("Steering vector contains NaN or Inf values")
-        norm = float(self.vector.norm().item())
-        if norm == 0.0:
-            raise ValueError("Steering vector has zero norm (cannot be normalized)")
-
-    def clone(self) -> "AddSpec":
-        return AddSpec(vector=self.vector.detach().clone(), scale=self.scale)
-
-    def materialize(self) -> torch.Tensor:
-        """Return the scaled steering vector."""
-        return (self.vector * self.scale).contiguous()
-
-
-@dataclass
-class ProjectionCapSpec:
-    """Describe projection capping applied after steering is injected.
-
-    Parameters
-    ----------
-    vector :
-        Direction (unit vector) used to measure the hidden-state component that
-        should be clamped.  The helper L2-normalises the provided tensor and
-        stores it in ``float32`` when constructing the spec.
-    min :
-        Optional minimum bound for that component.  ``None`` leaves the lower
-        side unconstrained.
-    max :
-        Optional maximum bound for that component.  ``None`` leaves the upper
-        side unconstrained.
-    """
-
-    vector: torch.Tensor
-    min: float | None = None
-    max: float | None = None
-
-    def __post_init__(self):
-        """Validate projection cap spec."""
-        if self.min is None and self.max is None:
-            raise ValueError("ProjectionCapSpec requires at least one of min or max to be set")
-        if not torch.isfinite(self.vector).all():
-            raise ValueError("Projection cap vector contains NaN or Inf values")
-        norm = float(self.vector.norm().item())
-        if norm == 0.0:
-            raise ValueError("Projection cap vector has zero norm (cannot be normalized)")
-
-    def clone(self) -> "ProjectionCapSpec":
-        return ProjectionCapSpec(
-            vector=self.vector.detach().clone(),
-            min=self.min,
-            max=self.max,
-        )
-
-
-@dataclass
-class AblationSpec:
-    """Describe multiplicative ablation along a residual direction.
-
-    Parameters
-    ----------
-    vector :
-        Direction to project onto before rescaling.  The helper L2-normalises
-        this tensor and stores it in ``float32`` when constructing the spec.
-    scale :
-        Multiplicative factor applied to the projected component.  Values under
-        ``1.0`` diminish the component; values over ``1.0`` amplify it.
-    """
-
-    vector: torch.Tensor
-    scale: float = 1.0
-
-    def __post_init__(self):
-        """Validate ablation spec."""
-        if not torch.isfinite(self.vector).all():
-            raise ValueError("Ablation vector contains NaN or Inf values")
-        norm = float(self.vector.norm().item())
-        if norm == 0.0:
-            raise ValueError("Ablation vector has zero norm (cannot be normalized)")
-
-    def clone(self) -> "AblationSpec":
-        return AblationSpec(vector=self.vector.detach().clone(), scale=self.scale)
-
-
-# Union type for steering operations
-SteeringOp = AddSpec | ProjectionCapSpec | AblationSpec
-
-
-@dataclass
-class LayerSteeringSpec:
-    """All steering controls for a single transformer layer.
-
-    Operations are applied in sequence order. Supports multiple caps/ablations
-    and arbitrary interleaving of operation types.
-
-    Parameters
-    ----------
-    operations :
-        Ordered list of steering operations to apply.
-
-    Example
-    -------
-    >>> LayerSteeringSpec(operations=[
-    ...     AddSpec(vector=v1, scale=1.0),
-    ...     ProjectionCapSpec(vector=v2, min=-1.0, max=1.0),
-    ...     AblationSpec(vector=v3, scale=0.5),
-    ... ])
-    """
-
-    operations: list[SteeringOp] = field(default_factory=list)
-
-    def clone(self) -> "LayerSteeringSpec":
-        return LayerSteeringSpec(
-            operations=[op.clone() for op in self.operations],
-        )
-
-    def is_empty(self) -> bool:
-        if not self.operations:
-            return True
-        # Check if any AddSpec has non-zero scale
-        for op in self.operations:
-            if isinstance(op, AddSpec):
-                scale = float(op.scale)
-                if math.isfinite(scale) and not math.isclose(scale, 0.0, rel_tol=0.0, abs_tol=1e-12):
-                    return False
-            else:
-                # ProjectionCapSpec and AblationSpec are always considered active
-                return False
-        return True
-
-
-@dataclass
-class MessageBoundary:
-    """Token boundary information for a single message in a chat conversation.
-
-    Attributes
-    ----------
-    role : str
-        Message role (e.g., "system", "user", "assistant").
-    content : str
-        Original message content.
-    start_token : int
-        Starting token index in the formatted prompt (inclusive).
-    end_token : int
-        Ending token index in the formatted prompt (exclusive).
-    """
-
-    role: str
-    content: str
-    start_token: int
-    end_token: int
-
-    @property
-    def num_tokens(self) -> int:
-        """Number of tokens in this message."""
-        return self.end_token - self.start_token
-
-
-@dataclass
-class ChatResponse:
-    """Response from chat() API with explicit prefill/generated separation.
-
-    When using assistant response prefilling with continue_final_message=True,
-    this dataclass makes it clear which text was prefilled vs. generated by
-    the model. This is especially useful when combined with activation capture,
-    as the message boundaries will include prefill tokens but the vLLM response
-    text contains only generated tokens.
-
-    Attributes
-    ----------
-    prefill : str
-        Text that was prefilled (from partial assistant message). Empty string
-        if no prefill was used.
-    generated : str
-        Text generated by the model (always present, may be empty).
-    """
-
-    prefill: str
-    generated: str
-
-    def full_text(self) -> str:
-        """Return complete response text (prefill + generated)."""
-        return self.prefill + self.generated
-
-    def __str__(self) -> str:
-        """String representation is the full text."""
-        return self.full_text()
-
-    @property
-    def has_prefill(self) -> bool:
-        """Whether this response includes a prefill."""
-        return len(self.prefill) > 0
-
-    def to_message(self, role: str = "assistant") -> dict[str, str]:
-        """Convert to OpenAI-style message dict for building conversation history."""
-        return {"role": role, "content": self.full_text()}
 
 
 def _cleanup_capture_handle_and_warn(
@@ -525,27 +319,6 @@ class CaptureHandle:
             end = full_hidden.shape[0]
 
         return full_hidden[start:end]
-
-
-@dataclass
-class SteeringSpec:
-    """Bundle steering metadata for multiple layers.
-
-    Parameters
-    ----------
-    layers :
-        Mapping of layer indices to :class:`LayerSteeringSpec` instances.
-    """
-
-    layers: dict[int, LayerSteeringSpec] = field(default_factory=dict)
-
-    def clone(self) -> "SteeringSpec":
-        return SteeringSpec(
-            layers={layer: spec.clone() for layer, spec in self.layers.items()}
-        )
-
-    def is_empty(self) -> bool:
-        return all(spec.is_empty() for spec in self.layers.values())
 
 
 def _parse_dtype(dtype_str: str) -> torch.dtype:
