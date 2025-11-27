@@ -157,6 +157,7 @@ async def test_vllm_integration_comprehensive():
         assert len(handles) == 1
 
         async with handles[0] as handle:
+            await handle.fetch()  # Must fetch before accessing captures
             assert handle.captures is not None
             assert 5 in handle.captures
             assert 10 in handle.captures
@@ -176,6 +177,7 @@ async def test_vllm_integration_comprehensive():
         )
         assert handles is not None
         async with handles[0] as handle:
+            await handle.fetch()
             assert 5 in handle.captures
             assert 10 in handle.captures
 
@@ -187,6 +189,7 @@ async def test_vllm_integration_comprehensive():
         assert len(handles) == 3
         for handle in handles:
             async with handle:
+                await handle.fetch()
                 assert 5 in handle.captures
                 assert len(handle.captures[5]) > 0
 
@@ -213,6 +216,7 @@ async def test_vllm_integration_comprehensive():
         )
         assert handles is not None
         async with handles[0] as handle:
+            await handle.fetch()
             assert 5 in handle.captures
             assert handle.message_boundaries is not None
 

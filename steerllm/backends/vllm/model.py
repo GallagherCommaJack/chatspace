@@ -410,12 +410,12 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Steering vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {vector.numel()}."
                         )
-                    # Send pre-scaled vector as bytes
+                    # Send pre-scaled vector as bytes (uint8 view for bfloat16 support)
                     vec_cpu = vector.to(dtype=self._vector_dtype).cpu().contiguous()
                     serialized_ops.append(
                         {
                             "type": "add",
-                            "vector": vec_cpu.numpy().tobytes(),
+                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
                             "dtype": str(vec_cpu.dtype),
                             "params": None,  # Scale already applied
                         }
@@ -427,11 +427,12 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Projection cap vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    vec_cpu = op.vector.to(dtype=torch.float32).cpu().contiguous()
+                    # Use model dtype for consistency (uint8 view for bfloat16 support)
+                    vec_cpu = op.vector.to(dtype=self._vector_dtype).cpu().contiguous()
                     serialized_ops.append(
                         {
                             "type": "cap",
-                            "vector": vec_cpu.numpy().tobytes(),
+                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
                             "dtype": str(vec_cpu.dtype),
                             "params": (op.min, op.max),
                         }
@@ -443,11 +444,12 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Ablation vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    vec_cpu = op.vector.to(dtype=torch.float32).cpu().contiguous()
+                    # Use model dtype for consistency (uint8 view for bfloat16 support)
+                    vec_cpu = op.vector.to(dtype=self._vector_dtype).cpu().contiguous()
                     serialized_ops.append(
                         {
                             "type": "ablation",
-                            "vector": vec_cpu.numpy().tobytes(),
+                            "vector": vec_cpu.view(torch.uint8).numpy().tobytes(),
                             "dtype": str(vec_cpu.dtype),
                             "params": float(op.scale),
                         }
@@ -475,7 +477,7 @@ class VLLMSteeringModel(SyncWrapperMixin):
         for layer_idx_str, capture_data in worker_result.items():
             layer_idx = int(layer_idx_str)
 
-            # Reconstruct tensor from shared memory
+            # Reconstruct tensor from shared memory (uint8 encoding for bfloat16 support)
             if "shm_name" in capture_data:
                 shm_name = capture_data["shm_name"]
                 shape = tuple(capture_data["shape"])
@@ -486,22 +488,23 @@ class VLLMSteeringModel(SyncWrapperMixin):
                 shm = SharedMemory(name=shm_name, create=False)
                 shm_objects_list.append(shm)
 
-                # Reconstruct tensor
+                # Reconstruct tensor using uint8 view (works for bfloat16)
                 dtype = _parse_dtype(dtype_str)
-                np_dtype = np.dtype(str(dtype).replace("torch.", ""))
-                arr = np.ndarray(shape, dtype=np_dtype, buffer=shm.buf[:nbytes])
-                tensor = torch.from_numpy(arr.copy())
+                arr = np.ndarray((nbytes,), dtype=np.uint8, buffer=shm.buf[:nbytes])
+                tensor = torch.frombuffer(
+                    bytearray(arr), dtype=torch.uint8
+                ).view(dtype).reshape(shape).clone()
 
             elif "data" in capture_data:
-                # Fallback: bytes transport
+                # Fallback: bytes transport (uint8 encoding for bfloat16 support)
                 shape = tuple(capture_data["shape"])
                 dtype_str = capture_data["dtype"]
                 data = capture_data["data"]
 
                 dtype = _parse_dtype(dtype_str)
-                np_dtype = np.dtype(str(dtype).replace("torch.", ""))
-                arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
-                tensor = torch.from_numpy(arr.copy())
+                tensor = torch.frombuffer(
+                    bytearray(data), dtype=torch.uint8
+                ).view(dtype).reshape(shape).clone()
 
             else:
                 continue
@@ -712,7 +715,7 @@ class VLLMSteeringModel(SyncWrapperMixin):
                 boundaries = self._compute_message_boundaries(
                     conversations[i], chat_kwargs
                 )
-                handle._message_boundaries = boundaries
+                handle.message_boundaries = boundaries
 
         return responses, handles
 
@@ -727,8 +730,9 @@ class VLLMSteeringModel(SyncWrapperMixin):
 
         for i, msg in enumerate(messages):
             partial_conv = messages[: i + 1]
+            # Note: chat_kwargs already contains tokenize=False
             partial_text = self.tokenizer.apply_chat_template(
-                partial_conv, tokenize=False, **chat_kwargs
+                partial_conv, **chat_kwargs
             )
             partial_tokens = self.tokenizer(partial_text, return_tensors="pt")
             total_len = partial_tokens.input_ids.shape[1]

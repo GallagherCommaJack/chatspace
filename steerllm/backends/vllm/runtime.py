@@ -956,9 +956,9 @@ def _rpc_register_steering_spec(
             dtype_str = op_data["dtype"]
             params = op_data.get("params")
 
-            # Reconstruct tensor
+            # Reconstruct tensor (uint8 view encoding for bfloat16 support)
             dtype = getattr(torch, dtype_str.replace("torch.", ""))
-            vec = torch.frombuffer(bytearray(vec_bytes), dtype=dtype).clone()
+            vec = torch.frombuffer(bytearray(vec_bytes), dtype=torch.uint8).view(dtype).clone()
             vec = vec.to(device=state.device, dtype=state.dtype)
 
             # Scale vector for additive steering
@@ -1021,7 +1021,9 @@ def _rpc_fetch_captures(
     for layer_idx, tensor in captures.items():
         # Create shared memory segment
         shm_name = f"steerllm_{request_id}_{layer_idx}_{uuid.uuid4().hex[:8]}"
-        tensor_bytes = tensor.cpu().numpy().tobytes()
+        # Use uint8 view for bfloat16 support (numpy doesn't support bfloat16)
+        tensor_cpu = tensor.cpu().contiguous()
+        tensor_bytes = tensor_cpu.view(torch.uint8).numpy().tobytes()
 
         try:
             shm = SharedMemory(name=shm_name, create=True, size=len(tensor_bytes))
@@ -1033,8 +1035,8 @@ def _rpc_fetch_captures(
 
             result[str(layer_idx)] = {
                 "shm_name": shm_name,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
+                "shape": list(tensor_cpu.shape),
+                "dtype": str(tensor_cpu.dtype),
                 "nbytes": len(tensor_bytes),
             }
         except Exception as e:
@@ -1042,8 +1044,8 @@ def _rpc_fetch_captures(
             # Fall back to bytes
             result[str(layer_idx)] = {
                 "data": tensor_bytes,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
+                "shape": list(tensor_cpu.shape),
+                "dtype": str(tensor_cpu.dtype),
             }
 
     return result
