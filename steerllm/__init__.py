@@ -100,6 +100,9 @@ __all__ = [
     "BackendError",
     "CaptureError",
     "ValidationError",
+    # Backends (lazy-loaded)
+    "VLLMSteeringModel",
+    "HFSteeringModel",
 ]
 
 
