@@ -32,27 +32,51 @@ logger = logging.getLogger(__name__)
 # Tensor Serialization
 # =============================================================================
 
-def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
-    """Serialize tensor for RPC transport (client→worker).
+def create_shared_tensor(tensor: torch.Tensor) -> tuple[dict[str, Any], SharedMemory]:
+    """Create shared memory segment for tensor (client-side).
 
-    Uses uint8 view for all dtypes - simpler single pipeline that works
-    uniformly for float32, float16, bfloat16, etc.
+    Returns (metadata_dict, SharedMemory_object).
+    Caller is responsible for cleanup via shm.close() and shm.unlink().
+
+    Uses uint8 view for dtype-agnostic transfer - works uniformly for
+    float32, float16, bfloat16, etc.
     """
-    arr = tensor.detach().cpu().contiguous()
-    dtype_name = str(arr.dtype).removeprefix("torch.")
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+    dtype_name = str(cpu_tensor.dtype).removeprefix("torch.")
 
-    if arr.numel() == 0:
-        buffer = b""
-    else:
-        # uint8 view works for all dtypes uniformly
-        buffer = arr.view(torch.uint8).numpy().tobytes()
+    if nbytes == 0:
+        # Handle empty tensors - create minimal shm segment
+        nbytes = 1  # SharedMemory requires size > 0
 
-    return {
-        "encoding": "bytes",
+    shm_name = f"steerllm_{uuid.uuid4().hex}"
+    shm = SharedMemory(create=True, size=nbytes, name=shm_name)
+
+    if cpu_tensor.numel() > 0:
+        # uint8 view for dtype-agnostic transfer
+        shm_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
+        byte_view = cpu_tensor.view(torch.uint8).flatten()
+        shm_array[:] = byte_view.numpy()
+
+    metadata = {
+        "encoding": "shm",
+        "shm_name": shm_name,
+        "shape": list(cpu_tensor.shape),
         "dtype": dtype_name,
-        "shape": list(arr.shape),
-        "data": buffer,
+        "nbytes": cpu_tensor.numel() * cpu_tensor.element_size(),  # Original nbytes (may be 0)
     }
+    return metadata, shm
+
+
+def serialize_tensor(tensor: torch.Tensor) -> tuple[dict[str, Any], SharedMemory]:
+    """Serialize tensor via shared memory for RPC transport (client→worker).
+
+    Returns (metadata_dict, SharedMemory_object).
+    Caller must clean up after RPC completes: shm.close(); shm.unlink()
+
+    Uses shared memory for zero-copy transfer between client and worker processes.
+    """
+    return create_shared_tensor(tensor)
 
 
 def deserialize_tensor(
@@ -62,64 +86,49 @@ def deserialize_tensor(
     dtype: torch.dtype | None = None,
     shm_objects_list: list[SharedMemory] | None = None,
 ) -> torch.Tensor:
-    """Deserialize tensor from either bytes or shm encoding.
+    """Deserialize tensor from shared memory.
 
     Parameters
     ----------
     payload :
-        Serialized tensor data with encoding metadata.
+        Serialized tensor metadata (shm_name, shape, dtype, nbytes).
     device :
         Target device for the tensor.
     dtype :
         Target dtype for the tensor (overrides payload dtype if specified).
     shm_objects_list :
-        If provided and payload uses shared memory, the SharedMemory object
-        will be appended to this list to keep it alive.
+        If provided, the SharedMemory object will be appended to keep it alive.
     """
-    encoding = payload.get("encoding", "bytes")  # Default for legacy
     dtype_str = payload.get("dtype")
     shape = payload.get("shape")
+    shm_name = payload.get("shm_name")
+    nbytes = payload.get("nbytes")
 
     if dtype_str is None or shape is None:
         raise TypeError(f"Missing required tensor metadata: dtype={dtype_str}, shape={shape}")
+    if shm_name is None:
+        raise TypeError("Missing shm_name in payload")
+    if nbytes is None:
+        raise TypeError("Missing nbytes in payload")
 
     target_dtype = getattr(torch, dtype_str, None)
     if target_dtype is None:
         raise TypeError(f"Unsupported tensor dtype: {dtype_str}")
     shape_tuple = tuple(int(dim) for dim in shape)
 
-    if encoding == "bytes":
-        data = payload.get("data")
-        if not isinstance(data, bytes):
-            raise TypeError(f"Expected bytes for encoding=bytes, got {type(data)}")
-        # Handle empty tensors (frombuffer fails on empty data)
-        if len(data) == 0:
-            tensor = torch.empty(shape_tuple, dtype=target_dtype)
-        else:
-            # All dtypes serialized via uint8 view - reinterpret to target dtype
-            tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-            tensor = tensor.view(target_dtype).reshape(shape_tuple).clone()
+    # Open existing shared memory segment
+    shm = SharedMemory(name=shm_name, create=False)
+    if shm_objects_list is not None:
+        shm_objects_list.append(shm)
 
-    elif encoding == "shm":
-        shm_name = payload.get("shm_name")
-        nbytes = payload.get("nbytes")
-        if shm_name is None:
-            raise TypeError("Missing shm_name in shared memory payload")
-        if nbytes is None:
-            raise TypeError("Missing nbytes in shared memory payload")
-
-        # Open existing shared memory segment
-        shm = SharedMemory(name=shm_name, create=False)
-        if shm_objects_list is not None:
-            shm_objects_list.append(shm)
-
+    # Handle empty tensors
+    if nbytes == 0:
+        tensor = torch.empty(shape_tuple, dtype=target_dtype)
+    else:
         # Read as uint8 bytes, reinterpret to target dtype
         np_array = np.ndarray(nbytes, dtype=np.uint8, buffer=shm.buf)
         tensor = torch.frombuffer(bytearray(np_array), dtype=torch.uint8)
         tensor = tensor.view(target_dtype).reshape(shape_tuple).clone()
-
-    else:
-        raise TypeError(f"Unknown tensor encoding: {encoding}")
 
     if dtype is not None and tensor.dtype != dtype:
         tensor = tensor.to(dtype=dtype)
@@ -1063,7 +1072,7 @@ def _rpc_register_steering_spec(
     spec_data is a dict with:
     - layers: dict[int, layer_spec]
     - Each layer_spec has operations: list of {type, vector, params}
-      where vector is a serialized tensor payload (encoding=bytes)
+      where vector is a shm tensor payload (shm_name, shape, dtype, nbytes)
     """
     state = get_worker_state()
     if state is None:
@@ -1079,7 +1088,6 @@ def _rpc_register_steering_spec(
             vector_payload = op_data["vector"]
             params = op_data.get("params")
 
-            # Use unified deserialize_tensor (handles bytes encoding)
             vec = deserialize_tensor(
                 vector_payload,
                 device=state.device,

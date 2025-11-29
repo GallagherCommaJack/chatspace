@@ -22,45 +22,55 @@ from steerllm.backends.vllm.runtime import (
 
 
 class TestTensorSerialization:
-    """Tests for tensor serialization/deserialization."""
+    """Tests for tensor serialization/deserialization via shared memory."""
 
     def test_float32_roundtrip(self):
-        """Test float32 tensor roundtrip."""
+        """Test float32 tensor roundtrip via shm."""
         original = torch.randn(64, dtype=torch.float32)
-        serialized = serialize_tensor(original)
+        serialized, shm = serialize_tensor(original)
         reconstructed = deserialize_tensor(serialized)
+        shm.close()
+        shm.unlink()
         assert torch.allclose(original, reconstructed)
         assert reconstructed.dtype == torch.float32
 
     def test_float16_roundtrip(self):
-        """Test float16 tensor roundtrip."""
+        """Test float16 tensor roundtrip via shm."""
         original = torch.randn(64, dtype=torch.float16)
-        serialized = serialize_tensor(original)
+        serialized, shm = serialize_tensor(original)
         reconstructed = deserialize_tensor(serialized)
+        shm.close()
+        shm.unlink()
         assert torch.allclose(original.float(), reconstructed.float(), rtol=1e-3)
 
     def test_bfloat16_roundtrip(self):
-        """Test bfloat16 tensor roundtrip preserves dtype."""
+        """Test bfloat16 tensor roundtrip via shm preserves dtype."""
         original = torch.randn(64, dtype=torch.bfloat16)
-        serialized = serialize_tensor(original)
-        # bfloat16 is preserved via storage_dtype fallback
+        serialized, shm = serialize_tensor(original)
+        # bfloat16 is preserved via uint8 view
         reconstructed = deserialize_tensor(serialized)
+        shm.close()
+        shm.unlink()
         assert reconstructed.dtype == torch.bfloat16
         assert torch.allclose(original.float(), reconstructed.float(), rtol=1e-2)
 
     def test_2d_tensor(self):
-        """Test 2D tensor roundtrip."""
+        """Test 2D tensor roundtrip via shm."""
         original = torch.randn(10, 64, dtype=torch.float32)
-        serialized = serialize_tensor(original)
+        serialized, shm = serialize_tensor(original)
         reconstructed = deserialize_tensor(serialized)
+        shm.close()
+        shm.unlink()
         assert torch.allclose(original, reconstructed)
         assert reconstructed.shape == (10, 64)
 
     def test_empty_tensor(self):
-        """Test empty tensor roundtrip."""
+        """Test empty tensor roundtrip via shm."""
         original = torch.tensor([], dtype=torch.float32)
-        serialized = serialize_tensor(original)
+        serialized, shm = serialize_tensor(original)
         reconstructed = deserialize_tensor(serialized)
+        shm.close()
+        shm.unlink()
         assert reconstructed.numel() == 0
 
 

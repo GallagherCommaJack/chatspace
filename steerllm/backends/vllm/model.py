@@ -386,8 +386,14 @@ class VLLMSteeringModel(SyncWrapperMixin):
             args=steering_runtime.rpc_args(op, *args),
         )
 
-    def _serialize_steering_spec(self, spec: SteeringSpec) -> dict[str, Any]:
-        """Serialize a SteeringSpec for RPC transmission."""
+    def _serialize_steering_spec(
+        self, spec: SteeringSpec
+    ) -> tuple[dict[str, Any], list[SharedMemory]]:
+        """Serialize a SteeringSpec for RPC transmission.
+
+        Returns (serialized_spec, list_of_shm_objects_to_cleanup).
+        Caller must clean up shm objects after RPC completes.
+        """
         # Validate layer indices before serialization
         for layer_idx in spec.layers.keys():
             if layer_idx < 0 or layer_idx >= self._layer_count:
@@ -397,6 +403,8 @@ class VLLMSteeringModel(SyncWrapperMixin):
                 )
 
         serialized_layers = {}
+        shm_objects: list[SharedMemory] = []
+
         for layer_idx, layer_spec in spec.layers.items():
             serialized_ops = []
 
@@ -409,13 +417,15 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Steering vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {vector.numel()}."
                         )
-                    # Use serialize_tensor for unified encoding
+                    # Use serialize_tensor for shm-based encoding
+                    payload, shm = steering_runtime.serialize_tensor(
+                        vector.to(dtype=self._vector_dtype)
+                    )
+                    shm_objects.append(shm)
                     serialized_ops.append(
                         {
                             "type": "add",
-                            "vector": steering_runtime.serialize_tensor(
-                                vector.to(dtype=self._vector_dtype)
-                            ),
+                            "vector": payload,
                             "params": None,  # Scale already applied
                         }
                     )
@@ -426,13 +436,15 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Projection cap vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    # Use serialize_tensor for unified encoding
+                    # Use serialize_tensor for shm-based encoding
+                    payload, shm = steering_runtime.serialize_tensor(
+                        op.vector.to(dtype=self._vector_dtype)
+                    )
+                    shm_objects.append(shm)
                     serialized_ops.append(
                         {
                             "type": "cap",
-                            "vector": steering_runtime.serialize_tensor(
-                                op.vector.to(dtype=self._vector_dtype)
-                            ),
+                            "vector": payload,
                             "params": (op.min, op.max),
                         }
                     )
@@ -443,20 +455,22 @@ class VLLMSteeringModel(SyncWrapperMixin):
                             f"Ablation vector dimension mismatch at layer {layer_idx}: "
                             f"expected {self._hidden_size}, got {op.vector.numel()}."
                         )
-                    # Use serialize_tensor for unified encoding
+                    # Use serialize_tensor for shm-based encoding
+                    payload, shm = steering_runtime.serialize_tensor(
+                        op.vector.to(dtype=self._vector_dtype)
+                    )
+                    shm_objects.append(shm)
                     serialized_ops.append(
                         {
                             "type": "ablation",
-                            "vector": steering_runtime.serialize_tensor(
-                                op.vector.to(dtype=self._vector_dtype)
-                            ),
+                            "vector": payload,
                             "params": float(op.scale),
                         }
                     )
 
             serialized_layers[int(layer_idx)] = {"operations": serialized_ops}
 
-        return {"layers": serialized_layers}
+        return {"layers": serialized_layers}, shm_objects
 
     async def _fetch_request_captures(
         self,
@@ -476,7 +490,6 @@ class VLLMSteeringModel(SyncWrapperMixin):
         for layer_idx_str, capture_data in worker_result.items():
             layer_idx = int(layer_idx_str)
 
-            # Use unified deserialize_tensor (handles both "shm" and "bytes" encodings)
             tensor = steering_runtime.deserialize_tensor(
                 capture_data,
                 shm_objects_list=shm_objects_list,
@@ -569,12 +582,22 @@ class VLLMSteeringModel(SyncWrapperMixin):
 
         # Register steering specs
         serialized_spec = None
+        steering_shm_objects: list[SharedMemory] = []
         if steering_spec is not None and not steering_spec.is_empty():
-            serialized_spec = self._serialize_steering_spec(steering_spec)
+            serialized_spec, steering_shm_objects = self._serialize_steering_spec(
+                steering_spec
+            )
             for req_id in request_ids:
                 await self._collective_rpc(
                     "register_steering_spec", req_id, serialized_spec
                 )
+            # All workers have cloned from shm - safe to cleanup
+            for shm in steering_shm_objects:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup steering shm {shm.name}: {e}")
 
         try:
             # Generate all prompts concurrently
