@@ -99,6 +99,24 @@ _PROFILE_FETCH_TRACE_DIR = os.getenv("CHATSPACE_PROFILE_FETCH_TRACE_DIR")
 _PROFILE_FETCH_TRACE_PREFIX = os.getenv("CHATSPACE_PROFILE_FETCH_TRACE_PREFIX", "fetch_trace")
 _CAPTURE_METADATA_ENABLED = _env_flag("CHATSPACE_CAPTURE_METADATA", True)
 
+# Performance counters for profiling hot path (disabled by default, no overhead)
+_PERF_COUNTERS_ENABLED = _env_flag("CHATSPACE_PERF_COUNTERS", False)
+_PERF_COUNTERS: dict[str, int] = {}
+_PERF_TIMINGS: dict[str, float] = {}  # Cumulative time in seconds
+
+
+def _perf_incr(name: str, delta: int = 1) -> None:
+    """Increment a counter (no-op if profiling disabled)."""
+    if _PERF_COUNTERS_ENABLED:
+        _PERF_COUNTERS[name] = _PERF_COUNTERS.get(name, 0) + delta
+
+
+def _perf_add_time(name: str, seconds: float) -> None:
+    """Add cumulative time to a timing bucket (no-op if profiling disabled)."""
+    if _PERF_COUNTERS_ENABLED:
+        _PERF_TIMINGS[name] = _PERF_TIMINGS.get(name, 0.0) + seconds
+
+
 LayerLike = Any
 
 # Optional override for projection cap math precision. When set the cap
@@ -937,25 +955,35 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
 
     @wraps(original_forward)
     def _patched_forward(self, *args: Any, **kwargs: Any) -> Any:
+        _perf_incr("forward_calls")
+
         output = original_forward(self, *args, **kwargs)
 
         state = getattr(self, "_chatspace_steering_state", None)
         layer_idx = getattr(self, "_chatspace_layer_index", None)
 
+        # Fast path: no state attached means no steering/capture possible
+        if state is None:
+            _perf_incr("exit_no_state")
+            return output
+
         # Extract request metadata for per-request steering
         request_ids = None
         seq_lens = None
-        if state is not None:
-            current_step = state.global_step - 1
-            if current_step >= 0:
-                metadata = state.step_metadata.get(current_step)
-                if metadata is not None:
-                    request_ids = metadata.get("request_ids")
-                    seq_lens = metadata.get("seq_lens")
+        current_step = state.global_step - 1
+        if current_step >= 0:
+            metadata = state.step_metadata.get(current_step)
+            if metadata is not None:
+                request_ids = metadata.get("request_ids")
+                seq_lens = metadata.get("seq_lens")
+
+        if not request_ids:
+            _perf_incr("exit_no_requests")
+            return output
 
         # Check if we have per-request steering specs for any request in the batch
         has_per_request_steering = False
-        if state is not None and request_ids and layer_idx is not None:
+        if layer_idx is not None:
             for req_id in request_ids:
                 spec = state.request_steering_specs.get(req_id)
                 if spec is not None and layer_idx in spec.layers:
@@ -964,31 +992,47 @@ def _patch_decoder_layer_class(layer_cls: type) -> None:
                         has_per_request_steering = True
                         break
 
+        # Check if capture is active (empty dict is falsy, so this is correct)
+        has_active_capture = bool(state.active_capture_requests)
+
+        # Fast path: no steering and no capture for this forward
+        if not has_per_request_steering and not has_active_capture:
+            _perf_incr("exit_no_work")
+            return output
+
         # Extract hidden state once for both steering and capture
         # This avoids double extraction when both are active
-        cached_hidden = None
-        if has_per_request_steering or state.active_capture_requests:
-            cached_hidden = _extract_hidden_from_output(output)
+        _perf_incr("extraction_triggered")
+        if _PERF_COUNTERS_ENABLED:
+            _t0 = time.perf_counter()
+        cached_hidden = _extract_hidden_from_output(output)
+        if _PERF_COUNTERS_ENABLED:
+            _perf_add_time("extraction_time", time.perf_counter() - _t0)
 
         # Apply per-request steering if needed
         if has_per_request_steering:
+            _perf_incr("steering_applied")
             output = _apply_per_request_steering(
                 output, state, layer_idx, request_ids, seq_lens, cached_hidden=cached_hidden
             )
             # After steering, output has changed, so invalidate cached_hidden
             # We need to re-extract for capture
-            if state.active_capture_requests:
+            if has_active_capture:
+                _perf_incr("extraction_post_steering")
                 cached_hidden = _extract_hidden_from_output(output)
 
         # Handle activation capture
-        if state is None or not state.active_capture_requests:
+        if not has_active_capture:
             return output
 
-        if request_ids is None or layer_idx is None:
+        if layer_idx is None:
+            _perf_incr("exit_capture_no_layer_idx")
             return output
 
+        _perf_incr("capture_processed")
         hidden = cached_hidden if cached_hidden is not None else _extract_hidden_from_output(output)
         if hidden is None or hidden.dim() != 2:
+            _perf_incr("exit_capture_bad_hidden")
             return output
 
         _capture_hook_full(state, layer_idx, hidden, request_ids, seq_lens)
@@ -1962,6 +2006,18 @@ def _cleanup_stale_shared_memory(state: _SteeringState, stop_event: threading.Ev
     logger.info("Shared memory cleanup thread stopped")
 
 
+def fetch_perf_counters(worker: Any) -> dict[str, Any]:
+    """Return current performance counters and timings.
+
+    Only populated when CHATSPACE_PERF_COUNTERS=1 is set.
+    """
+    return {
+        "counters": dict(_PERF_COUNTERS),
+        "timings": dict(_PERF_TIMINGS),
+        "enabled": _PERF_COUNTERS_ENABLED,
+    }
+
+
 for _rpc_fn in (
     initialize_worker_state,
     set_projection_cap_precision,
@@ -1971,6 +2027,7 @@ for _rpc_fn in (
     fetch_request_activations,
     fetch_batch_captures,
     fetch_last_profile,
+    fetch_perf_counters,
     unregister_capture_request,
     release_shared_memory,
 ):

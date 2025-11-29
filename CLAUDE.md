@@ -425,3 +425,11 @@ When in doubt, delete unused code aggressively, but leave working code alone.
 - Once work stabilizes, move key findings to canonical `JOURNAL.md`
 - Note tmux sessions, long-running jobs, and `/workspace` artifact paths for resumability
 - **IMPORTANT**: Implementation summaries, feature documentation, and completion notes should be added to `JOURNAL.md`, NOT as separate markdown files in the repo root. Keep the repo clean by consolidating documentation in the journal.
+
+## Benchmark Journal
+
+Store benchmark results in `bench_journal/` with dated markdown files:
+- Naming: `YYYY-MM-DD-description.md` (e.g., `2025-11-29-steering-idle-overhead.md`)
+- Include: objective, hardware, model, workload parameters, results tables, conclusions
+- Reference related GitHub issues
+- Keep methodology reproducible (include test commands/scripts used)

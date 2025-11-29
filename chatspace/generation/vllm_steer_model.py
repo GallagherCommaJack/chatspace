@@ -584,6 +584,14 @@ class VLLMSteerModel:
         """Unregister a per-request steering spec from all workers."""
         await self._collective_rpc("unregister_steering_spec", request_id)
 
+    async def get_perf_counters(self) -> list[dict[str, Any]]:
+        """Fetch performance counters from all workers.
+
+        Returns list of dicts (one per worker) with 'counters', 'timings', and 'enabled'.
+        Only populated when CHATSPACE_PERF_COUNTERS=1 is set.
+        """
+        return await self._collective_rpc("fetch_perf_counters")
+
     @staticmethod
     def simple_steering(layer: int, vector: torch.Tensor, scale: float = 1.0) -> SteeringSpec:
         """Create a simple additive steering spec for a single layer.
