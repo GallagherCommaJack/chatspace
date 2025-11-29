@@ -815,29 +815,28 @@ def _apply_per_request_steering(
                     return _apply_layer_steering_to_output(output, layer_spec, state)
         return output
 
-    # Slice hidden states per request
-    request_slices = []
+    # Apply steering in-place to avoid shape mismatch with padded tensors
+    # vLLM may pad tensors to larger sizes internally, but seq_lens only covers actual tokens
+    transformed_hidden = hidden.clone()
     start_idx = 0
 
     for i, req_id in enumerate(request_ids):
         seq_len = seq_lens[i]
         end_idx = start_idx + seq_len
-        req_hidden = hidden[start_idx:end_idx]
 
         # Apply steering if this request has a spec for this layer
         spec = state.request_steering_specs.get(req_id)
         if spec is not None and layer_idx in spec.layers:
             layer_spec = spec.layers[layer_idx]
             if layer_spec.operations:  # Non-empty operations list
-                req_hidden = _apply_layer_steering_to_hidden(req_hidden, layer_spec, state)
+                # Apply steering to the slice and write back
+                transformed_hidden[start_idx:end_idx] = _apply_layer_steering_to_hidden(
+                    hidden[start_idx:end_idx], layer_spec, state
+                )
 
-        request_slices.append(req_hidden)
         start_idx = end_idx
 
-    # Concatenate transformed slices
-    transformed_hidden = torch.cat(request_slices, dim=0)
-
-    # Reconstruct output with transformed hidden state
+    # Reconstruct output with transformed hidden state (same shape as original)
     return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
 
 
@@ -913,7 +912,8 @@ def _reconstruct_output_with_hidden(
         delta, residual = output[0], output[1]
         # transformed_hidden = residual + new_delta
         # new_delta = transformed_hidden - residual
-        new_delta = transformed_hidden - residual
+        # Must be contiguous for vLLM's subsequent operations (rotary embedding)
+        new_delta = (transformed_hidden - residual).contiguous()
         return (new_delta,) + output[1:]
 
     # Handle tensor output
