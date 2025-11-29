@@ -9,6 +9,16 @@ import warnings
 
 import pytest
 
+# Register custom markers to avoid pytest warnings
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )
+    config.addinivalue_line(
+        "markers", "veryslow: marks tests as very slow (requires --run-veryslow)"
+    )
+
+
 # vLLM brings in SWIG-backed helper types that currently emit DeprecationWarnings
 # under Python 3.11. Filter them here so GPU-enabled steering tests run cleanly.
 warnings.filterwarnings(
@@ -22,16 +32,29 @@ def pytest_addoption(parser):
     parser.addoption(
         "--run-slow", action="store_true", default=False, help="run slow tests"
     )
+    parser.addoption(
+        "--run-veryslow", action="store_true", default=False, help="run very slow tests (implies --run-slow)"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--run-slow"):
-        # --run-slow given in cli: do not skip slow tests
-        return
+    run_slow = config.getoption("--run-slow")
+    run_veryslow = config.getoption("--run-veryslow")
+
+    # --run-veryslow implies --run-slow
+    if run_veryslow:
+        run_slow = True
+
     skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
+    skip_veryslow = pytest.mark.skip(reason="need --run-veryslow option to run")
+
     for item in items:
-        if "slow" in item.keywords:
-            item.add_marker(skip_slow)
+        if "veryslow" in item.keywords:
+            if not run_veryslow:
+                item.add_marker(skip_veryslow)
+        elif "slow" in item.keywords:
+            if not run_slow:
+                item.add_marker(skip_slow)
 
 
 @pytest.fixture(autouse=True, scope="function")

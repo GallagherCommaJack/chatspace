@@ -817,27 +817,127 @@ def _apply_per_request_steering(
 
     # Apply steering in-place to avoid shape mismatch with padded tensors
     # vLLM may pad tensors to larger sizes internally, but seq_lens only covers actual tokens
+    if _PERF_COUNTERS_ENABLED:
+        _t0 = time.perf_counter()
+
+    # Fast path: check if all requests use the same layer spec (by identity)
+    # This allows a single batched operation instead of per-request slicing
+    first_layer_spec = None
+    all_same_spec = True
+    any_has_spec = False
+
+    for req_id in request_ids:
+        spec = state.request_steering_specs.get(req_id)
+        if spec is not None and layer_idx in spec.layers:
+            layer_spec = spec.layers[layer_idx]
+            if layer_spec.operations:  # Non-empty operations list
+                if first_layer_spec is None:
+                    first_layer_spec = layer_spec
+                    any_has_spec = True
+                elif layer_spec is not first_layer_spec:
+                    all_same_spec = False
+                    break
+        else:
+            # This request has no spec for this layer
+            if any_has_spec:
+                # Mixed: some have spec, some don't
+                all_same_spec = False
+                break
+
+    if _PERF_COUNTERS_ENABLED:
+        _perf_add_time("steering_uniformity_check", time.perf_counter() - _t0)
+        _t0 = time.perf_counter()
+
+    # Uniform batch fast path: single batched operation
+    if all_same_spec and first_layer_spec is not None:
+        if _PERF_COUNTERS_ENABLED:
+            _perf_incr("steering_fast_path_hits")
+
+        # Compute total real tokens (excludes padding)
+        total_real_tokens = sum(seq_lens)
+
+        # Clone only the portion we need to steer
+        transformed_hidden = hidden.clone()
+
+        if _PERF_COUNTERS_ENABLED:
+            _perf_add_time("steering_clone", time.perf_counter() - _t0)
+            _t0 = time.perf_counter()
+
+        # Single batched steering operation (1 kernel launch instead of N)
+        transformed_hidden[:total_real_tokens] = _apply_layer_steering_to_hidden(
+            hidden[:total_real_tokens], first_layer_spec, state
+        )
+
+        if _PERF_COUNTERS_ENABLED:
+            _perf_incr("steering_tokens_steered", total_real_tokens)
+            _perf_add_time("steering_ops", time.perf_counter() - _t0)
+            _t0 = time.perf_counter()
+
+        result = _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
+
+        if _PERF_COUNTERS_ENABLED:
+            _perf_add_time("steering_reconstruct", time.perf_counter() - _t0)
+
+        return result
+
+    # Slow path: per-request slicing (heterogeneous batch or mixed steered/unsteered)
+    if _PERF_COUNTERS_ENABLED:
+        _perf_incr("steering_slow_path_hits")
+
     transformed_hidden = hidden.clone()
+
+    if _PERF_COUNTERS_ENABLED:
+        _perf_add_time("steering_clone", time.perf_counter() - _t0)
+        _t0 = time.perf_counter()
+        _t_loop = 0.0
+        _t_lookup = 0.0
+        _t_apply = 0.0
+
     start_idx = 0
 
     for i, req_id in enumerate(request_ids):
         seq_len = seq_lens[i]
         end_idx = start_idx + seq_len
 
+        if _PERF_COUNTERS_ENABLED:
+            _t1 = time.perf_counter()
+
         # Apply steering if this request has a spec for this layer
         spec = state.request_steering_specs.get(req_id)
+
+        if _PERF_COUNTERS_ENABLED:
+            _t_lookup += time.perf_counter() - _t1
+
         if spec is not None and layer_idx in spec.layers:
             layer_spec = spec.layers[layer_idx]
             if layer_spec.operations:  # Non-empty operations list
+                if _PERF_COUNTERS_ENABLED:
+                    _t2 = time.perf_counter()
+                    _perf_incr("steering_slice_count")
+                    _perf_incr("steering_tokens_steered", end_idx - start_idx)
                 # Apply steering to the slice and write back
                 transformed_hidden[start_idx:end_idx] = _apply_layer_steering_to_hidden(
                     hidden[start_idx:end_idx], layer_spec, state
                 )
+                if _PERF_COUNTERS_ENABLED:
+                    _t_apply += time.perf_counter() - _t2
 
         start_idx = end_idx
 
+    if _PERF_COUNTERS_ENABLED:
+        _t_loop = time.perf_counter() - _t0
+        _perf_add_time("steering_ops", _t_loop)
+        _perf_add_time("steering_ops_lookup", _t_lookup)
+        _perf_add_time("steering_ops_apply", _t_apply)
+        _t0 = time.perf_counter()
+
     # Reconstruct output with transformed hidden state (same shape as original)
-    return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
+    result = _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
+
+    if _PERF_COUNTERS_ENABLED:
+        _perf_add_time("steering_reconstruct", time.perf_counter() - _t0)
+
+    return result
 
 
 def _apply_layer_steering_to_hidden(
