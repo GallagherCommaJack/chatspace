@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import os
 
 import pytest
@@ -233,7 +235,7 @@ async def test_gemma_hidden_state_capture(model_name: str):
     texts, handles = await model.generate([prompt], sampling_params=sampling_params, steering_spec=baseline_spec, use_tqdm=False, capture_layers=[target_layer])
 
     # Fetch captured states
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     assert len(handles) > 0, "Expected at least one request"
     assert target_layer in handles[0].captures, f"Expected captures for layer {target_layer}"
 
@@ -268,7 +270,7 @@ async def test_gemma_hidden_state_capture(model_name: str):
     )
 
     # Fetch steered captures
-    await model.fetch_captures_batch(handles_steered)
+    await asyncio.gather(*[h.fetch() for h in handles_steered])
     assert len(handles_steered) > 0, "Expected at least one steered request"
     assert target_layer in handles_steered[0].captures, f"Expected captures for layer {target_layer}"
 

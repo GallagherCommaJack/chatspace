@@ -89,7 +89,7 @@ async def test_unlink_file_not_found_error(model_factory, caplog):
     handle = handles[0]
 
     # Fetch captures to trigger shared memory creation
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
     assert len(handle._shm_names) > 0, "Expected shared memory to be used"
 
     # Patch SharedMemory.close() to simulate unlink failure
@@ -138,7 +138,7 @@ async def test_unlink_permission_error(model_factory, caplog):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
     assert len(handle._shm_names) > 0
 
     # Simulate permission error during unlink
@@ -172,7 +172,7 @@ async def test_idempotent_close(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # First close should work normally
     await handle.close()
@@ -241,7 +241,7 @@ async def test_shared_memory_limit_raises_error(model_factory):
     # Fetch should raise Exception when shared memory limit is exceeded
     # (RuntimeError from worker gets wrapped in Exception through RPC)
     with pytest.raises(Exception, match="Shared memory limit reached"):
-        await model.fetch_captures_batch([handle])
+        await handle.fetch()
 
 
 @pytest.mark.slow
@@ -294,7 +294,7 @@ async def test_concurrent_close_operations(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Launch multiple close operations concurrently
     close_tasks = [handle.close() for _ in range(5)]
@@ -323,7 +323,7 @@ async def test_shared_memory_always_used(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Shared memory should always be used
     assert len(handle._shm_names) > 0, "Expected shared memory for captures"
@@ -349,7 +349,7 @@ async def test_multiple_handles_cleanup(model_factory):
     assert len(handles) == 3
 
     # Fetch all handles
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # All should have shared memory
     for handle in handles:
@@ -381,7 +381,7 @@ async def test_basic_capture_with_shared_memory(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Shared memory is always used
     assert len(handle._shm_names) > 0, "Expected shared memory for captures"

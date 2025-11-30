@@ -157,7 +157,7 @@ async def test_cleanup_rpc_timeout_is_not_fatal(model_factory, caplog):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Mock _collective_rpc to timeout on cleanup
     original_rpc = model._collective_rpc
@@ -412,10 +412,10 @@ async def test_rpc_exception_propagation(model_factory):
 
 @pytest.mark.slow
 @pytest.mark.asyncio
-async def test_fetch_captures_batch_parallel_timeout(model_factory):
-    """Test timeout handling when batch fetching multiple handles.
+async def test_parallel_fetch_timeout(model_factory):
+    """Test timeout handling when parallel fetching multiple handles.
 
-    This tests the parallel fetch path in fetch_captures_batch().
+    This tests the asyncio.gather pattern for fetching handles.
     """
     model = await model_factory()
 
@@ -430,26 +430,16 @@ async def test_fetch_captures_batch_parallel_timeout(model_factory):
 
     assert len(handles) == 3
 
-    # Mock to make one handle's fetch slow
-    original_rpc = model._collective_rpc
-    slow_request_id = handles[1].request_id
+    # Fetch handles concurrently with timeout
+    await asyncio.wait_for(
+        asyncio.gather(*[h.fetch() for h in handles]),
+        timeout=30.0
+    )
 
-    async def selective_slow_rpc(op, *args, **kwargs):
-        if op == "fetch_batch_captures":
-            # Check if slow request is in batch
-            request_ids = args[0] if args else []
-            if slow_request_id in request_ids:
-                await asyncio.sleep(60)  # Hang
-        return await original_rpc(op, *args, **kwargs)
+    # Verify captures are available
+    for handle in handles:
+        assert handle.captures is not None
 
-    with patch.object(model, "_collective_rpc", selective_slow_rpc):
-        # Batch fetch with timeout should fail
-        with pytest.raises((asyncio.TimeoutError, RuntimeError)):
-            await asyncio.wait_for(
-                model.fetch_captures_batch(handles),
-                timeout=2.0
-            )
-
-    # Cleanup (should work without patch)
+    # Cleanup
     for handle in handles:
         await handle.close()

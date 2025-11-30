@@ -72,95 +72,55 @@ def print_table(results: list[BenchResult], title: str):
 
 
 # ============================================================================
-# Test steerllm compiled vs uncompiled
+# Test individual op performance (baseline, no compilation)
 # ============================================================================
 
-def bench_steerllm_compiled_ops():
-    """Benchmark steerllm compiled steering ops."""
-    print("\n[1] Benchmarking steerllm compiled ops (torch.compile default mode)")
+def bench_individual_ops():
+    """Benchmark individual steering operations (uncompiled baseline)."""
+    print("\n[1] Benchmarking individual steering ops (uncompiled baseline)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
-    # Create test tensors - larger batch to see if compilation helps
-    hidden_size = 2048
-    seq_lens = [256, 512, 384, 320]  # Larger sequences
-    total_tokens = sum(seq_lens)
-
-    hidden = torch.randn(total_tokens, hidden_size, device=device, dtype=dtype)
-    vec = torch.randn(hidden_size, device=device, dtype=dtype)
-    vec = vec / vec.norm()  # Unit vector
-
+    # Create test tensors
+    hidden_size = 4096
     results = []
 
-    # --- Additive steering ---
-    # Compiled (clear cache to force fresh compilation)
-    steer_rt._COMPILE_STEERING = True
-    steer_rt._compiled_ops.clear()  # Clear cache
-    add_compiled = steer_rt._get_compiled_add()
+    # Test at different sequence lengths
+    for seq_len in [256, 1024, 4096]:
+        hidden = torch.randn(seq_len, hidden_size, device=device, dtype=dtype)
+        vec = torch.randn(hidden_size, device=device, dtype=dtype)
+        vec = vec / vec.norm()
 
-    def bench_add_compiled():
-        return add_compiled(hidden, vec)
+        # --- Additive steering ---
+        def bench_add():
+            return hidden + vec
 
-    r = bench_fn(bench_add_compiled)
-    r.name = "Add (compiled)"
-    results.append(r)
+        r = bench_fn(bench_add)
+        r.name = f"Add (seq_len={seq_len})"
+        results.append(r)
 
-    # Uncompiled
-    def bench_add_uncompiled():
-        return hidden + vec
+        # --- Projection cap ---
+        cap_config = steer_rt._ProjectionCapConfig(unit_vector=vec, min=-0.5, max=0.5)
 
-    r = bench_fn(bench_add_uncompiled)
-    r.name = "Add (uncompiled)"
-    results.append(r)
+        def bench_cap():
+            return steer_rt._apply_projection_cap(hidden, cap_config)
 
-    # --- Projection cap ---
-    cap_min, cap_max = -0.5, 0.5
+        r = bench_fn(bench_cap)
+        r.name = f"Projection cap (seq_len={seq_len})"
+        results.append(r)
 
-    # Compiled (both bounds)
-    cap_compiled = steer_rt._get_compiled_projection_cap(True, True)
+        # --- Ablation ---
+        ablation_config = steer_rt._AblationConfig(unit_vector=vec, scale=0.5)
 
-    def bench_cap_compiled():
-        return cap_compiled(hidden, vec, cap_min, cap_max)
+        def bench_ablation():
+            return steer_rt._apply_ablation(hidden, ablation_config)
 
-    r = bench_fn(bench_cap_compiled)
-    r.name = "Projection cap (compiled, both bounds)"
-    results.append(r)
+        r = bench_fn(bench_ablation)
+        r.name = f"Ablation (seq_len={seq_len})"
+        results.append(r)
 
-    # Uncompiled (using original function)
-    config = steer_rt._ProjectionCapConfig(unit_vector=vec, min=cap_min, max=cap_max)
-
-    def bench_cap_uncompiled():
-        return steer_rt._apply_projection_cap(hidden, config)
-
-    r = bench_fn(bench_cap_uncompiled)
-    r.name = "Projection cap (uncompiled)"
-    results.append(r)
-
-    # --- Ablation ---
-    scale = 0.5
-
-    # Compiled
-    ablation_compiled = steer_rt._get_compiled_ablation()
-
-    def bench_ablation_compiled():
-        return ablation_compiled(hidden, vec, scale)
-
-    r = bench_fn(bench_ablation_compiled)
-    r.name = "Ablation (compiled)"
-    results.append(r)
-
-    # Uncompiled
-    ablation_config = steer_rt._AblationConfig(unit_vector=vec, scale=scale)
-
-    def bench_ablation_uncompiled():
-        return steer_rt._apply_ablation(hidden, ablation_config)
-
-    r = bench_fn(bench_ablation_uncompiled)
-    r.name = "Ablation (uncompiled)"
-    results.append(r)
-
-    print_table(results, "steerllm: Compiled vs Uncompiled Ops")
+    print_table(results, "Individual Op Performance (Uncompiled)")
     return results
 
 
@@ -170,12 +130,12 @@ def bench_steerllm_compiled_ops():
 
 def bench_fast_vs_slow_path():
     """Benchmark uniform (fast) vs heterogeneous (slow) batch steering."""
-    print("\n[2] Benchmarking fast path vs slow path")
+    print("\n[2] Benchmarking fast path vs slow path (with loop-level compilation)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
-    hidden_size = 2048
+    hidden_size = 4096  # Larger to match real models
     num_requests = 32
     seq_len_per_request = 64
     total_tokens = num_requests * seq_len_per_request
@@ -196,7 +156,7 @@ def bench_fast_vs_slow_path():
         pass
 
     layer_spec = LayerSpec()
-    layer_spec.operations = [("add", vec, None)]
+    layer_spec.operations = [("cap", vec, (-0.5, 0.5))]  # Use cap for more realistic benchmark
 
     # Create identical specs for all requests (fast path)
     class Spec:
@@ -214,9 +174,7 @@ def bench_fast_vs_slow_path():
 
     results = []
 
-    # Fast path benchmark
-    steer_rt._COMPILE_STEERING = True
-
+    # Fast path benchmark (uniform batch - single batched op)
     def bench_fast_path():
         h = hidden.clone()
         # Check uniformity
@@ -241,39 +199,51 @@ def bench_fast_vs_slow_path():
     r.name = f"Fast path (uniform, {num_requests} reqs)"
     results.append(r)
 
-    # Slow path benchmark - create separate spec objects
+    # Slow path benchmark - create separate spec objects (heterogeneous)
+    layer_specs_list = []
     for i, req_id in enumerate(request_ids):
         separate_spec = Spec()
         separate_layer_spec = LayerSpec()
-        separate_layer_spec.operations = [("add", vec, None)]
+        separate_layer_spec.operations = [("cap", vec, (-0.5, 0.5))]
         separate_spec.layers = {0: separate_layer_spec}
         state.request_steering_specs[req_id] = separate_spec  # Different objects
+        layer_specs_list.append(separate_layer_spec)
 
-    def bench_slow_path():
+    # Test slow path with loop-level compilation
+    steer_rt._COMPILE_STEERING = True
+    # Clear cached compiled function to force recompilation
+    steer_rt._compiled_slow_path = None
+
+    def bench_slow_path_compiled():
         h = hidden.clone()
-        start_idx = 0
-        for i, req_id in enumerate(request_ids):
-            seq_len = seq_lens[i]
-            end_idx = start_idx + seq_len
-            spec = state.request_steering_specs.get(req_id)
-            if spec and 0 in spec.layers:
-                h[start_idx:end_idx] = steer_rt._apply_layer_steering_to_hidden(
-                    h[start_idx:end_idx], spec.layers[0], state
-                )
-            start_idx = end_idx
-        return h
+        slow_path_fn = steer_rt._get_compiled_slow_path()
+        return slow_path_fn(h, seq_lens, layer_specs_list)
 
-    r = bench_fn(bench_slow_path)
-    r.name = f"Slow path (heterogeneous, {num_requests} reqs)"
+    r = bench_fn(bench_slow_path_compiled)
+    r.name = f"Slow path compiled (heterogeneous, {num_requests} reqs)"
     results.append(r)
 
-    print_table(results, "Fast Path vs Slow Path")
+    # Test slow path uncompiled
+    steer_rt._COMPILE_STEERING = False
 
-    # Calculate speedup
+    def bench_slow_path_uncompiled():
+        h = hidden.clone()
+        return steer_rt._slow_path_loop_impl(h, seq_lens, layer_specs_list)
+
+    r = bench_fn(bench_slow_path_uncompiled)
+    r.name = f"Slow path uncompiled (heterogeneous, {num_requests} reqs)"
+    results.append(r)
+
+    print_table(results, "Fast Path vs Slow Path (Loop-Level Compilation)")
+
+    # Calculate speedups
     fast_time = results[0].mean_us
-    slow_time = results[1].mean_us
-    speedup = slow_time / fast_time
-    print(f"  Fast path speedup: {speedup:.1f}x")
+    slow_compiled = results[1].mean_us
+    slow_uncompiled = results[2].mean_us
+
+    print(f"  Fast path vs slow uncompiled: {slow_uncompiled / fast_time:.1f}x faster")
+    print(f"  Compiled vs uncompiled slow path: {slow_uncompiled / slow_compiled:.2f}x faster")
+    print(f"  Fast path vs slow compiled: {slow_compiled / fast_time:.1f}x faster")
 
     return results
 
@@ -289,7 +259,7 @@ def bench_steerllm_vs_chatspace():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
-    hidden_size = 2048
+    hidden_size = 4096
     seq_len = 512
     hidden = torch.randn(seq_len, hidden_size, device=device, dtype=dtype)
     vec = torch.randn(hidden_size, device=device, dtype=dtype)
@@ -297,18 +267,14 @@ def bench_steerllm_vs_chatspace():
 
     results = []
 
-    # steerllm projection cap
-    steer_rt._COMPILE_STEERING = True
-    steer_rt._compiled_ops.clear()
-
+    # steerllm projection cap (uncompiled - individual ops aren't compiled anymore)
     steer_config = steer_rt._ProjectionCapConfig(unit_vector=vec, min=-0.5, max=0.5)
-    steer_cap_compiled = steer_rt._get_compiled_projection_cap(True, True)
 
     def bench_steerllm_cap():
-        return steer_cap_compiled(hidden, vec, -0.5, 0.5)
+        return steer_rt._apply_projection_cap(hidden, steer_config)
 
     r = bench_fn(bench_steerllm_cap)
-    r.name = "steerllm: projection cap (compiled)"
+    r.name = "steerllm: projection cap"
     results.append(r)
 
     # chatspace projection cap
@@ -321,19 +287,19 @@ def bench_steerllm_vs_chatspace():
             return chat_rt._apply_projection_cap(hidden, chat_config)
 
         r = bench_fn(bench_chatspace_cap)
-        r.name = "chatspace: projection cap (uncompiled)"
+        r.name = "chatspace: projection cap"
         results.append(r)
     except ImportError:
         print("  [SKIP] chatspace runtime not available")
 
     # steerllm ablation
-    steer_ablation_compiled = steer_rt._get_compiled_ablation()
+    steer_ablation_config = steer_rt._AblationConfig(unit_vector=vec, scale=0.5)
 
     def bench_steerllm_ablation():
-        return steer_ablation_compiled(hidden, vec, 0.5)
+        return steer_rt._apply_ablation(hidden, steer_ablation_config)
 
     r = bench_fn(bench_steerllm_ablation)
-    r.name = "steerllm: ablation (compiled)"
+    r.name = "steerllm: ablation"
     results.append(r)
 
     # chatspace ablation
@@ -346,7 +312,7 @@ def bench_steerllm_vs_chatspace():
             return chat_rt._apply_ablation(hidden, chat_ablation_config)
 
         r = bench_fn(bench_chatspace_ablation)
-        r.name = "chatspace: ablation (uncompiled)"
+        r.name = "chatspace: ablation"
         results.append(r)
     except ImportError:
         pass
@@ -356,33 +322,47 @@ def bench_steerllm_vs_chatspace():
 
 
 # ============================================================================
-# Compilation warmup overhead
+# Loop-level compilation warmup overhead
 # ============================================================================
 
 def bench_compilation_overhead():
-    """Measure first-call compilation overhead."""
-    print("\n[4] Measuring compilation warmup overhead")
+    """Measure first-call compilation overhead for loop-level compilation."""
+    print("\n[4] Measuring loop-level compilation warmup overhead")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
-    hidden_size = 2048
-    seq_len = 256
-    hidden = torch.randn(seq_len, hidden_size, device=device, dtype=dtype)
+    hidden_size = 4096
+    num_requests = 32
+    seq_len_per = 64
+    total_tokens = num_requests * seq_len_per
+
+    hidden = torch.randn(total_tokens, hidden_size, device=device, dtype=dtype)
     vec = torch.randn(hidden_size, device=device, dtype=dtype)
     vec = vec / vec.norm()
 
-    results = []
+    seq_lens = [seq_len_per] * num_requests
+
+    # Create layer specs
+    class LayerSpec:
+        pass
+
+    layer_specs = []
+    for _ in range(num_requests):
+        ls = LayerSpec()
+        ls.operations = [("cap", vec, (-0.5, 0.5))]
+        layer_specs.append(ls)
 
     # Clear cache to force recompilation
-    steer_rt._compiled_ops.clear()
+    steer_rt._compiled_slow_path = None
     steer_rt._COMPILE_STEERING = True
 
     # First call (includes compilation)
     torch.cuda.synchronize()
     start = time.perf_counter()
-    cap_fn = steer_rt._get_compiled_projection_cap(True, True)
-    _ = cap_fn(hidden, vec, -0.5, 0.5)
+    slow_path_fn = steer_rt._get_compiled_slow_path()
+    h = hidden.clone()
+    _ = slow_path_fn(h, seq_lens, layer_specs)
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - start) * 1000
 
@@ -390,8 +370,9 @@ def bench_compilation_overhead():
     times = []
     for _ in range(100):
         torch.cuda.synchronize()
+        h = hidden.clone()
         start = time.perf_counter()
-        _ = cap_fn(hidden, vec, -0.5, 0.5)
+        _ = slow_path_fn(h, seq_lens, layer_specs)
         torch.cuda.synchronize()
         times.append((time.perf_counter() - start) * 1000)
 
@@ -415,7 +396,7 @@ def bench_compilation_overhead():
 
 def main():
     print("="*60)
-    print(" Steering Compilation Benchmark")
+    print(" Steering Loop-Level Compilation Benchmark")
     print("="*60)
 
     if torch.cuda.is_available():
@@ -427,7 +408,7 @@ def main():
     print(f"PyTorch version: {torch.__version__}")
 
     # Run benchmarks
-    bench_steerllm_compiled_ops()
+    bench_individual_ops()
     bench_fast_vs_slow_path()
     bench_steerllm_vs_chatspace()
     bench_compilation_overhead()

@@ -550,7 +550,7 @@ async def test_single_int_capture_layer(model_factory):
     assert len(results) == 1
     handle = handles[0]
 
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Should have captured layer 5
     assert 5 in handle.captures
@@ -577,7 +577,7 @@ async def test_duplicate_capture_layers(model_factory):
     assert len(results) == 1
     handle = handles[0]
 
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Should have both layers (duplicates deduplicated)
     assert 5 in handle.captures

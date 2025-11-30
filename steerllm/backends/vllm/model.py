@@ -501,45 +501,56 @@ class VLLMSteeringModel(SyncWrapperMixin):
     async def generate(
         self,
         prompts: list[str],
+        sampling_params: Any | None = None,
         *,
         max_tokens: int = 256,
         temperature: float = 1.0,
         steering_spec: SteeringSpec | None = None,
         capture_layers: Sequence[int] | None = None,
+        raw_output: bool = False,
         **sampling_kwargs: Any,
-    ) -> tuple[list[str], list[CaptureHandle] | None]:
+    ) -> tuple[list[str], list[CaptureHandle] | None] | tuple[list[Any], list[CaptureHandle] | None]:
         """Generate text with optional steering and capture.
 
         Parameters
         ----------
         prompts :
             Input prompts for generation.
+        sampling_params :
+            Optional vLLM SamplingParams object. If provided, max_tokens,
+            temperature, and sampling_kwargs are ignored.
         max_tokens :
-            Maximum tokens to generate per prompt.
+            Maximum tokens to generate per prompt (ignored if sampling_params provided).
         temperature :
-            Sampling temperature.
+            Sampling temperature (ignored if sampling_params provided).
         steering_spec :
             Optional steering configuration.
         capture_layers :
             Optional layer indices to capture activations from.
+        raw_output :
+            If True, return full vLLM RequestOutput objects instead of text strings.
         **sampling_kwargs :
-            Additional sampling parameters.
+            Additional sampling parameters (ignored if sampling_params provided).
 
         Returns
         -------
         tuple[list[str], list[CaptureHandle] | None]
             Generated texts and capture handles (or None if no capture).
+            If raw_output=True, returns RequestOutput objects instead of strings.
         """
         from vllm import SamplingParams
 
         await self._ensure_engine_initialized()
 
-        # Create sampling params
-        params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            **sampling_kwargs,
-        )
+        # Use provided sampling params or create from kwargs
+        if sampling_params is not None:
+            params = sampling_params
+        else:
+            params = SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **sampling_kwargs,
+            )
 
         # Convert capture_layers to tuple
         layers_tuple: tuple[int, ...] | None = None
@@ -601,7 +612,7 @@ class VLLMSteeringModel(SyncWrapperMixin):
 
         try:
             # Generate all prompts concurrently
-            async def process_one(i: int, prompt: str) -> str:
+            async def process_one(i: int, prompt: str) -> Any:
                 req_id = request_ids[i]
                 final_output = None
                 async for output in self._engine.generate(
@@ -612,13 +623,15 @@ class VLLMSteeringModel(SyncWrapperMixin):
                 if final_output is None:
                     raise RuntimeError(f"No output for prompt: {prompt}")
 
+                if raw_output:
+                    return final_output
                 return final_output.outputs[0].text
 
             # Launch all requests concurrently
             tasks = [process_one(i, p) for i, p in enumerate(prompts)]
-            texts = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
 
-            return list(texts), handles
+            return list(results), handles
 
         finally:
             # Clean up steering specs
@@ -640,37 +653,45 @@ class VLLMSteeringModel(SyncWrapperMixin):
     async def chat(
         self,
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        sampling_params: Any | None = None,
         *,
         max_tokens: int = 256,
         temperature: float = 1.0,
         steering_spec: SteeringSpec | None = None,
         capture_layers: Sequence[int] | None = None,
         chat_options: dict[str, Any] | None = None,
+        raw_output: bool = False,
         **sampling_kwargs: Any,
-    ) -> tuple[list[ChatResponse], list[CaptureHandle] | None]:
+    ) -> tuple[list[ChatResponse], list[CaptureHandle] | None] | tuple[list[Any], list[CaptureHandle] | None]:
         """Chat-style generation with optional steering and capture.
 
         Parameters
         ----------
         messages :
             Single conversation or batch of conversations.
+        sampling_params :
+            Optional vLLM SamplingParams object. If provided, max_tokens,
+            temperature, and sampling_kwargs are ignored.
         max_tokens :
-            Maximum tokens to generate.
+            Maximum tokens to generate (ignored if sampling_params provided).
         temperature :
-            Sampling temperature.
+            Sampling temperature (ignored if sampling_params provided).
         steering_spec :
             Optional steering configuration.
         capture_layers :
             Optional layer indices to capture.
         chat_options :
             Options passed to apply_chat_template().
+        raw_output :
+            If True, return full vLLM RequestOutput objects instead of ChatResponse.
         **sampling_kwargs :
-            Additional sampling parameters.
+            Additional sampling parameters (ignored if sampling_params provided).
 
         Returns
         -------
         tuple[list[ChatResponse], list[CaptureHandle] | None]
             Chat responses and capture handles.
+            If raw_output=True, returns RequestOutput objects instead of ChatResponse.
         """
         # Normalize to batch format
         single_conversation = isinstance(messages, list) and (
@@ -683,26 +704,49 @@ class VLLMSteeringModel(SyncWrapperMixin):
         if chat_options:
             chat_kwargs.update(chat_options)
 
+        # Track prefill text for each conversation (assistant prefix when continue_final_message)
+        prefill_texts: list[str] = []
         prompts = []
         for conv in conversations:
+            # Check if we're continuing a final assistant message
+            has_prefill = (
+                conv
+                and conv[-1].get("role") == "assistant"
+                and chat_kwargs.get("continue_final_message", False)
+            )
+            prefill_text = conv[-1].get("content", "") if has_prefill else ""
+            prefill_texts.append(prefill_text)
+
             prompt = self.tokenizer.apply_chat_template(conv, **chat_kwargs)
             prompts.append(prompt)
 
         # Generate
-        texts, handles = await self.generate(
+        results, handles = await self.generate(
             prompts,
+            sampling_params=sampling_params,
             max_tokens=max_tokens,
             temperature=temperature,
             steering_spec=steering_spec,
             capture_layers=capture_layers,
+            raw_output=raw_output,
             **sampling_kwargs,
         )
 
+        # Return raw output if requested
+        if raw_output:
+            # Add message boundaries to handles if capturing
+            if handles is not None:
+                for i, handle in enumerate(handles):
+                    boundaries = self._compute_message_boundaries(
+                        conversations[i], chat_kwargs
+                    )
+                    handle.message_boundaries = boundaries
+            return results, handles
+
         # Convert to ChatResponse
         responses = []
-        for i, text in enumerate(texts):
-            prompt = prompts[i]
-            responses.append(ChatResponse(prefill=prompt, generated=text))
+        for i, text in enumerate(results):
+            responses.append(ChatResponse(prefill=prefill_texts[i], generated=text))
 
         # Add message boundaries to handles if capturing
         if handles is not None:

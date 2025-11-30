@@ -203,8 +203,8 @@ async def test_comprehensive_vllm_integration():
             steering_spec=steering_spec,
         )
 
-        # Fetch all captures in batch (efficient single RPC)
-        await vllm_model.fetch_captures_batch(handles)
+        # Fetch all captures concurrently
+        await asyncio.gather(*[h.fetch() for h in handles])
 
         print(f"✓ Generated {len(texts)} sequences")
         for i, text in enumerate(texts):
@@ -469,7 +469,7 @@ async def test_comprehensive_vllm_integration():
                 capture_layers=capture_layers,
                 steering_spec=steering_spec,
             )
-            await vllm_model.fetch_captures_batch(handles_conc)
+            await asyncio.gather(*[h.fetch() for h in handles_conc])
             return (texts_conc[0], handles_conc[0].captures, prompt_idx)
 
         # Queue up concurrent tasks
@@ -777,7 +777,7 @@ async def test_mixed_batch_capture_ordering():
             capture_layers=[2],
         )
 
-        await vllm_model.fetch_captures_batch(handles)
+        await asyncio.gather(*[h.fetch() for h in handles])
 
         print(f"\n{'='*80}")
         print("MIXED BATCH CAPTURE ORDERING TEST")

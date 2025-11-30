@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -43,7 +45,7 @@ async def test_hidden_state_capture_basic():
     # Verify we got a handle
     assert len(handles) == 1, "Expected one capture handle"
     handle = handles[0]
-    assert handle.request_id.startswith("capture_"), "Expected capture request ID"
+    assert handle.request_id, "Expected non-empty request ID"
     assert target_layer in handle.layer_indices, f"Expected layer {target_layer} in handle"
 
     # Fetch captured states
@@ -141,7 +143,7 @@ async def test_hidden_state_capture_batch_fetch():
     assert len(handles) == len(prompts), f"Expected {len(prompts)} handles"
 
     # Batch fetch all handles at once
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # Verify all handles have captures
     for i, handle in enumerate(handles):
