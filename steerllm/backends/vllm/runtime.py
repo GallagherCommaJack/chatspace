@@ -217,8 +217,112 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Configuration from environment
 _CAPTURE_METADATA_ENABLED = _env_flag("STEERLLM_CAPTURE_METADATA", True)
 
+# Enable torch.compile for steering ops (reduces kernel launch overhead)
+# NOTE: Benchmarks show compilation adds overhead for small tensor ops.
+# Disabled by default. The uniform batch fast path is the main optimization.
+_COMPILE_STEERING = _env_flag("STEERLLM_COMPILE_STEERING", False)
+
 # Optional precision override for projection caps
 _PROJECTION_CAP_PRECISION: torch.dtype | None = None
+
+# =============================================================================
+# Compiled Steering Operations
+# =============================================================================
+# Pre-specialized compiled functions for steering ops with dynamic shapes.
+# Each variant is compiled lazily on first use to handle control flow branches.
+
+_compiled_ops: dict[tuple, Callable] = {}
+
+
+def _get_compiled_projection_cap(has_min: bool, has_max: bool) -> Callable:
+    """Get or create compiled projection cap for this min/max variant.
+
+    Specializes the control flow at compile time to avoid graph breaks.
+    Uses dynamic=True for varying sequence lengths and batch sizes.
+    """
+    key = ("cap", has_min, has_max)
+    if key in _compiled_ops:
+        return _compiled_ops[key]
+
+    if has_min and has_max:
+        def _impl(hidden: torch.Tensor, vec: torch.Tensor,
+                  cap_min: float, cap_max: float) -> torch.Tensor:
+            proj = hidden @ vec
+            clamped = torch.clamp(proj, min=cap_min, max=cap_max)
+            diff = (clamped - proj).unsqueeze(-1)
+            return hidden + diff * vec
+    elif has_min:
+        def _impl(hidden: torch.Tensor, vec: torch.Tensor,
+                  cap_min: float, cap_max: float) -> torch.Tensor:
+            proj = hidden @ vec
+            clamped = torch.clamp(proj, min=cap_min)
+            diff = (clamped - proj).unsqueeze(-1)
+            return hidden + diff * vec
+    elif has_max:
+        def _impl(hidden: torch.Tensor, vec: torch.Tensor,
+                  cap_min: float, cap_max: float) -> torch.Tensor:
+            proj = hidden @ vec
+            clamped = torch.clamp(proj, max=cap_max)
+            diff = (clamped - proj).unsqueeze(-1)
+            return hidden + diff * vec
+    else:
+        # No clamping needed - return identity
+        def _impl(hidden: torch.Tensor, vec: torch.Tensor,
+                  cap_min: float, cap_max: float) -> torch.Tensor:
+            return hidden
+
+    try:
+        # Use default mode - reduce-overhead has too much per-call overhead for small ops
+        compiled = torch.compile(_impl, dynamic=True)
+    except Exception as e:
+        logger.warning(f"torch.compile failed for projection cap: {e}, using uncompiled")
+        compiled = _impl
+
+    _compiled_ops[key] = compiled
+    return compiled
+
+
+def _get_compiled_ablation() -> Callable:
+    """Get or create compiled ablation function.
+
+    Uses dynamic=True for varying sequence lengths.
+    """
+    key = ("ablation",)
+    if key in _compiled_ops:
+        return _compiled_ops[key]
+
+    def _impl(hidden: torch.Tensor, vec: torch.Tensor, scale: float) -> torch.Tensor:
+        proj = hidden @ vec
+        adjustment = ((scale - 1) * proj).unsqueeze(-1)
+        return hidden + adjustment * vec
+
+    try:
+        compiled = torch.compile(_impl, dynamic=True)
+    except Exception as e:
+        logger.warning(f"torch.compile failed for ablation: {e}, using uncompiled")
+        compiled = _impl
+
+    _compiled_ops[key] = compiled
+    return compiled
+
+
+def _get_compiled_add() -> Callable:
+    """Get or create compiled additive steering function."""
+    key = ("add",)
+    if key in _compiled_ops:
+        return _compiled_ops[key]
+
+    def _impl(hidden: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        return hidden + vec
+
+    try:
+        compiled = torch.compile(_impl, dynamic=True)
+    except Exception as e:
+        logger.warning(f"torch.compile failed for additive: {e}, using uncompiled")
+        compiled = _impl
+
+    _compiled_ops[key] = compiled
+    return compiled
 
 
 @dataclass
@@ -472,25 +576,51 @@ def _apply_layer_steering_to_hidden(
 
     Operations are applied in sequence order.
     Each operation is a tuple: (op_type, vector, params)
+
+    Uses compiled ops when STEERLLM_COMPILE_STEERING=1 (default) for reduced
+    kernel launch overhead via torch.compile with dynamic shapes.
     """
     ops = layer_spec.operations
     if not ops:
         return hidden
 
     for op_type, vec, params in ops:
-        if op_type == "add":
-            if vec.device != hidden.device or vec.dtype != hidden.dtype:
-                vec = vec.to(device=hidden.device, dtype=hidden.dtype)
-            hidden = hidden + vec
-        elif op_type == "cap":
-            cap_min, cap_max = params
-            hidden = _apply_projection_cap(
-                hidden, _ProjectionCapConfig(unit_vector=vec, min=cap_min, max=cap_max)
-            )
-        elif op_type == "ablation":
-            hidden = _apply_ablation(
-                hidden, _AblationConfig(unit_vector=vec, scale=params)
-            )
+        # Ensure vector is on correct device/dtype
+        if vec.device != hidden.device or vec.dtype != hidden.dtype:
+            vec = vec.to(device=hidden.device, dtype=hidden.dtype)
+
+        if _COMPILE_STEERING:
+            # Use compiled ops for reduced kernel launch overhead
+            if op_type == "add":
+                compiled_fn = _get_compiled_add()
+                hidden = compiled_fn(hidden, vec)
+            elif op_type == "cap":
+                cap_min, cap_max = params
+                has_min = cap_min is not None
+                has_max = cap_max is not None
+                compiled_fn = _get_compiled_projection_cap(has_min, has_max)
+                # Pass 0.0 as sentinel for None values (compiled fn expects floats)
+                hidden = compiled_fn(
+                    hidden, vec,
+                    cap_min if has_min else 0.0,
+                    cap_max if has_max else 0.0,
+                )
+            elif op_type == "ablation":
+                compiled_fn = _get_compiled_ablation()
+                hidden = compiled_fn(hidden, vec, params)
+        else:
+            # Uncompiled fallback
+            if op_type == "add":
+                hidden = hidden + vec
+            elif op_type == "cap":
+                cap_min, cap_max = params
+                hidden = _apply_projection_cap(
+                    hidden, _ProjectionCapConfig(unit_vector=vec, min=cap_min, max=cap_max)
+                )
+            elif op_type == "ablation":
+                hidden = _apply_ablation(
+                    hidden, _AblationConfig(unit_vector=vec, scale=params)
+                )
 
     return hidden
 
@@ -503,7 +633,12 @@ def _apply_per_request_steering(
     seq_lens: list[int] | None,
     cached_hidden: torch.Tensor | None = None,
 ) -> Any:
-    """Apply per-request steering by slicing and transforming hidden states."""
+    """Apply per-request steering by slicing and transforming hidden states.
+
+    Uses a fast path when all requests have identical steering specs (by identity),
+    avoiding per-request slicing overhead. Falls back to slow path for heterogeneous
+    batches where different requests have different steering configurations.
+    """
     hidden = cached_hidden if cached_hidden is not None else _extract_hidden_from_output(output)
     if hidden is None or hidden.dim() != 2:
         return output
@@ -520,25 +655,61 @@ def _apply_per_request_steering(
                     return _reconstruct_output_with_hidden(output, hidden, new_hidden)
         return output
 
-    # Multiple requests: slice, transform, concatenate
-    request_slices = []
+    # Fast path: check if all requests use the same layer spec (by identity)
+    # This allows a single batched operation instead of per-request slicing
+    first_layer_spec = None
+    all_same_spec = True
+    any_has_spec = False
+
+    for req_id in request_ids:
+        spec = state.request_steering_specs.get(req_id)
+        if spec is not None and layer_idx in spec.layers:
+            layer_spec = spec.layers[layer_idx]
+            if layer_spec.operations:  # Non-empty operations list
+                if first_layer_spec is None:
+                    first_layer_spec = layer_spec
+                    any_has_spec = True
+                elif layer_spec is not first_layer_spec:
+                    all_same_spec = False
+                    break
+        else:
+            # This request has no spec for this layer
+            if any_has_spec:
+                # Mixed: some have spec, some don't
+                all_same_spec = False
+                break
+
+    # Uniform batch fast path: single batched operation
+    if all_same_spec and first_layer_spec is not None:
+        # Compute total real tokens (excludes padding)
+        total_real_tokens = sum(seq_lens)
+
+        # Clone to avoid modifying original, apply steering to real tokens only
+        transformed_hidden = hidden.clone()
+        transformed_hidden[:total_real_tokens] = _apply_layer_steering_to_hidden(
+            hidden[:total_real_tokens], first_layer_spec, state
+        )
+        return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
+
+    # Slow path: per-request slicing (heterogeneous batch or mixed steered/unsteered)
+    transformed_hidden = hidden.clone()
     start_idx = 0
 
     for i, req_id in enumerate(request_ids):
         seq_len = seq_lens[i]
         end_idx = start_idx + seq_len
-        req_hidden = hidden[start_idx:end_idx]
 
         spec = state.request_steering_specs.get(req_id)
         if spec is not None and layer_idx in spec.layers:
             layer_spec = spec.layers[layer_idx]
             if layer_spec.operations:
-                req_hidden = _apply_layer_steering_to_hidden(req_hidden, layer_spec, state)
+                # Apply steering to slice and write back
+                transformed_hidden[start_idx:end_idx] = _apply_layer_steering_to_hidden(
+                    hidden[start_idx:end_idx], layer_spec, state
+                )
 
-        request_slices.append(req_hidden)
         start_idx = end_idx
 
-    transformed_hidden = torch.cat(request_slices, dim=0)
     return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
 
 
