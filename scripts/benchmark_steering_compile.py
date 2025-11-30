@@ -209,21 +209,7 @@ def bench_fast_vs_slow_path():
         state.request_steering_specs[req_id] = separate_spec  # Different objects
         layer_specs_list.append(separate_layer_spec)
 
-    # Test slow path with loop-level compilation
-    steer_rt._COMPILE_STEERING = True
-    # Clear cached compiled function to force recompilation
-    steer_rt._compiled_slow_path = None
-
-    def bench_slow_path_compiled():
-        h = hidden.clone()
-        slow_path_fn = steer_rt._get_compiled_slow_path()
-        return slow_path_fn(h, seq_lens, layer_specs_list)
-
-    r = bench_fn(bench_slow_path_compiled)
-    r.name = f"Slow path compiled (heterogeneous, {num_requests} reqs)"
-    results.append(r)
-
-    # Test slow path uncompiled
+    # Test slow path (loop-based) uncompiled
     steer_rt._COMPILE_STEERING = False
 
     def bench_slow_path_uncompiled():
@@ -231,19 +217,60 @@ def bench_fast_vs_slow_path():
         return steer_rt._slow_path_loop_impl(h, seq_lens, layer_specs_list)
 
     r = bench_fn(bench_slow_path_uncompiled)
-    r.name = f"Slow path uncompiled (heterogeneous, {num_requests} reqs)"
+    r.name = f"Slow path loop (uncompiled, {num_requests} reqs)"
     results.append(r)
 
-    print_table(results, "Fast Path vs Slow Path (Loop-Level Compilation)")
+    # Test slow path (loop-based) compiled
+    steer_rt._COMPILE_STEERING = True
+    steer_rt._compiled_slow_path = None  # Force recompilation
+
+    def bench_slow_path_compiled():
+        h = hidden.clone()
+        slow_path_fn = steer_rt._get_compiled_slow_path()
+        return slow_path_fn(h, seq_lens, layer_specs_list)
+
+    r = bench_fn(bench_slow_path_compiled)
+    r.name = f"Slow path loop (compiled, {num_requests} reqs)"
+    results.append(r)
+
+    # Test gather/scatter uncompiled
+    steer_rt._COMPILE_STEERING = False
+
+    def bench_gather_scatter_uncompiled():
+        h = hidden.clone()
+        return steer_rt._gather_scatter_steering(h, seq_lens, layer_specs_list)
+
+    r = bench_fn(bench_gather_scatter_uncompiled)
+    r.name = f"Gather/scatter (uncompiled, {num_requests} reqs)"
+    results.append(r)
+
+    # Test gather/scatter compiled
+    steer_rt._COMPILE_STEERING = True
+    steer_rt._compiled_gather_scatter = None  # Force recompilation
+
+    def bench_gather_scatter_compiled():
+        h = hidden.clone()
+        gather_fn = steer_rt._get_compiled_gather_scatter()
+        return gather_fn(h, seq_lens, layer_specs_list)
+
+    r = bench_fn(bench_gather_scatter_compiled)
+    r.name = f"Gather/scatter (compiled, {num_requests} reqs)"
+    results.append(r)
+
+    print_table(results, "Fast Path vs Slow Path vs Gather/Scatter")
 
     # Calculate speedups
     fast_time = results[0].mean_us
-    slow_compiled = results[1].mean_us
-    slow_uncompiled = results[2].mean_us
+    slow_uncompiled = results[1].mean_us
+    slow_compiled = results[2].mean_us
+    gather_uncompiled = results[3].mean_us
+    gather_compiled = results[4].mean_us
 
     print(f"  Fast path vs slow uncompiled: {slow_uncompiled / fast_time:.1f}x faster")
-    print(f"  Compiled vs uncompiled slow path: {slow_uncompiled / slow_compiled:.2f}x faster")
-    print(f"  Fast path vs slow compiled: {slow_compiled / fast_time:.1f}x faster")
+    print(f"  Slow path compiled vs uncompiled: {slow_uncompiled / slow_compiled:.2f}x faster")
+    print(f"  Gather/scatter uncompiled vs slow uncompiled: {slow_uncompiled / gather_uncompiled:.2f}x faster")
+    print(f"  Gather/scatter compiled vs slow compiled: {slow_compiled / gather_compiled:.2f}x faster")
+    print(f"  Gather/scatter compiled vs slow uncompiled: {slow_uncompiled / gather_compiled:.2f}x faster")
 
     return results
 

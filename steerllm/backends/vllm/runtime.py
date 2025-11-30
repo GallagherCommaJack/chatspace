@@ -10,12 +10,14 @@ Note: This is a standalone reimplementation for steerllm, not dependent on chats
 from __future__ import annotations
 
 import atexit
+import hashlib
 import importlib
 import logging
 import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import wraps
 from multiprocessing.shared_memory import SharedMemory
@@ -134,6 +136,37 @@ def deserialize_tensor(
         tensor = tensor.to(dtype=dtype)
     if device is not None:
         tensor = tensor.to(device=device)
+    return tensor
+
+
+def _intern_vector(state: "_SteeringState", tensor: torch.Tensor) -> torch.Tensor:
+    """Intern a steering vector to enable gather/scatter optimization.
+
+    Returns a cached tensor if one with identical content exists,
+    otherwise caches and returns the input tensor. This ensures
+    vectors with the same content share the same `id()`, enabling
+    the gather/scatter path to batch them together.
+
+    Uses SHA256 hash of tensor bytes for content-based deduplication.
+    LRU eviction keeps cache size bounded.
+    """
+    # Hash tensor content (view as uint8 for universal dtype support)
+    tensor_bytes = tensor.detach().cpu().view(torch.uint8).numpy().tobytes()
+    content_hash = hashlib.sha256(tensor_bytes).hexdigest()
+
+    # Check cache
+    if content_hash in state.vector_cache:
+        # Move to end (most recently used)
+        state.vector_cache.move_to_end(content_hash)
+        return state.vector_cache[content_hash]
+
+    # Not in cache - add it
+    state.vector_cache[content_hash] = tensor
+
+    # LRU eviction if over limit
+    while len(state.vector_cache) > state.vector_cache_max_size:
+        state.vector_cache.popitem(last=False)  # Remove oldest
+
     return tensor
 
 
@@ -307,6 +340,128 @@ def _get_compiled_slow_path() -> Callable:
     return _compiled_slow_path
 
 
+# =============================================================================
+# Gather/Scatter Path (optimized for heterogeneous batches)
+# =============================================================================
+
+
+def _gather_scatter_steering(
+    hidden: torch.Tensor,
+    seq_lens: list[int],
+    request_layer_specs: list[Any],
+) -> torch.Tensor:
+    """Apply steering using gather/scatter for better memory access patterns.
+
+    Instead of N non-contiguous slice operations, this:
+    1. Groups tokens by operation signature (op_type, vec identity, params)
+    2. Gathers all tokens needing same operation to contiguous buffer
+    3. Applies steering to contiguous buffer (single efficient op)
+    4. Scatters results back to original positions
+
+    For 32 requests using the same steering vector, this reduces
+    32 slice operations to 1 gather + 1 op + 1 scatter.
+    """
+    # Group tokens by operation signature
+    # Key: (op_type, id(vec), params_tuple)
+    # Value: {'vec': tensor, 'params': params, 'indices': list[int]}
+    op_groups: dict[tuple, dict] = {}
+
+    start = 0
+    for i, layer_spec in enumerate(request_layer_specs):
+        seq_len = seq_lens[i]
+        end = start + seq_len
+
+        if layer_spec is not None and layer_spec.operations:
+            for op_type, vec, params in layer_spec.operations:
+                # Create hashable key for this operation
+                # Use id(vec) to group by vector identity (same tensor object)
+                if op_type == "cap":
+                    params_key = params  # (min, max) tuple
+                elif op_type == "ablation":
+                    params_key = (params,)  # (scale,) tuple
+                else:
+                    params_key = ()  # add has no params
+
+                op_key = (op_type, id(vec), params_key)
+
+                if op_key not in op_groups:
+                    op_groups[op_key] = {
+                        'vec': vec,
+                        'op_type': op_type,
+                        'params': params,
+                        'indices': [],
+                    }
+                # Add all token indices for this request
+                op_groups[op_key]['indices'].extend(range(start, end))
+
+        start = end
+
+    # If no operations, return unchanged
+    if not op_groups:
+        return hidden
+
+    # Apply each unique operation using gather/scatter
+    for op_data in op_groups.values():
+        indices = torch.tensor(op_data['indices'], device=hidden.device, dtype=torch.long)
+        vec = op_data['vec']
+        op_type = op_data['op_type']
+        params = op_data['params']
+
+        # Ensure vector is on correct device/dtype
+        if vec.device != hidden.device or vec.dtype != hidden.dtype:
+            vec = vec.to(device=hidden.device, dtype=hidden.dtype)
+
+        # Gather to contiguous buffer
+        gathered = hidden[indices]  # [num_tokens, hidden_size] - contiguous!
+
+        # Apply operation to contiguous buffer
+        if op_type == "add":
+            gathered = gathered + vec
+        elif op_type == "cap":
+            cap_min, cap_max = params
+            proj = gathered @ vec  # [num_tokens]
+            # Apply clamping based on which bounds are set
+            if cap_min is not None and cap_max is not None:
+                clamped = torch.clamp(proj, min=cap_min, max=cap_max)
+            elif cap_min is not None:
+                clamped = torch.clamp(proj, min=cap_min)
+            elif cap_max is not None:
+                clamped = torch.clamp(proj, max=cap_max)
+            else:
+                clamped = proj
+            diff = (clamped - proj).unsqueeze(-1)  # [num_tokens, 1]
+            gathered = gathered + diff * vec
+        elif op_type == "ablation":
+            scale = params
+            proj = gathered @ vec  # [num_tokens]
+            adjustment = ((scale - 1) * proj).unsqueeze(-1)  # [num_tokens, 1]
+            gathered = gathered + adjustment * vec
+
+        # Scatter back to original positions
+        hidden[indices] = gathered
+
+    return hidden
+
+
+_compiled_gather_scatter: Callable | None = None
+
+
+def _get_compiled_gather_scatter() -> Callable:
+    """Get or create compiled gather/scatter function."""
+    global _compiled_gather_scatter
+    if _compiled_gather_scatter is not None:
+        return _compiled_gather_scatter
+
+    try:
+        _compiled_gather_scatter = torch.compile(_gather_scatter_steering, dynamic=True)
+        logger.debug("Compiled gather/scatter steering")
+    except Exception as e:
+        logger.warning(f"torch.compile failed for gather/scatter: {e}, using uncompiled")
+        _compiled_gather_scatter = _gather_scatter_steering
+
+    return _compiled_gather_scatter
+
+
 @dataclass
 class _ProjectionCapConfig:
     """Projection capping parameters for a layer."""
@@ -346,6 +501,11 @@ class _SteeringState:
 
     # Per-request steering (request_id -> deserialized spec)
     request_steering_specs: dict[str, Any] = field(default_factory=dict)
+
+    # Vector interning cache (hash -> tensor) with LRU eviction
+    # This enables gather/scatter optimization across RPC by deduplicating identical vectors
+    vector_cache: OrderedDict[str, torch.Tensor] = field(default_factory=OrderedDict)
+    vector_cache_max_size: int = 1000  # ~8MB for bf16 4096-dim vectors
 
     # Per-step batch metadata from model runner
     step_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -664,13 +824,42 @@ def _apply_per_request_steering(
 
     transformed_hidden = hidden.clone()
 
-    if _COMPILE_STEERING:
-        # Use compiled loop for 2x speedup on heterogeneous batches
-        slow_path_fn = _get_compiled_slow_path()
-        transformed_hidden = slow_path_fn(transformed_hidden, seq_lens, request_layer_specs)
+    # Count unique operations to decide between gather/scatter and loop
+    # Gather/scatter wins when num_unique_ops << num_requests (sharing)
+    # but loses when each request has unique ops (overhead from index tensors)
+    num_requests_with_ops = sum(1 for s in request_layer_specs if s is not None and s.operations)
+    if num_requests_with_ops > 0:
+        unique_ops: set[tuple] = set()
+        for spec in request_layer_specs:
+            if spec is not None and spec.operations:
+                for op_type, vec, params in spec.operations:
+                    if op_type == "cap":
+                        unique_ops.add((op_type, id(vec), params))
+                    elif op_type == "ablation":
+                        unique_ops.add((op_type, id(vec), (params,)))
+                    else:
+                        unique_ops.add((op_type, id(vec), ()))
+        num_unique_ops = len(unique_ops)
     else:
-        # Uncompiled fallback
-        transformed_hidden = _slow_path_loop_impl(transformed_hidden, seq_lens, request_layer_specs)
+        num_unique_ops = 0
+
+    # Use gather/scatter when there's operation sharing (< half unique)
+    # Otherwise use loop (avoids index tensor overhead)
+    use_gather_scatter = num_unique_ops > 0 and num_unique_ops < num_requests_with_ops
+
+    if use_gather_scatter:
+        if _COMPILE_STEERING:
+            gather_scatter_fn = _get_compiled_gather_scatter()
+            transformed_hidden = gather_scatter_fn(transformed_hidden, seq_lens, request_layer_specs)
+        else:
+            transformed_hidden = _gather_scatter_steering(transformed_hidden, seq_lens, request_layer_specs)
+    else:
+        # Fall back to loop when no sharing benefit
+        if _COMPILE_STEERING:
+            slow_path_fn = _get_compiled_slow_path()
+            transformed_hidden = slow_path_fn(transformed_hidden, seq_lens, request_layer_specs)
+        else:
+            transformed_hidden = _slow_path_loop_impl(transformed_hidden, seq_lens, request_layer_specs)
 
     return _reconstruct_output_with_hidden(output, hidden, transformed_hidden)
 
@@ -1231,6 +1420,10 @@ def _rpc_register_steering_spec(
             if op_type == "add" and params is not None:
                 vec = vec * params  # params is scale for add
                 params = None  # Clear params after applying
+
+            # Intern vector for content-based deduplication
+            # This enables gather/scatter optimization across RPC
+            vec = _intern_vector(state, vec)
 
             ops.append((op_type, vec, params))
 
