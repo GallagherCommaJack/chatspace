@@ -664,22 +664,50 @@ def _fused_cap_gpu_native(
         hidden[indices] = gathered + diff * vec_for_each
         return hidden
 
-    # Non-uniform fallback
-    start = 0
-    cap_idx = 0
-    for i, layer_spec in enumerate(request_layer_specs):
-        end = start + seq_lens[i]
-        if request_has_cap[i]:
-            vec = cap_vecs[cap_idx]
-            cap_min = cap_mins[cap_idx]
-            cap_max = cap_maxs[cap_idx]
-            cap_idx += 1
+    # Non-uniform fallback: use GPU masking (like add)
+    # Build indices on GPU using cumsum
+    seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.long)
+    cumsum = torch.cumsum(seq_lens_t, dim=0)
+    starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-            proj = hidden[start:end] @ vec
-            clamped = torch.clamp(proj, min=cap_min, max=cap_max)
-            diff = (clamped - proj).unsqueeze(-1)
-            hidden[start:end] = hidden[start:end] + diff * vec
-        start = end
+    # Collect steered requests
+    steered_requests = [i for i, has in enumerate(request_has_cap) if has]
+    if not steered_requests:
+        return hidden
+
+    # Build indices for steered requests
+    steered_t = torch.tensor(steered_requests, device=device, dtype=torch.long)
+    steered_starts = starts[steered_t]  # [num_steered]
+    steered_lens = seq_lens_t[steered_t]  # [num_steered]
+
+    # Build flat index tensor using GPU ops with masking
+    max_len = steered_lens.max().item()
+    offsets = torch.arange(max_len, device=device, dtype=torch.long)
+    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [num_steered, max_len]
+
+    # Mask out invalid indices (for non-uniform seq_lens)
+    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)  # [num_steered, max_len]
+    valid_indices = all_indices[mask]  # [total_steered_tokens]
+
+    # Build assignment tensor
+    assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
+    assign_expanded = assignments.repeat_interleave(steered_lens)  # [total_steered_tokens]
+
+    # Stack vectors and params
+    vecs_stacked = torch.stack(cap_vecs)  # [num_steered, hidden]
+    mins_t = torch.tensor(cap_mins, device=device, dtype=dtype)
+    maxs_t = torch.tensor(cap_maxs, device=device, dtype=dtype)
+
+    # Gather, apply cap, scatter
+    gathered = hidden[valid_indices]
+    vec_for_each = vecs_stacked[assign_expanded]
+    min_for_each = mins_t[assign_expanded]
+    max_for_each = maxs_t[assign_expanded]
+
+    proj = (gathered * vec_for_each).sum(dim=-1)
+    clamped = torch.clamp(proj, min_for_each, max_for_each)
+    diff = (clamped - proj).unsqueeze(-1)
+    hidden[valid_indices] = gathered + diff * vec_for_each
 
     return hidden
 
@@ -762,20 +790,47 @@ def _fused_ablation_gpu_native(
         hidden[indices] = gathered + adjustment * vec_for_each
         return hidden
 
-    # Non-uniform fallback
-    start = 0
-    ablation_idx = 0
-    for i, layer_spec in enumerate(request_layer_specs):
-        end = start + seq_lens[i]
-        if request_has_ablation[i]:
-            vec = ablation_vecs[ablation_idx]
-            scale = ablation_scales[ablation_idx]
-            ablation_idx += 1
+    # Non-uniform fallback: use GPU masking (like add)
+    # Build indices on GPU using cumsum
+    seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.long)
+    cumsum = torch.cumsum(seq_lens_t, dim=0)
+    starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-            proj = hidden[start:end] @ vec
-            adjustment = ((scale - 1) * proj).unsqueeze(-1)
-            hidden[start:end] = hidden[start:end] + adjustment * vec
-        start = end
+    # Collect steered requests
+    steered_requests = [i for i, has in enumerate(request_has_ablation) if has]
+    if not steered_requests:
+        return hidden
+
+    # Build indices for steered requests
+    steered_t = torch.tensor(steered_requests, device=device, dtype=torch.long)
+    steered_starts = starts[steered_t]  # [num_steered]
+    steered_lens = seq_lens_t[steered_t]  # [num_steered]
+
+    # Build flat index tensor using GPU ops with masking
+    max_len = steered_lens.max().item()
+    offsets = torch.arange(max_len, device=device, dtype=torch.long)
+    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [num_steered, max_len]
+
+    # Mask out invalid indices (for non-uniform seq_lens)
+    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)  # [num_steered, max_len]
+    valid_indices = all_indices[mask]  # [total_steered_tokens]
+
+    # Build assignment tensor
+    assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
+    assign_expanded = assignments.repeat_interleave(steered_lens)  # [total_steered_tokens]
+
+    # Stack vectors and params
+    vecs_stacked = torch.stack(ablation_vecs)  # [num_steered, hidden]
+    scales_t = torch.tensor(ablation_scales, device=device, dtype=dtype)
+
+    # Gather, apply ablation, scatter
+    gathered = hidden[valid_indices]
+    vec_for_each = vecs_stacked[assign_expanded]
+    scale_for_each = scales_t[assign_expanded]
+
+    proj = (gathered * vec_for_each).sum(dim=-1)
+    adjustment = ((scale_for_each - 1) * proj).unsqueeze(-1)
+    hidden[valid_indices] = gathered + adjustment * vec_for_each
 
     return hidden
 
