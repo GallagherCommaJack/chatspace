@@ -433,3 +433,14 @@ Store benchmark results in `bench_journal/` with dated markdown files:
 - Include: objective, hardware, model, workload parameters, results tables, conclusions
 - Reference related GitHub issues
 - Keep methodology reproducible (include test commands/scripts used)
+
+### Exploratory Benchmark Scripts
+
+When exploring optimization approaches:
+
+1. **Keep in `scripts/`**: Final benchmark scripts that validate the chosen approach
+2. **Archive in `scripts/archive/`**: Exploratory scripts that document alternative approaches tested
+3. **Log results in `JOURNAL.md`**: Key findings, performance numbers, and which approaches won/lost
+4. **Delete**: Intermediate scripts that are superseded and don't add documentary value
+
+This pattern preserves the "why" (journal), the "how we got there" (archive), and the "final answer" (scripts), while avoiding clutter from throwaway experiments.
