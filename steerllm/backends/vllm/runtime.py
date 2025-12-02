@@ -461,52 +461,24 @@ def _get_compiled_gather_scatter() -> Callable:
 # =============================================================================
 
 
-def _fused_add_gpu_native(
+def _fused_add_impl(
     hidden: torch.Tensor,
     seq_lens: list[int],
-    request_layer_specs: list[Any],
+    dispatch: _OpDispatch,
     uniform_seq_lens: bool,
 ) -> torch.Tensor:
-    """Apply additive steering using GPU-native operations.
+    """Apply additive steering using pre-computed dispatch info.
 
-    Three paths based on pre-computed dispatch:
-    1. All-same-vector (identity check): simple broadcast, fastest
-    2. Repeat-interleave (uniform_seq_lens=True): 4-5x faster than slow loop
-    3. Masking (uniform_seq_lens=False): 1.2x faster than slow loop
+    Three paths:
+    1. All-same (dispatch.all_same): simple broadcast, fastest
+    2. Repeat-interleave (uniform_seq_lens): 4-5x faster than slow loop
+    3. Masking (non-uniform): 1.2x faster than slow loop
     """
-    device = hidden.device
-
-    # Collect vectors for steered requests + check if all same
-    add_vecs: list[torch.Tensor] = []
-    request_has_add: list[bool] = []
-    first_vec = None
-    all_same_vec = True
-
-    for layer_spec in request_layer_specs:
-        has_add = False
-        if layer_spec is not None and layer_spec.operations:
-            for op_type, vec, params in layer_spec.operations:
-                if op_type == "add":
-                    add_vecs.append(vec)
-                    has_add = True
-                    # Check identity
-                    if first_vec is None:
-                        first_vec = vec
-                    elif vec is not first_vec:
-                        all_same_vec = False
-                    break
-        else:
-            # No add for this request breaks "all same" unless none have it
-            if first_vec is not None:
-                all_same_vec = False
-        request_has_add.append(has_add)
-
-    if not add_vecs:
-        return hidden
-
     # FAST PATH: all requests use identical vector - simple broadcast
-    if all_same_vec and all(request_has_add):
-        return hidden + first_vec
+    if dispatch.all_same:
+        return hidden + dispatch.first_vec
+
+    device = hidden.device
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors using broadcasting
@@ -517,9 +489,9 @@ def _fused_add_gpu_native(
         hidden_size = hidden.shape[-1]
         vec_per_request = torch.zeros(num_requests, hidden_size, device=device, dtype=hidden.dtype)
         vec_idx = 0
-        for i, has_add in enumerate(request_has_add):
-            if has_add:
-                vec_per_request[i] = add_vecs[vec_idx]
+        for i, has_op in enumerate(dispatch.request_has_op):
+            if has_op:
+                vec_per_request[i] = dispatch.vecs[vec_idx]
                 vec_idx += 1
 
         # Expand to all tokens and apply
@@ -533,7 +505,7 @@ def _fused_add_gpu_native(
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
     # Collect steered request indices
-    steered_requests = [i for i, has in enumerate(request_has_add) if has]
+    steered_requests = [i for i, has in enumerate(dispatch.request_has_op) if has]
     if not steered_requests:
         return hidden
 
@@ -552,7 +524,7 @@ def _fused_add_gpu_native(
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
     assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    vecs_stacked = torch.stack(add_vecs)
+    vecs_stacked = torch.stack(dispatch.vecs)
     gathered = hidden[valid_indices]
     vec_for_each = vecs_stacked[assign_expanded]
     hidden[valid_indices] = gathered + vec_for_each
@@ -560,65 +532,48 @@ def _fused_add_gpu_native(
     return hidden
 
 
-def _fused_cap_gpu_native(
+def _fused_add_gpu_native(
     hidden: torch.Tensor,
     seq_lens: list[int],
     request_layer_specs: list[Any],
     uniform_seq_lens: bool,
 ) -> torch.Tensor:
-    """Apply projection cap steering using GPU-native operations.
+    """Wrapper for benchmark compatibility - extracts dispatch and calls impl."""
+    add_dispatch, _, _ = _extract_dispatch_info(request_layer_specs)
+    if add_dispatch is None:
+        return hidden
+    return _fused_add_impl(hidden, seq_lens, add_dispatch, uniform_seq_lens)
 
-    Three paths based on pre-computed dispatch:
-    1. All-same-vector (identity check): simple batched cap, fastest
-    2. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
-    3. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
+
+def _fused_cap_impl(
+    hidden: torch.Tensor,
+    seq_lens: list[int],
+    dispatch: _OpDispatch,
+    uniform_seq_lens: bool,
+) -> torch.Tensor:
+    """Apply projection cap steering using pre-computed dispatch info.
+
+    Three paths:
+    1. All-same (dispatch.all_same): simple batched cap, fastest
+    2. Repeat-interleave (uniform_seq_lens): 7-8x faster than slow loop
+    3. Masking (non-uniform): 2-3x faster than slow loop
     """
+    # FAST PATH: all requests use identical vector and params
+    if dispatch.all_same:
+        cap_min, cap_max = dispatch.first_params
+        proj = (hidden * dispatch.first_vec).sum(dim=-1)
+        clamped = torch.clamp(proj, cap_min, cap_max)
+        diff = (clamped - proj).unsqueeze(-1)
+        return hidden + diff * dispatch.first_vec
+
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
     hidden_size = hidden.shape[-1]
 
-    # Collect cap operations + check if all same
-    cap_vecs: list[torch.Tensor] = []
-    cap_mins: list[float] = []
-    cap_maxs: list[float] = []
-    request_has_cap: list[bool] = []
-    first_vec = None
-    first_params = None
-    all_same = True
-
-    for layer_spec in request_layer_specs:
-        has_cap = False
-        if layer_spec is not None and layer_spec.operations:
-            for op_type, vec, params in layer_spec.operations:
-                if op_type == "cap":
-                    cap_vecs.append(vec)
-                    cap_mins.append(params[0] if params[0] is not None else float('-inf'))
-                    cap_maxs.append(params[1] if params[1] is not None else float('inf'))
-                    has_cap = True
-                    # Check identity
-                    if first_vec is None:
-                        first_vec = vec
-                        first_params = params
-                    elif vec is not first_vec or params != first_params:
-                        all_same = False
-                    break
-        else:
-            if first_vec is not None:
-                all_same = False
-        request_has_cap.append(has_cap)
-
-    if not cap_vecs:
-        return hidden
-
-    # FAST PATH: all requests use identical vector and params - simple batched cap
-    if all_same and all(request_has_cap):
-        cap_min = first_params[0] if first_params[0] is not None else float('-inf')
-        cap_max = first_params[1] if first_params[1] is not None else float('inf')
-        proj = (hidden * first_vec).sum(dim=-1)
-        clamped = torch.clamp(proj, cap_min, cap_max)
-        diff = (clamped - proj).unsqueeze(-1)
-        return hidden + diff * first_vec
+    # Extract params lists
+    cap_mins = [p[0] for p in dispatch.params]
+    cap_maxs = [p[1] for p in dispatch.params]
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors/params using broadcasting
@@ -629,9 +584,9 @@ def _fused_cap_gpu_native(
         min_per_request = torch.zeros(num_requests, device=device, dtype=dtype)
         max_per_request = torch.zeros(num_requests, device=device, dtype=dtype)
         vec_idx = 0
-        for i, has_cap in enumerate(request_has_cap):
-            if has_cap:
-                vec_per_request[i] = cap_vecs[vec_idx]
+        for i, has_op in enumerate(dispatch.request_has_op):
+            if has_op:
+                vec_per_request[i] = dispatch.vecs[vec_idx]
                 min_per_request[i] = cap_mins[vec_idx]
                 max_per_request[i] = cap_maxs[vec_idx]
                 vec_idx += 1
@@ -654,7 +609,7 @@ def _fused_cap_gpu_native(
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
     # Collect steered request indices
-    steered_requests = [i for i, has in enumerate(request_has_cap) if has]
+    steered_requests = [i for i, has in enumerate(dispatch.request_has_op) if has]
     if not steered_requests:
         return hidden
 
@@ -673,7 +628,7 @@ def _fused_cap_gpu_native(
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
     assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    vecs_stacked = torch.stack(cap_vecs)
+    vecs_stacked = torch.stack(dispatch.vecs)
     mins_t = torch.tensor(cap_mins, device=device, dtype=dtype)
     maxs_t = torch.tensor(cap_maxs, device=device, dtype=dtype)
 
@@ -690,60 +645,45 @@ def _fused_cap_gpu_native(
     return hidden
 
 
-def _fused_ablation_gpu_native(
+def _fused_cap_gpu_native(
     hidden: torch.Tensor,
     seq_lens: list[int],
     request_layer_specs: list[Any],
     uniform_seq_lens: bool,
 ) -> torch.Tensor:
-    """Apply ablation steering using GPU-native operations.
+    """Wrapper for benchmark compatibility - extracts dispatch and calls impl."""
+    _, cap_dispatch, _ = _extract_dispatch_info(request_layer_specs)
+    if cap_dispatch is None:
+        return hidden
+    return _fused_cap_impl(hidden, seq_lens, cap_dispatch, uniform_seq_lens)
 
-    Three paths based on pre-computed dispatch:
-    1. All-same-vector (identity check): simple batched ablation, fastest
-    2. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
-    3. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
+
+def _fused_ablation_impl(
+    hidden: torch.Tensor,
+    seq_lens: list[int],
+    dispatch: _OpDispatch,
+    uniform_seq_lens: bool,
+) -> torch.Tensor:
+    """Apply ablation steering using pre-computed dispatch info.
+
+    Three paths:
+    1. All-same (dispatch.all_same): simple batched ablation, fastest
+    2. Repeat-interleave (uniform_seq_lens): 7-8x faster than slow loop
+    3. Masking (non-uniform): 2-3x faster than slow loop
     """
+    # FAST PATH: all requests use identical vector and scale
+    if dispatch.all_same:
+        proj = (hidden * dispatch.first_vec).sum(dim=-1)
+        adjustment = ((dispatch.first_params - 1) * proj).unsqueeze(-1)
+        return hidden + adjustment * dispatch.first_vec
+
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
     hidden_size = hidden.shape[-1]
 
-    # Collect ablation operations + check if all same
-    ablation_vecs: list[torch.Tensor] = []
-    ablation_scales: list[float] = []
-    request_has_ablation: list[bool] = []
-    first_vec = None
-    first_scale = None
-    all_same = True
-
-    for layer_spec in request_layer_specs:
-        has_ablation = False
-        if layer_spec is not None and layer_spec.operations:
-            for op_type, vec, params in layer_spec.operations:
-                if op_type == "ablation":
-                    ablation_vecs.append(vec)
-                    ablation_scales.append(params)
-                    has_ablation = True
-                    # Check identity
-                    if first_vec is None:
-                        first_vec = vec
-                        first_scale = params
-                    elif vec is not first_vec or params != first_scale:
-                        all_same = False
-                    break
-        else:
-            if first_vec is not None:
-                all_same = False
-        request_has_ablation.append(has_ablation)
-
-    if not ablation_vecs:
-        return hidden
-
-    # FAST PATH: all requests use identical vector and scale - simple batched ablation
-    if all_same and all(request_has_ablation):
-        proj = (hidden * first_vec).sum(dim=-1)
-        adjustment = ((first_scale - 1) * proj).unsqueeze(-1)
-        return hidden + adjustment * first_vec
+    # dispatch.params is the list of scales for ablation
+    ablation_scales = dispatch.params
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors/scales using broadcasting
@@ -751,11 +691,11 @@ def _fused_ablation_gpu_native(
 
         # Build per-request tensors (zeros for unsteered, scale=1 means no-op)
         vec_per_request = torch.zeros(num_requests, hidden_size, device=device, dtype=dtype)
-        scale_per_request = torch.ones(num_requests, device=device, dtype=dtype)  # 1.0 = no adjustment
+        scale_per_request = torch.ones(num_requests, device=device, dtype=dtype)
         vec_idx = 0
-        for i, has_ablation in enumerate(request_has_ablation):
-            if has_ablation:
-                vec_per_request[i] = ablation_vecs[vec_idx]
+        for i, has_op in enumerate(dispatch.request_has_op):
+            if has_op:
+                vec_per_request[i] = dispatch.vecs[vec_idx]
                 scale_per_request[i] = ablation_scales[vec_idx]
                 vec_idx += 1
 
@@ -775,7 +715,7 @@ def _fused_ablation_gpu_native(
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
     # Collect steered request indices
-    steered_requests = [i for i, has in enumerate(request_has_ablation) if has]
+    steered_requests = [i for i, has in enumerate(dispatch.request_has_op) if has]
     if not steered_requests:
         return hidden
 
@@ -794,7 +734,7 @@ def _fused_ablation_gpu_native(
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
     assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    vecs_stacked = torch.stack(ablation_vecs)
+    vecs_stacked = torch.stack(dispatch.vecs)
     scales_t = torch.tensor(ablation_scales, device=device, dtype=dtype)
 
     gathered = hidden[valid_indices]
@@ -808,6 +748,142 @@ def _fused_ablation_gpu_native(
     return hidden
 
 
+def _fused_ablation_gpu_native(
+    hidden: torch.Tensor,
+    seq_lens: list[int],
+    request_layer_specs: list[Any],
+    uniform_seq_lens: bool,
+) -> torch.Tensor:
+    """Wrapper for benchmark compatibility - extracts dispatch and calls impl."""
+    _, _, abl_dispatch = _extract_dispatch_info(request_layer_specs)
+    if abl_dispatch is None:
+        return hidden
+    return _fused_ablation_impl(hidden, seq_lens, abl_dispatch, uniform_seq_lens)
+
+
+@dataclass
+class _OpDispatch:
+    """Pre-computed dispatch info for a single operation type."""
+    vecs: list[torch.Tensor]
+    request_has_op: list[bool]
+    all_same: bool
+    first_vec: torch.Tensor | None = None
+    # For cap/ablation params
+    params: list[Any] | None = None
+    first_params: Any = None
+
+
+def _extract_dispatch_info(
+    request_layer_specs: list[Any],
+) -> tuple[_OpDispatch | None, _OpDispatch | None, _OpDispatch | None]:
+    """Extract all dispatch info in a single pass through specs.
+
+    Returns (add_dispatch, cap_dispatch, ablation_dispatch).
+    Each is None if no operations of that type exist.
+    """
+    num_requests = len(request_layer_specs)
+
+    # Add state
+    add_vecs: list[torch.Tensor] = []
+    add_has: list[bool] = [False] * num_requests
+    add_first: torch.Tensor | None = None
+    add_all_same = True
+
+    # Cap state
+    cap_vecs: list[torch.Tensor] = []
+    cap_params: list[tuple[float, float]] = []
+    cap_has: list[bool] = [False] * num_requests
+    cap_first: torch.Tensor | None = None
+    cap_first_params: tuple[float, float] | None = None
+    cap_all_same = True
+
+    # Ablation state
+    abl_vecs: list[torch.Tensor] = []
+    abl_scales: list[float] = []
+    abl_has: list[bool] = [False] * num_requests
+    abl_first: torch.Tensor | None = None
+    abl_first_scale: float | None = None
+    abl_all_same = True
+
+    for i, layer_spec in enumerate(request_layer_specs):
+        if layer_spec is None or not layer_spec.operations:
+            # No ops for this request - breaks "all same" if we've seen any
+            if add_first is not None:
+                add_all_same = False
+            if cap_first is not None:
+                cap_all_same = False
+            if abl_first is not None:
+                abl_all_same = False
+            continue
+
+        for op_type, vec, params in layer_spec.operations:
+            if op_type == "add":
+                add_vecs.append(vec)
+                add_has[i] = True
+                if add_first is None:
+                    add_first = vec
+                elif vec is not add_first:
+                    add_all_same = False
+
+            elif op_type == "cap":
+                cap_vecs.append(vec)
+                p = (
+                    params[0] if params[0] is not None else float('-inf'),
+                    params[1] if params[1] is not None else float('inf'),
+                )
+                cap_params.append(p)
+                cap_has[i] = True
+                if cap_first is None:
+                    cap_first = vec
+                    cap_first_params = p
+                elif vec is not cap_first or p != cap_first_params:
+                    cap_all_same = False
+
+            elif op_type == "ablation":
+                abl_vecs.append(vec)
+                abl_scales.append(params)
+                abl_has[i] = True
+                if abl_first is None:
+                    abl_first = vec
+                    abl_first_scale = params
+                elif vec is not abl_first or params != abl_first_scale:
+                    abl_all_same = False
+
+    # Build dispatch objects (None if no ops of that type)
+    add_dispatch = None
+    if add_vecs:
+        add_dispatch = _OpDispatch(
+            vecs=add_vecs,
+            request_has_op=add_has,
+            all_same=add_all_same and all(add_has),
+            first_vec=add_first,
+        )
+
+    cap_dispatch = None
+    if cap_vecs:
+        cap_dispatch = _OpDispatch(
+            vecs=cap_vecs,
+            request_has_op=cap_has,
+            all_same=cap_all_same and all(cap_has),
+            first_vec=cap_first,
+            params=cap_params,
+            first_params=cap_first_params,
+        )
+
+    abl_dispatch = None
+    if abl_vecs:
+        abl_dispatch = _OpDispatch(
+            vecs=abl_vecs,
+            request_has_op=abl_has,
+            all_same=abl_all_same and all(abl_has),
+            first_vec=abl_first,
+            params=abl_scales,
+            first_params=abl_first_scale,
+        )
+
+    return add_dispatch, cap_dispatch, abl_dispatch
+
+
 def _fused_gather_steering(
     hidden: torch.Tensor,
     seq_lens: list[int],
@@ -815,43 +891,32 @@ def _fused_gather_steering(
 ) -> torch.Tensor:
     """Apply steering using GPU-native fused operations.
 
-    Dispatch logic (computed once here):
-    1. Fast path (all same spec) - handled upstream in _apply_per_request_steering
-    2. Repeat-interleave path - uniform seq_lens, uses broadcasting
-    3. Masking path - non-uniform seq_lens, uses GPU-constructed masked indices
+    All dispatch logic is computed here in a single pass:
+    1. Extract vectors, params, and dispatch flags for each op type
+    2. Determine path: all-same (fastest) vs repeat-interleave vs masking
+    3. Call optimized implementation for each op type
 
     Benchmarks show:
-    - Repeat-interleave: 4-8x faster than slow loop
+    - All-same: 9-12x faster than slow loop
+    - Repeat-interleave: 2-5x faster than slow loop
     - Masking: 1.2-2.8x faster than slow loop
     """
-    # Compute dispatch once for all operations
-    uniform_seq_lens = len(set(seq_lens)) == 1
+    # Single pass: extract all dispatch info
+    add_dispatch, cap_dispatch, abl_dispatch = _extract_dispatch_info(request_layer_specs)
 
-    # Detect which operation types are present
-    has_add = False
-    has_cap = False
-    has_ablation = False
-
-    for spec in request_layer_specs:
-        if spec is not None and spec.operations:
-            for op_type, _, _ in spec.operations:
-                if op_type == "add":
-                    has_add = True
-                elif op_type == "cap":
-                    has_cap = True
-                elif op_type == "ablation":
-                    has_ablation = True
-
-    if not (has_add or has_cap or has_ablation):
+    if not (add_dispatch or cap_dispatch or abl_dispatch):
         return hidden
 
-    # Apply each operation type, passing the pre-computed dispatch decision
-    if has_add:
-        hidden = _fused_add_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
-    if has_cap:
-        hidden = _fused_cap_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
-    if has_ablation:
-        hidden = _fused_ablation_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
+    # Compute uniform_seq_lens once
+    uniform_seq_lens = len(set(seq_lens)) == 1
+
+    # Apply each operation type with pre-computed dispatch info
+    if add_dispatch:
+        hidden = _fused_add_impl(hidden, seq_lens, add_dispatch, uniform_seq_lens)
+    if cap_dispatch:
+        hidden = _fused_cap_impl(hidden, seq_lens, cap_dispatch, uniform_seq_lens)
+    if abl_dispatch:
+        hidden = _fused_ablation_impl(hidden, seq_lens, abl_dispatch, uniform_seq_lens)
 
     return hidden
 
