@@ -761,6 +761,237 @@ def _fused_ablation_gpu_native(
     return _fused_ablation_impl(hidden, seq_lens, abl_dispatch, uniform_seq_lens)
 
 
+# =============================================================================
+# Clock Scheduler for Multi-Op Batching
+# =============================================================================
+
+
+def _premerge_adds(
+    operations: list[tuple[str, torch.Tensor, Any]],
+) -> list[tuple[str, torch.Tensor, Any]]:
+    """Merge consecutive add operations within a single request.
+
+    [add(v1), add(v2), cap, add(v3)] → [add(v1+v2), cap, add(v3)]
+
+    This is always valid since adds commute with each other.
+    Reduces the number of operations and enables better batching.
+    """
+    if not operations or len(operations) <= 1:
+        return operations
+
+    merged: list[tuple[str, torch.Tensor, Any]] = []
+    i = 0
+    while i < len(operations):
+        op_type, vec, params = operations[i]
+
+        if op_type == "add":
+            # Collect consecutive adds
+            combined_vec = vec
+            j = i + 1
+            while j < len(operations) and operations[j][0] == "add":
+                combined_vec = combined_vec + operations[j][1]
+                j += 1
+            merged.append(("add", combined_vec, None))
+            i = j
+        else:
+            merged.append(operations[i])
+            i += 1
+
+    return merged
+
+
+@dataclass
+class _ClockSlot:
+    """Ops at one position in the virtual clock.
+
+    Each slot has three phases: ADD → ABLATE → CAP.
+    Within each phase, ops are batched across all requests that have
+    that op type at this slot position.
+    """
+    # Add phase
+    add_vecs: list[torch.Tensor] = field(default_factory=list)
+    add_request_mask: list[bool] = field(default_factory=list)
+
+    # Ablation phase
+    ablate_vecs: list[torch.Tensor] = field(default_factory=list)
+    ablate_scales: list[float] = field(default_factory=list)
+    ablate_request_mask: list[bool] = field(default_factory=list)
+
+    # Cap phase
+    cap_vecs: list[torch.Tensor] = field(default_factory=list)
+    cap_params: list[tuple[float, float]] = field(default_factory=list)
+    cap_request_mask: list[bool] = field(default_factory=list)
+
+
+def _build_clock_schedule(
+    request_layer_specs: list[Any],
+) -> list[_ClockSlot]:
+    """Build clock schedule using greedy list scheduling.
+
+    1. Pre-merge consecutive adds within each request
+    2. Schedule all "ready" ops at each slot (greedy)
+    3. Return list of slots for execution
+
+    Args:
+        request_layer_specs: Per-request layer specs with operations
+
+    Returns:
+        List of _ClockSlot, one per clock cycle needed
+    """
+    num_requests = len(request_layer_specs)
+
+    # Step 1: Pre-merge consecutive adds
+    ops_per_request: list[list[tuple[str, torch.Tensor, Any]]] = []
+    for spec in request_layer_specs:
+        if spec is not None and spec.operations:
+            merged = _premerge_adds(list(spec.operations))
+            ops_per_request.append(merged)
+        else:
+            ops_per_request.append([])
+
+    # Step 2: Greedy scheduling - schedule all ready ops per slot
+    op_cursors = [0] * num_requests  # Next op index per request
+    slots: list[_ClockSlot] = []
+
+    while any(op_cursors[r] < len(ops_per_request[r]) for r in range(num_requests)):
+        # Initialize slot with empty masks
+        slot = _ClockSlot(
+            add_request_mask=[False] * num_requests,
+            ablate_request_mask=[False] * num_requests,
+            cap_request_mask=[False] * num_requests,
+        )
+
+        # Collect and schedule all ready ops
+        for r in range(num_requests):
+            if op_cursors[r] >= len(ops_per_request[r]):
+                continue
+
+            op_type, vec, params = ops_per_request[r][op_cursors[r]]
+
+            if op_type == "add":
+                slot.add_vecs.append(vec)
+                slot.add_request_mask[r] = True
+            elif op_type == "ablation":
+                slot.ablate_vecs.append(vec)
+                slot.ablate_scales.append(params)
+                slot.ablate_request_mask[r] = True
+            elif op_type == "cap":
+                slot.cap_vecs.append(vec)
+                # Normalize params (handle None bounds)
+                cap_min, cap_max = params
+                normalized = (
+                    cap_min if cap_min is not None else float('-inf'),
+                    cap_max if cap_max is not None else float('inf'),
+                )
+                slot.cap_params.append(normalized)
+                slot.cap_request_mask[r] = True
+
+            op_cursors[r] += 1
+
+        slots.append(slot)
+
+    return slots
+
+
+def _check_slot_all_same(
+    vecs: list[torch.Tensor],
+    request_mask: list[bool],
+    params: list[Any] | None = None,
+) -> tuple[bool, torch.Tensor | None, Any]:
+    """Check if all ops in a slot phase are identical.
+
+    Returns (all_same, first_vec, first_params).
+    """
+    if not vecs:
+        return True, None, None
+
+    first_vec = vecs[0]
+    first_params = params[0] if params else None
+    all_same = True
+
+    # Check if all requests have this op (no gaps)
+    if not all(request_mask):
+        all_same = False
+    else:
+        # Check if all vecs are identical (by identity)
+        for v in vecs[1:]:
+            if v is not first_vec:
+                all_same = False
+                break
+
+        # Check params if present
+        if all_same and params:
+            for p in params[1:]:
+                if p != first_params:
+                    all_same = False
+                    break
+
+    return all_same, first_vec, first_params
+
+
+def _execute_clock_schedule(
+    hidden: torch.Tensor,
+    seq_lens: list[int],
+    schedule: list[_ClockSlot],
+    uniform_seq_lens: bool,
+) -> torch.Tensor:
+    """Execute clock schedule, batching ops at each slot.
+
+    For each slot, runs: ADD phase → ABLATE phase → CAP phase.
+    Skips phases with no ops.
+    """
+    for slot in schedule:
+        # ADD phase
+        if slot.add_vecs:
+            all_same, first_vec, _ = _check_slot_all_same(
+                slot.add_vecs, slot.add_request_mask
+            )
+            add_dispatch = _OpDispatch(
+                vecs=slot.add_vecs,
+                request_has_op=slot.add_request_mask,
+                all_same=all_same,
+                first_vec=first_vec,
+            )
+            hidden = _fused_add_impl(hidden, seq_lens, add_dispatch, uniform_seq_lens)
+
+        # ABLATE phase
+        if slot.ablate_vecs:
+            all_same, first_vec, first_params = _check_slot_all_same(
+                slot.ablate_vecs, slot.ablate_request_mask, slot.ablate_scales
+            )
+            abl_dispatch = _OpDispatch(
+                vecs=slot.ablate_vecs,
+                request_has_op=slot.ablate_request_mask,
+                all_same=all_same,
+                first_vec=first_vec,
+                params=slot.ablate_scales,
+                first_params=first_params,
+            )
+            hidden = _fused_ablation_impl(hidden, seq_lens, abl_dispatch, uniform_seq_lens)
+
+        # CAP phase
+        if slot.cap_vecs:
+            all_same, first_vec, first_params = _check_slot_all_same(
+                slot.cap_vecs, slot.cap_request_mask, slot.cap_params
+            )
+            cap_dispatch = _OpDispatch(
+                vecs=slot.cap_vecs,
+                request_has_op=slot.cap_request_mask,
+                all_same=all_same,
+                first_vec=first_vec,
+                params=slot.cap_params,
+                first_params=first_params,
+            )
+            hidden = _fused_cap_impl(hidden, seq_lens, cap_dispatch, uniform_seq_lens)
+
+    return hidden
+
+
+# =============================================================================
+# Single-Op Dispatch (existing fast paths)
+# =============================================================================
+
+
 @dataclass
 class _OpDispatch:
     """Pre-computed dispatch info for a single operation type."""
@@ -891,24 +1122,37 @@ def _fused_gather_steering(
 ) -> torch.Tensor:
     """Apply steering using GPU-native fused operations.
 
-    All dispatch logic is computed here in a single pass:
-    1. Extract vectors, params, and dispatch flags for each op type
-    2. Determine path: all-same (fastest) vs repeat-interleave vs masking
-    3. Call optimized implementation for each op type
+    Dispatch strategy:
+    1. Check for multi-op case (any request has >1 op after add merging)
+    2. If multi-op: use clock scheduler to preserve operation order
+    3. If single-op: use fast single-pass extraction
 
-    Benchmarks show:
+    Benchmarks show (single-op case):
     - All-same: 9-12x faster than slow loop
     - Repeat-interleave: 2-5x faster than slow loop
     - Masking: 1.2-2.8x faster than slow loop
     """
-    # Single pass: extract all dispatch info
+    # Check for multi-op case: any request has >1 operation
+    # Use raw op count - clock scheduler will handle add merging
+    max_ops = 0
+    for spec in request_layer_specs:
+        if spec is not None and spec.operations:
+            max_ops = max(max_ops, len(spec.operations))
+
+    uniform_seq_lens = len(set(seq_lens)) == 1
+
+    # Multi-op case: use clock scheduler (handles add merging internally)
+    if max_ops > 1:
+        schedule = _build_clock_schedule(request_layer_specs)
+        if schedule:
+            return _execute_clock_schedule(hidden, seq_lens, schedule, uniform_seq_lens)
+        return hidden
+
+    # Single-op case: use fast single-pass extraction
     add_dispatch, cap_dispatch, abl_dispatch = _extract_dispatch_info(request_layer_specs)
 
     if not (add_dispatch or cap_dispatch or abl_dispatch):
         return hidden
-
-    # Compute uniform_seq_lens once
-    uniform_seq_lens = len(set(seq_lens)) == 1
 
     # Apply each operation type with pre-computed dispatch info
     if add_dispatch:
