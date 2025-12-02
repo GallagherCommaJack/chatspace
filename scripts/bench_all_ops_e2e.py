@@ -120,11 +120,27 @@ def setup_mixed_scenario(cfg: BenchConfig):
 from steerllm.backends.vllm.runtime import (
     _slow_path_loop_impl,
     _fused_gather_steering,
-    _fused_add_gpu_native,
-    _fused_cap_gpu_native,
-    _fused_ablation_gpu_native,
+    _fused_add_gpu_native as _fused_add_raw,
+    _fused_cap_gpu_native as _fused_cap_raw,
+    _fused_ablation_gpu_native as _fused_ablation_raw,
     _gather_scatter_steering,
 )
+
+
+# Wrapper functions that compute uniform_seq_lens for the benchmark
+def _fused_add_gpu_native(hidden, seq_lens, specs):
+    uniform = len(set(seq_lens)) == 1
+    return _fused_add_raw(hidden, seq_lens, specs, uniform)
+
+
+def _fused_cap_gpu_native(hidden, seq_lens, specs):
+    uniform = len(set(seq_lens)) == 1
+    return _fused_cap_raw(hidden, seq_lens, specs, uniform)
+
+
+def _fused_ablation_gpu_native(hidden, seq_lens, specs):
+    uniform = len(set(seq_lens)) == 1
+    return _fused_ablation_raw(hidden, seq_lens, specs, uniform)
 
 
 def bench_func(fn, hidden, seq_lens, specs, num_layers=4, num_iters=50):

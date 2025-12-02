@@ -465,115 +465,81 @@ def _fused_add_gpu_native(
     hidden: torch.Tensor,
     seq_lens: list[int],
     request_layer_specs: list[Any],
+    uniform_seq_lens: bool,
 ) -> torch.Tensor:
     """Apply additive steering using GPU-native operations.
 
-    For the common case where all tokens are contiguous and in order,
-    we can skip gather/scatter entirely and use repeat_interleave.
-
-    Benchmarks show this is 5.6x faster than slow loop and 2.8x faster
-    than CPU-based index construction.
+    Two paths based on pre-computed dispatch:
+    1. Repeat-interleave (uniform_seq_lens=True): 4-5x faster than slow loop
+    2. Masking (uniform_seq_lens=False): 1.2x faster than slow loop
     """
     device = hidden.device
-    dtype = hidden.dtype
-    num_requests = len(seq_lens)
 
-    # Collect vectors and their request assignments
-    # request_to_vec[i] = (vec, has_add_op)
+    # Collect vectors for steered requests
     add_vecs: list[torch.Tensor] = []
     request_has_add: list[bool] = []
-    vec_id_to_idx: dict[int, int] = {}
 
     for layer_spec in request_layer_specs:
         has_add = False
         if layer_spec is not None and layer_spec.operations:
             for op_type, vec, params in layer_spec.operations:
                 if op_type == "add":
-                    vec_id = id(vec)
-                    if vec_id not in vec_id_to_idx:
-                        vec_id_to_idx[vec_id] = len(add_vecs)
-                        add_vecs.append(vec)
+                    add_vecs.append(vec)
                     has_add = True
-                    break  # Only first add op per request for now
+                    break
         request_has_add.append(has_add)
 
     if not add_vecs:
         return hidden
 
-    # Check if all requests have add ops with uniform seq_lens
-    all_have_add = all(request_has_add)
-    uniform_seq_len = len(set(seq_lens)) == 1
-
-    if all_have_add and uniform_seq_len:
-        # Fast path: all requests steered with same seq_len
-        # Use repeat_interleave - no gather needed!
+    if uniform_seq_lens:
+        # REPEAT-INTERLEAVE PATH: expand vectors using broadcasting
         seq_len = seq_lens[0]
+        num_requests = len(seq_lens)
 
-        # Build assignment tensor on GPU
-        assignments = []
-        for i, layer_spec in enumerate(request_layer_specs):
-            for op_type, vec, params in layer_spec.operations:
-                if op_type == "add":
-                    assignments.append(vec_id_to_idx[id(vec)])
-                    break
+        # Build per-request vector tensor (zeros for unsteered)
+        hidden_size = hidden.shape[-1]
+        vec_per_request = torch.zeros(num_requests, hidden_size, device=device, dtype=hidden.dtype)
+        vec_idx = 0
+        for i, has_add in enumerate(request_has_add):
+            if has_add:
+                vec_per_request[i] = add_vecs[vec_idx]
+                vec_idx += 1
 
-        assign_t = torch.tensor(assignments, device=device, dtype=torch.long)
-        vecs_stacked = torch.stack(add_vecs)  # [num_unique, hidden]
-
-        # Get vec for each request, then expand to all tokens
-        vec_per_request = vecs_stacked[assign_t]  # [num_requests, hidden]
-        vec_expanded = vec_per_request.repeat_interleave(seq_len, dim=0)  # [total_tokens, hidden]
-
+        # Expand to all tokens and apply
+        vec_expanded = vec_per_request.repeat_interleave(seq_len, dim=0)
         hidden = hidden + vec_expanded
         return hidden
 
-    # Fallback: use GPU-constructed indices for sparse/non-uniform case
-    total_tokens = sum(seq_lens)
-
-    # Build indices on GPU using arange and cumsum
+    # MASKING PATH: GPU-constructed indices for non-uniform seq_lens
     seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.long)
     cumsum = torch.cumsum(seq_lens_t, dim=0)
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-    # Collect steered requests
-    steered_requests = []
-    steered_vecs = []
-    for i, (layer_spec, has_add) in enumerate(zip(request_layer_specs, request_has_add)):
-        if has_add:
-            steered_requests.append(i)
-            for op_type, vec, params in layer_spec.operations:
-                if op_type == "add":
-                    steered_vecs.append(vec)
-                    break
-
+    # Collect steered request indices
+    steered_requests = [i for i, has in enumerate(request_has_add) if has]
     if not steered_requests:
         return hidden
 
-    # Build indices for steered requests
     steered_t = torch.tensor(steered_requests, device=device, dtype=torch.long)
-    steered_starts = starts[steered_t]  # [num_steered]
-    steered_lens = seq_lens_t[steered_t]  # [num_steered]
+    steered_starts = starts[steered_t]
+    steered_lens = seq_lens_t[steered_t]
 
-    # Build flat index tensor using GPU ops
+    # Build masked indices
     max_len = steered_lens.max().item()
-    offsets = torch.arange(max_len, device=device, dtype=torch.long)  # [max_len]
-    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [num_steered, max_len]
+    offsets = torch.arange(max_len, device=device, dtype=torch.long)
+    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)
+    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)
+    valid_indices = all_indices[mask]
 
-    # Mask out invalid indices (for non-uniform seq_lens)
-    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)  # [num_steered, max_len]
-    valid_indices = all_indices[mask]  # [total_steered_tokens]
-
-    # Build assignment tensor
-    counts = steered_lens  # Number of tokens per steered request
+    # Build assignment tensor and apply
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
-    assign_expanded = assignments.repeat_interleave(counts)  # [total_steered_tokens]
+    assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    # Stack vectors and apply
-    vecs_stacked = torch.stack(steered_vecs)  # [num_steered, hidden]
+    vecs_stacked = torch.stack(add_vecs)
     gathered = hidden[valid_indices]
     vec_for_each = vecs_stacked[assign_expanded]
-    gathered = gathered + vec_for_each
-    hidden[valid_indices] = gathered
+    hidden[valid_indices] = gathered + vec_for_each
 
     return hidden
 
@@ -582,15 +548,18 @@ def _fused_cap_gpu_native(
     hidden: torch.Tensor,
     seq_lens: list[int],
     request_layer_specs: list[Any],
+    uniform_seq_lens: bool,
 ) -> torch.Tensor:
     """Apply projection cap steering using GPU-native operations.
 
-    For uniform seq_lens with all requests capped, uses repeat_interleave
-    to avoid gather/scatter entirely.
+    Two paths based on pre-computed dispatch:
+    1. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
+    2. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
     """
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
+    hidden_size = hidden.shape[-1]
 
     # Collect cap operations
     cap_vecs: list[torch.Tensor] = []
@@ -613,92 +582,63 @@ def _fused_cap_gpu_native(
     if not cap_vecs:
         return hidden
 
-    all_have_cap = all(request_has_cap)
-    uniform_seq_len = len(set(seq_lens)) == 1
-
-    if all_have_cap and uniform_seq_len:
-        # Optimal path: no gather needed!
+    if uniform_seq_lens:
+        # REPEAT-INTERLEAVE PATH: expand vectors/params using broadcasting
         seq_len = seq_lens[0]
 
-        vecs_stacked = torch.stack(cap_vecs)  # [num_requests, hidden]
-        mins_t = torch.tensor(cap_mins, device=device, dtype=dtype)  # [num_requests]
-        maxs_t = torch.tensor(cap_maxs, device=device, dtype=dtype)  # [num_requests]
+        # Build per-request tensors (zeros for unsteered requests)
+        vec_per_request = torch.zeros(num_requests, hidden_size, device=device, dtype=dtype)
+        min_per_request = torch.zeros(num_requests, device=device, dtype=dtype)
+        max_per_request = torch.zeros(num_requests, device=device, dtype=dtype)
+        vec_idx = 0
+        for i, has_cap in enumerate(request_has_cap):
+            if has_cap:
+                vec_per_request[i] = cap_vecs[vec_idx]
+                min_per_request[i] = cap_mins[vec_idx]
+                max_per_request[i] = cap_maxs[vec_idx]
+                vec_idx += 1
 
         # Expand to all tokens
-        vecs_expanded = vecs_stacked.repeat_interleave(seq_len, dim=0)  # [total_tokens, hidden]
-        mins_expanded = mins_t.repeat_interleave(seq_len)  # [total_tokens]
-        maxs_expanded = maxs_t.repeat_interleave(seq_len)  # [total_tokens]
+        vecs_expanded = vec_per_request.repeat_interleave(seq_len, dim=0)
+        mins_expanded = min_per_request.repeat_interleave(seq_len)
+        maxs_expanded = max_per_request.repeat_interleave(seq_len)
 
         # Apply cap: project, clamp, adjust
-        proj = (hidden * vecs_expanded).sum(dim=-1)  # [total_tokens]
+        proj = (hidden * vecs_expanded).sum(dim=-1)
         clamped = torch.clamp(proj, mins_expanded, maxs_expanded)
         diff = (clamped - proj).unsqueeze(-1)
         hidden = hidden + diff * vecs_expanded
         return hidden
 
-    if uniform_seq_len:
-        # Sparse path: some requests have cap
-        seq_len = seq_lens[0]
-        steered_indices = [i for i, has in enumerate(request_has_cap) if has]
-
-        req_t = torch.tensor(steered_indices, device=device, dtype=torch.long)
-        vecs_stacked = torch.stack(cap_vecs)
-        mins_t = torch.tensor(cap_mins, device=device, dtype=dtype)
-        maxs_t = torch.tensor(cap_maxs, device=device, dtype=dtype)
-
-        # Build indices
-        starts = req_t * seq_len
-        offsets = torch.arange(seq_len, device=device, dtype=torch.long)
-        indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
-        assignments = torch.arange(len(steered_indices), device=device, dtype=torch.long)
-        assign_expanded = assignments.repeat_interleave(seq_len)
-
-        gathered = hidden[indices]
-        vec_for_each = vecs_stacked[assign_expanded]
-        min_for_each = mins_t[assign_expanded]
-        max_for_each = maxs_t[assign_expanded]
-
-        proj = (gathered * vec_for_each).sum(dim=-1)
-        clamped = torch.clamp(proj, min_for_each, max_for_each)
-        diff = (clamped - proj).unsqueeze(-1)
-        hidden[indices] = gathered + diff * vec_for_each
-        return hidden
-
-    # Non-uniform fallback: use GPU masking (like add)
-    # Build indices on GPU using cumsum
+    # MASKING PATH: GPU-constructed indices for non-uniform seq_lens
     seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.long)
     cumsum = torch.cumsum(seq_lens_t, dim=0)
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-    # Collect steered requests
+    # Collect steered request indices
     steered_requests = [i for i, has in enumerate(request_has_cap) if has]
     if not steered_requests:
         return hidden
 
-    # Build indices for steered requests
     steered_t = torch.tensor(steered_requests, device=device, dtype=torch.long)
-    steered_starts = starts[steered_t]  # [num_steered]
-    steered_lens = seq_lens_t[steered_t]  # [num_steered]
+    steered_starts = starts[steered_t]
+    steered_lens = seq_lens_t[steered_t]
 
-    # Build flat index tensor using GPU ops with masking
+    # Build masked indices
     max_len = steered_lens.max().item()
     offsets = torch.arange(max_len, device=device, dtype=torch.long)
-    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [num_steered, max_len]
+    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)
+    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)
+    valid_indices = all_indices[mask]
 
-    # Mask out invalid indices (for non-uniform seq_lens)
-    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)  # [num_steered, max_len]
-    valid_indices = all_indices[mask]  # [total_steered_tokens]
-
-    # Build assignment tensor
+    # Build assignment tensor and apply
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
-    assign_expanded = assignments.repeat_interleave(steered_lens)  # [total_steered_tokens]
+    assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    # Stack vectors and params
-    vecs_stacked = torch.stack(cap_vecs)  # [num_steered, hidden]
+    vecs_stacked = torch.stack(cap_vecs)
     mins_t = torch.tensor(cap_mins, device=device, dtype=dtype)
     maxs_t = torch.tensor(cap_maxs, device=device, dtype=dtype)
 
-    # Gather, apply cap, scatter
     gathered = hidden[valid_indices]
     vec_for_each = vecs_stacked[assign_expanded]
     min_for_each = mins_t[assign_expanded]
@@ -716,15 +656,18 @@ def _fused_ablation_gpu_native(
     hidden: torch.Tensor,
     seq_lens: list[int],
     request_layer_specs: list[Any],
+    uniform_seq_lens: bool,
 ) -> torch.Tensor:
     """Apply ablation steering using GPU-native operations.
 
-    For uniform seq_lens with all requests ablated, uses repeat_interleave
-    to avoid gather/scatter entirely.
+    Two paths based on pre-computed dispatch:
+    1. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
+    2. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
     """
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
+    hidden_size = hidden.shape[-1]
 
     # Collect ablation operations
     ablation_vecs: list[torch.Tensor] = []
@@ -745,85 +688,58 @@ def _fused_ablation_gpu_native(
     if not ablation_vecs:
         return hidden
 
-    all_have_ablation = all(request_has_ablation)
-    uniform_seq_len = len(set(seq_lens)) == 1
-
-    if all_have_ablation and uniform_seq_len:
-        # Optimal path: no gather needed!
+    if uniform_seq_lens:
+        # REPEAT-INTERLEAVE PATH: expand vectors/scales using broadcasting
         seq_len = seq_lens[0]
 
-        vecs_stacked = torch.stack(ablation_vecs)  # [num_requests, hidden]
-        scales_t = torch.tensor(ablation_scales, device=device, dtype=dtype)  # [num_requests]
+        # Build per-request tensors (zeros for unsteered, scale=1 means no-op)
+        vec_per_request = torch.zeros(num_requests, hidden_size, device=device, dtype=dtype)
+        scale_per_request = torch.ones(num_requests, device=device, dtype=dtype)  # 1.0 = no adjustment
+        vec_idx = 0
+        for i, has_ablation in enumerate(request_has_ablation):
+            if has_ablation:
+                vec_per_request[i] = ablation_vecs[vec_idx]
+                scale_per_request[i] = ablation_scales[vec_idx]
+                vec_idx += 1
 
         # Expand to all tokens
-        vecs_expanded = vecs_stacked.repeat_interleave(seq_len, dim=0)  # [total_tokens, hidden]
-        scales_expanded = scales_t.repeat_interleave(seq_len)  # [total_tokens]
+        vecs_expanded = vec_per_request.repeat_interleave(seq_len, dim=0)
+        scales_expanded = scale_per_request.repeat_interleave(seq_len)
 
         # Apply ablation: project, scale adjustment
-        proj = (hidden * vecs_expanded).sum(dim=-1)  # [total_tokens]
+        proj = (hidden * vecs_expanded).sum(dim=-1)
         adjustment = ((scales_expanded - 1) * proj).unsqueeze(-1)
         hidden = hidden + adjustment * vecs_expanded
         return hidden
 
-    if uniform_seq_len:
-        # Sparse path: some requests have ablation
-        seq_len = seq_lens[0]
-        steered_indices = [i for i, has in enumerate(request_has_ablation) if has]
-
-        req_t = torch.tensor(steered_indices, device=device, dtype=torch.long)
-        vecs_stacked = torch.stack(ablation_vecs)
-        scales_t = torch.tensor(ablation_scales, device=device, dtype=dtype)
-
-        # Build indices
-        starts = req_t * seq_len
-        offsets = torch.arange(seq_len, device=device, dtype=torch.long)
-        indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
-        assignments = torch.arange(len(steered_indices), device=device, dtype=torch.long)
-        assign_expanded = assignments.repeat_interleave(seq_len)
-
-        gathered = hidden[indices]
-        vec_for_each = vecs_stacked[assign_expanded]
-        scale_for_each = scales_t[assign_expanded]
-
-        proj = (gathered * vec_for_each).sum(dim=-1)
-        adjustment = ((scale_for_each - 1) * proj).unsqueeze(-1)
-        hidden[indices] = gathered + adjustment * vec_for_each
-        return hidden
-
-    # Non-uniform fallback: use GPU masking (like add)
-    # Build indices on GPU using cumsum
+    # MASKING PATH: GPU-constructed indices for non-uniform seq_lens
     seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.long)
     cumsum = torch.cumsum(seq_lens_t, dim=0)
     starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-    # Collect steered requests
+    # Collect steered request indices
     steered_requests = [i for i, has in enumerate(request_has_ablation) if has]
     if not steered_requests:
         return hidden
 
-    # Build indices for steered requests
     steered_t = torch.tensor(steered_requests, device=device, dtype=torch.long)
-    steered_starts = starts[steered_t]  # [num_steered]
-    steered_lens = seq_lens_t[steered_t]  # [num_steered]
+    steered_starts = starts[steered_t]
+    steered_lens = seq_lens_t[steered_t]
 
-    # Build flat index tensor using GPU ops with masking
+    # Build masked indices
     max_len = steered_lens.max().item()
     offsets = torch.arange(max_len, device=device, dtype=torch.long)
-    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [num_steered, max_len]
+    all_indices = steered_starts.unsqueeze(1) + offsets.unsqueeze(0)
+    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)
+    valid_indices = all_indices[mask]
 
-    # Mask out invalid indices (for non-uniform seq_lens)
-    mask = offsets.unsqueeze(0) < steered_lens.unsqueeze(1)  # [num_steered, max_len]
-    valid_indices = all_indices[mask]  # [total_steered_tokens]
-
-    # Build assignment tensor
+    # Build assignment tensor and apply
     assignments = torch.arange(len(steered_requests), device=device, dtype=torch.long)
-    assign_expanded = assignments.repeat_interleave(steered_lens)  # [total_steered_tokens]
+    assign_expanded = assignments.repeat_interleave(steered_lens)
 
-    # Stack vectors and params
-    vecs_stacked = torch.stack(ablation_vecs)  # [num_steered, hidden]
+    vecs_stacked = torch.stack(ablation_vecs)
     scales_t = torch.tensor(ablation_scales, device=device, dtype=dtype)
 
-    # Gather, apply ablation, scatter
     gathered = hidden[valid_indices]
     vec_for_each = vecs_stacked[assign_expanded]
     scale_for_each = scales_t[assign_expanded]
@@ -842,12 +758,18 @@ def _fused_gather_steering(
 ) -> torch.Tensor:
     """Apply steering using GPU-native fused operations.
 
-    This replaces CPU-side index construction with GPU tensor ops,
-    achieving 2.8-5.6x speedup over the slow loop.
+    Dispatch logic (computed once here):
+    1. Fast path (all same spec) - handled upstream in _apply_per_request_steering
+    2. Repeat-interleave path - uniform seq_lens, uses broadcasting
+    3. Masking path - non-uniform seq_lens, uses GPU-constructed masked indices
 
-    Each operation type (add, cap, ablation) has its own optimized path
-    using repeat_interleave when all requests are steered with uniform seq_lens.
+    Benchmarks show:
+    - Repeat-interleave: 4-8x faster than slow loop
+    - Masking: 1.2-2.8x faster than slow loop
     """
+    # Compute dispatch once for all operations
+    uniform_seq_lens = len(set(seq_lens)) == 1
+
     # Detect which operation types are present
     has_add = False
     has_cap = False
@@ -866,14 +788,13 @@ def _fused_gather_steering(
     if not (has_add or has_cap or has_ablation):
         return hidden
 
-    # Apply each operation type using its optimized GPU-native function
-    # Each function handles its own optimal/sparse/fallback paths
+    # Apply each operation type, passing the pre-computed dispatch decision
     if has_add:
-        hidden = _fused_add_gpu_native(hidden, seq_lens, request_layer_specs)
+        hidden = _fused_add_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
     if has_cap:
-        hidden = _fused_cap_gpu_native(hidden, seq_lens, request_layer_specs)
+        hidden = _fused_cap_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
     if has_ablation:
-        hidden = _fused_ablation_gpu_native(hidden, seq_lens, request_layer_specs)
+        hidden = _fused_ablation_gpu_native(hidden, seq_lens, request_layer_specs, uniform_seq_lens)
 
     return hidden
 

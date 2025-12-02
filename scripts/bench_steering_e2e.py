@@ -77,7 +77,6 @@ from steerllm.backends.vllm.runtime import (
     _slow_path_loop_impl,
     _gather_scatter_steering,
     _fused_gather_steering,
-    _fused_add_gpu_native,
     _apply_layer_steering_to_hidden,
 )
 
