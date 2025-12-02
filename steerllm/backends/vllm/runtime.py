@@ -469,15 +469,18 @@ def _fused_add_gpu_native(
 ) -> torch.Tensor:
     """Apply additive steering using GPU-native operations.
 
-    Two paths based on pre-computed dispatch:
-    1. Repeat-interleave (uniform_seq_lens=True): 4-5x faster than slow loop
-    2. Masking (uniform_seq_lens=False): 1.2x faster than slow loop
+    Three paths based on pre-computed dispatch:
+    1. All-same-vector (identity check): simple broadcast, fastest
+    2. Repeat-interleave (uniform_seq_lens=True): 4-5x faster than slow loop
+    3. Masking (uniform_seq_lens=False): 1.2x faster than slow loop
     """
     device = hidden.device
 
-    # Collect vectors for steered requests
+    # Collect vectors for steered requests + check if all same
     add_vecs: list[torch.Tensor] = []
     request_has_add: list[bool] = []
+    first_vec = None
+    all_same_vec = True
 
     for layer_spec in request_layer_specs:
         has_add = False
@@ -486,11 +489,24 @@ def _fused_add_gpu_native(
                 if op_type == "add":
                     add_vecs.append(vec)
                     has_add = True
+                    # Check identity
+                    if first_vec is None:
+                        first_vec = vec
+                    elif vec is not first_vec:
+                        all_same_vec = False
                     break
+        else:
+            # No add for this request breaks "all same" unless none have it
+            if first_vec is not None:
+                all_same_vec = False
         request_has_add.append(has_add)
 
     if not add_vecs:
         return hidden
+
+    # FAST PATH: all requests use identical vector - simple broadcast
+    if all_same_vec and all(request_has_add):
+        return hidden + first_vec
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors using broadcasting
@@ -552,20 +568,24 @@ def _fused_cap_gpu_native(
 ) -> torch.Tensor:
     """Apply projection cap steering using GPU-native operations.
 
-    Two paths based on pre-computed dispatch:
-    1. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
-    2. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
+    Three paths based on pre-computed dispatch:
+    1. All-same-vector (identity check): simple batched cap, fastest
+    2. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
+    3. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
     """
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
     hidden_size = hidden.shape[-1]
 
-    # Collect cap operations
+    # Collect cap operations + check if all same
     cap_vecs: list[torch.Tensor] = []
     cap_mins: list[float] = []
     cap_maxs: list[float] = []
     request_has_cap: list[bool] = []
+    first_vec = None
+    first_params = None
+    all_same = True
 
     for layer_spec in request_layer_specs:
         has_cap = False
@@ -576,11 +596,29 @@ def _fused_cap_gpu_native(
                     cap_mins.append(params[0] if params[0] is not None else float('-inf'))
                     cap_maxs.append(params[1] if params[1] is not None else float('inf'))
                     has_cap = True
+                    # Check identity
+                    if first_vec is None:
+                        first_vec = vec
+                        first_params = params
+                    elif vec is not first_vec or params != first_params:
+                        all_same = False
                     break
+        else:
+            if first_vec is not None:
+                all_same = False
         request_has_cap.append(has_cap)
 
     if not cap_vecs:
         return hidden
+
+    # FAST PATH: all requests use identical vector and params - simple batched cap
+    if all_same and all(request_has_cap):
+        cap_min = first_params[0] if first_params[0] is not None else float('-inf')
+        cap_max = first_params[1] if first_params[1] is not None else float('inf')
+        proj = (hidden * first_vec).sum(dim=-1)
+        clamped = torch.clamp(proj, cap_min, cap_max)
+        diff = (clamped - proj).unsqueeze(-1)
+        return hidden + diff * first_vec
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors/params using broadcasting
@@ -660,19 +698,23 @@ def _fused_ablation_gpu_native(
 ) -> torch.Tensor:
     """Apply ablation steering using GPU-native operations.
 
-    Two paths based on pre-computed dispatch:
-    1. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
-    2. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
+    Three paths based on pre-computed dispatch:
+    1. All-same-vector (identity check): simple batched ablation, fastest
+    2. Repeat-interleave (uniform_seq_lens=True): 7-8x faster than slow loop
+    3. Masking (uniform_seq_lens=False): 2-3x faster than slow loop
     """
     device = hidden.device
     dtype = hidden.dtype
     num_requests = len(seq_lens)
     hidden_size = hidden.shape[-1]
 
-    # Collect ablation operations
+    # Collect ablation operations + check if all same
     ablation_vecs: list[torch.Tensor] = []
     ablation_scales: list[float] = []
     request_has_ablation: list[bool] = []
+    first_vec = None
+    first_scale = None
+    all_same = True
 
     for layer_spec in request_layer_specs:
         has_ablation = False
@@ -682,11 +724,26 @@ def _fused_ablation_gpu_native(
                     ablation_vecs.append(vec)
                     ablation_scales.append(params)
                     has_ablation = True
+                    # Check identity
+                    if first_vec is None:
+                        first_vec = vec
+                        first_scale = params
+                    elif vec is not first_vec or params != first_scale:
+                        all_same = False
                     break
+        else:
+            if first_vec is not None:
+                all_same = False
         request_has_ablation.append(has_ablation)
 
     if not ablation_vecs:
         return hidden
+
+    # FAST PATH: all requests use identical vector and scale - simple batched ablation
+    if all_same and all(request_has_ablation):
+        proj = (hidden * first_vec).sum(dim=-1)
+        adjustment = ((first_scale - 1) * proj).unsqueeze(-1)
+        return hidden + adjustment * first_vec
 
     if uniform_seq_lens:
         # REPEAT-INTERLEAVE PATH: expand vectors/scales using broadcasting
