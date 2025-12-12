@@ -2166,6 +2166,57 @@ def _rpc_fetch_captures(
 _register_rpc("fetch_captures", _rpc_fetch_captures)
 
 
+def _rpc_fetch_batch_captures(
+    worker: Any,
+    request_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Fetch captures for multiple requests in a single RPC call.
+
+    Batches all GPU→shm transfers and syncs the transfer stream once at the end,
+    reducing synchronization overhead when fetching many requests.
+
+    Parameters
+    ----------
+    worker :
+        vLLM worker instance (unused but required by RPC signature).
+    request_ids :
+        List of request IDs to fetch captures for.
+
+    Returns
+    -------
+    dict[str, dict[str, Any]]
+        Mapping from request_id to layer captures. Each layer capture is
+        serialized tensor metadata for shared memory reconstruction.
+    """
+    state = get_worker_state()
+    if state is None:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+
+    # Queue all GPU→shm copies on transfer_stream (non-blocking)
+    for request_id in request_ids:
+        captures = state.request_captures.get(request_id)
+        if captures is None:
+            continue
+
+        request_result: dict[str, Any] = {}
+        for layer_idx, tensor in captures.items():
+            request_result[str(layer_idx)] = _create_shared_tensor(
+                tensor, state, stream=state.transfer_stream
+            )
+        result[request_id] = request_result
+
+    # Sync transfer_stream ONCE after all copies queued
+    if state.transfer_stream is not None:
+        state.transfer_stream.synchronize()
+
+    return result
+
+
+_register_rpc("fetch_batch_captures", _rpc_fetch_batch_captures)
+
+
 def _rpc_release_shared_memory(
     worker: Any,
     shm_names: list[str],

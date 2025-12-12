@@ -498,6 +498,63 @@ class VLLMSteeringModel(SyncWrapperMixin):
 
         return captures
 
+    async def fetch_captures_batch(
+        self,
+        handles: Sequence[_VLLMCaptureHandle],
+    ) -> None:
+        """Fetch captures for multiple handles in a single RPC call.
+
+        This is more efficient than calling handle.fetch() individually when
+        fetching many captures, as it batches the GPU→shm transfers and performs
+        a single stream synchronization.
+
+        Parameters
+        ----------
+        handles :
+            Sequence of CaptureHandle objects to fetch captures for.
+
+        Note
+        ----
+        Mutates handles in-place by populating their _captures field.
+        Handles that already have captures are skipped.
+        """
+        await self._ensure_engine_initialized()
+
+        # Filter to handles that need fetching
+        to_fetch = [h for h in handles if h._captures is None]
+        if not to_fetch:
+            return
+
+        # Extract request IDs
+        request_ids = [h.request_id for h in to_fetch]
+
+        # Batch fetch all captures in single RPC
+        results = await self._collective_rpc("fetch_batch_captures", request_ids)
+
+        # Process first worker's result (all workers have same captures for single-GPU)
+        if not results or results[0] is None:
+            return
+
+        worker_result = results[0]
+
+        # Distribute results to handles
+        for handle in to_fetch:
+            request_data = worker_result.get(handle.request_id)
+            if request_data is None:
+                handle._captures = {}
+                continue
+
+            captures: dict[int, list[dict[str, Any]]] = {}
+            for layer_idx_str, capture_data in request_data.items():
+                layer_idx = int(layer_idx_str)
+                tensor = steering_runtime.deserialize_tensor(
+                    capture_data,
+                    shm_objects_list=handle._shm_objects,
+                )
+                captures[layer_idx] = [{"hidden": tensor}]
+
+            handle._captures = captures
+
     async def generate(
         self,
         prompts: list[str],

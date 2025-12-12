@@ -547,6 +547,40 @@ class VLLMSteerModel:
                     handles.append(handle)
             return results, handles
 
+    async def fetch_captures_batch(
+        self,
+        handles: Sequence["CaptureHandle"],
+    ) -> None:
+        """Fetch captures for multiple handles in a single RPC call.
+
+        This is more efficient than calling handle.fetch() individually when
+        fetching many captures, as it batches the GPU→shm transfers and performs
+        a single stream synchronization.
+
+        Parameters
+        ----------
+        handles :
+            Sequence of CaptureHandle objects to fetch captures for.
+
+        Note
+        ----
+        Mutates handles in-place by populating their _captures field.
+        Handles that already have captures are skipped.
+        """
+        # Filter handles that need fetching and have inner handles
+        to_fetch = [h for h in handles if h._captures is None and h._inner_handle is not None]
+        if not to_fetch:
+            return
+
+        # Extract inner handles and call steerllm batch fetch
+        inner_handles = [h._inner_handle for h in to_fetch]
+        await self._inner.fetch_captures_batch(inner_handles)
+
+        # Copy captures from inner handles to wrapper handles
+        for handle in to_fetch:
+            if handle._inner_handle._captures is not None:
+                handle._captures = handle._inner_handle._captures
+
     # ------------------------------------------------------------------
     # Sync wrappers (deprecated)
     # ------------------------------------------------------------------
