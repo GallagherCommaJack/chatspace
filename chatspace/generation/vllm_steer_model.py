@@ -171,10 +171,13 @@ class CaptureHandle:
     async def fetch(self) -> dict[int, list[dict[str, Any]]]:
         """Fetch captures from workers (idempotent)."""
         if self._captures is None:
-            if self._inner_handle is not None:
-                self._captures = await self._inner_handle.fetch()
-            else:
-                self._captures = {}
+            if self._inner_handle is None:
+                raise RuntimeError(
+                    f"Cannot fetch captures for request {self.request_id}: "
+                    "no inner handle available. This indicates the CaptureHandle "
+                    "was created without valid capture data."
+                )
+            self._captures = await self._inner_handle.fetch()
         return self._captures
 
     @property
@@ -413,20 +416,26 @@ class VLLMSteerModel:
             else:
                 layers_seq = list(capture_layers)
 
-        # Call inner model
-        results, inner_handles = await self._inner.generate(
-            prompts,
-            sampling_params=sampling_params,
-            steering_spec=steering_spec,
-            capture_layers=layers_seq,
-            raw_output=raw_output,
-            **kwargs,
-        )
-
-        # Convert return type based on capture_layers
+        # Call inner model - return type depends on capture_layers
         if capture_layers is None:
+            results = await self._inner.generate(
+                prompts,
+                sampling_params=sampling_params,
+                steering_spec=steering_spec,
+                capture_layers=None,
+                raw_output=raw_output,
+                **kwargs,
+            )
             return results
         else:
+            results, inner_handles = await self._inner.generate(
+                prompts,
+                sampling_params=sampling_params,
+                steering_spec=steering_spec,
+                capture_layers=layers_seq,
+                raw_output=raw_output,
+                **kwargs,
+            )
             # Wrap handles in chatspace CaptureHandle
             handles = []
             if inner_handles:
@@ -447,7 +456,6 @@ class VLLMSteerModel:
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         capture_layers: None = None,
         steering_spec: SteeringSpec | None = None,
@@ -461,7 +469,6 @@ class VLLMSteerModel:
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         capture_layers: None = None,
         steering_spec: SteeringSpec | None = None,
@@ -475,7 +482,6 @@ class VLLMSteerModel:
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         capture_layers: int | Sequence[int],
         steering_spec: SteeringSpec | None = None,
@@ -489,7 +495,6 @@ class VLLMSteerModel:
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         capture_layers: int | Sequence[int],
         steering_spec: SteeringSpec | None = None,
@@ -502,7 +507,6 @@ class VLLMSteerModel:
         messages: list[dict[str, Any]] | list[list[dict[str, Any]]],
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = False,
         chat_options: dict[str, Any] | None = None,
         capture_layers: int | Sequence[int] | None = None,
         steering_spec: SteeringSpec | None = None,
@@ -518,21 +522,28 @@ class VLLMSteerModel:
             else:
                 layers_seq = list(capture_layers)
 
-        # Call inner model
-        results, inner_handles = await self._inner.chat(
-            messages,
-            sampling_params=sampling_params,
-            steering_spec=steering_spec,
-            capture_layers=layers_seq,
-            chat_options=chat_options,
-            raw_output=raw_output,
-            **sampling_kwargs,
-        )
-
-        # Convert return type based on capture_layers
+        # Call inner model - return type depends on capture_layers
         if capture_layers is None:
+            results = await self._inner.chat(
+                messages,
+                sampling_params=sampling_params,
+                steering_spec=steering_spec,
+                capture_layers=None,
+                chat_options=chat_options,
+                raw_output=raw_output,
+                **sampling_kwargs,
+            )
             return results
         else:
+            results, inner_handles = await self._inner.chat(
+                messages,
+                sampling_params=sampling_params,
+                steering_spec=steering_spec,
+                capture_layers=layers_seq,
+                chat_options=chat_options,
+                raw_output=raw_output,
+                **sampling_kwargs,
+            )
             # Wrap handles in chatspace CaptureHandle
             handles = []
             if inner_handles:
