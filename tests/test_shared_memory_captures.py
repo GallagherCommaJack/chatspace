@@ -81,7 +81,7 @@ async def test_shared_memory_basic_roundtrip(model_factory):
     handle = handles[0]
 
     # Fetch captures
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Verify captures exist
     assert handle._captures is not None
@@ -118,7 +118,7 @@ async def test_shared_memory_context_manager(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     shm_names_before = list(handle._shm_names)
     assert len(shm_names_before) > 0
@@ -149,7 +149,7 @@ async def test_concurrent_access_isolation(model_factory):
     assert len(handles) == 2
 
     # Fetch both concurrently
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # Verify each handle has different captures
     handle1, handle2 = handles
@@ -231,7 +231,7 @@ async def test_data_integrity(model_factory):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Verify multiple layers exist
     assert 5 in handle.captures
@@ -293,7 +293,7 @@ async def test_memory_leak_detection(model_factory):
         )
 
         handle = handles[0]
-        await model.fetch_captures_batch([handle])
+        await handle.fetch()
 
         # Access captures
         _ = handle.captures
@@ -325,7 +325,7 @@ async def test_explicit_close_vs_context_manager(model_factory):
     )
 
     h1, h2 = handles
-    await model.fetch_captures_batch([h1, h2])
+    await asyncio.gather(h1.fetch(), h2.fetch())
 
     # Method 1: Explicit close
     _ = h1.captures

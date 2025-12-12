@@ -9,6 +9,7 @@ Tests cover:
 - Token count accuracy
 """
 
+import asyncio
 import pytest
 
 import torch
@@ -132,7 +133,7 @@ async def test_long_prompt_capture_continuity(model_factory, tokenizer):
     handle = handles[0]
 
     # Fetch captures
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Verify captures exist for both layers
     assert 5 in handle.captures
@@ -198,7 +199,7 @@ async def test_prefill_to_decode_transition(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     layer5_capture = handle.captures[5][0]["hidden"]
 
@@ -252,7 +253,7 @@ async def test_decode_buffer_flush_behavior(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     layer5_capture = handle.captures[5][0]["hidden"]
 
@@ -298,7 +299,7 @@ async def test_multiple_layers_coalesce_independently(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Expected length for all layers
     expected_len = actual_prompt_tokens + (max_tokens - 1)
@@ -356,7 +357,7 @@ async def test_very_long_prompt_multiple_chunks(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     layer5_capture = handle.captures[5][0]["hidden"]
 
@@ -409,7 +410,7 @@ async def test_concurrent_requests_independent_coalescing(model_factory, tokeniz
     assert len(handles) == 3
 
     # Fetch all
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # Calculate expected prompt lengths
     prompt_lens = [count_tokens(tokenizer, prompt) for prompt in prompts]
@@ -474,7 +475,7 @@ async def test_capture_with_no_decode_tokens(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     layer5_capture = handle.captures[5][0]["hidden"]
 
@@ -525,7 +526,7 @@ async def test_small_decode_buffer_many_tokens(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     layer5_capture = handle.captures[5][0]["hidden"]
 
@@ -584,7 +585,7 @@ async def test_coalescing_with_steering_applied(model_factory, tokenizer):
     )
 
     handle = handles[0]
-    await model.fetch_captures_batch([handle])
+    await handle.fetch()
 
     # Expected length for both layers
     expected_len = actual_prompt_tokens + (max_tokens - 1)

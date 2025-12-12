@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -222,7 +224,7 @@ async def test_vllm_hf_steering_combinations_match():
                 steering_spec=steering_spec,
                 capture_layers=[target_layer, downstream_layer]
             )
-            await vllm_model.fetch_captures_batch(handles)
+            await asyncio.gather(*[h.fetch() for h in handles])
             vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
             vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
@@ -328,7 +330,7 @@ async def test_vllm_decode_steering_matches_hf_prefill():
     full_text = prompt + generated_text
 
     # Fetch vLLM hidden states (decode mode)
-    await vllm_model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # New API: captures are concatenated tensors [seq_len, hidden_size]
     vllm_target_hidden_full = handles[0].captures[target_layer][0]["hidden"]  # [seq_len, hidden_size]
@@ -591,7 +593,7 @@ async def test_vllm_hf_high_magnitude_steering():
             capture_layers=[target_layer, downstream_layer]
         )
 
-        await vllm_model.fetch_captures_batch(handles)
+        await asyncio.gather(*[h.fetch() for h in handles])
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
         vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
@@ -789,7 +791,7 @@ async def test_vllm_hf_high_magnitude_ablation_and_capping():
             capture_layers=[target_layer, downstream_layer]
         )
 
-        await vllm_model.fetch_captures_batch(handles)
+        await asyncio.gather(*[h.fetch() for h in handles])
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
         vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
@@ -960,7 +962,7 @@ async def test_vllm_hf_multi_magnitude_steering():
                 capture_layers=[target_layer, downstream_layer]
             )
 
-            await vllm_model.fetch_captures_batch(handles)
+            await asyncio.gather(*[h.fetch() for h in handles])
             vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
             vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
@@ -1114,7 +1116,7 @@ async def test_vllm_hf_high_precision_steering():
             capture_layers=[target_layer, downstream_layer]
         )
 
-        await vllm_model.fetch_captures_batch(handles)
+        await asyncio.gather(*[h.fetch() for h in handles])
         vllm_target_hidden = handles[0].captures[target_layer][0]["hidden"]
         vllm_downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"]
 
@@ -1297,7 +1299,7 @@ async def test_delta_vs_residual_numerics():
                     capture_layers=[target_layer, downstream_layer]
                 )
 
-                await vllm_model.fetch_captures_batch(handles)
+                await asyncio.gather(*[h.fetch() for h in handles])
                 target_hidden = handles[0].captures[target_layer][0]["hidden"].to(dtype=torch.float32)
                 downstream_hidden = handles[0].captures[downstream_layer][0]["hidden"].to(dtype=torch.float32)
 
@@ -1500,7 +1502,7 @@ async def test_delta_vs_residual_instrumented():
                 capture_layers=[target_layer]
             )
 
-            await vllm_model.fetch_captures_batch(handles)
+            await asyncio.gather(*[h.fetch() for h in handles])
             hidden = handles[0].captures[target_layer][0]["hidden"]
 
             results[approach_name] = {
@@ -1684,7 +1686,7 @@ async def test_vllm_hf_multi_layer_steering_float32():
         capture_layers=list(all_check_layers)
     )
 
-    await vllm_model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     print("\nvLLM results:")
     for layer_idx in all_check_layers:
@@ -1833,7 +1835,7 @@ async def test_vllm_hf_multi_layer_steering_float32():
         steering_spec=every_steering_spec,
         capture_layers=list(all_every_check)
     )
-    await vllm_every_model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     print("\nvLLM results (sample layers):")
     for layer_idx in [0, 5, 9, 10, 11]:
@@ -2080,7 +2082,7 @@ async def test_bf16_degradation_hf_vs_vllm():
             capture_layers=[check_layer]
         )
 
-        await vllm_model.fetch_captures_batch(handles)
+        await asyncio.gather(*[h.fetch() for h in handles])
         vllm_bf16_hidden = handles[0].captures[check_layer][0]["hidden"]
 
         vllm_bf16_mae = torch.mean(torch.abs(vllm_bf16_hidden.cpu().float() - hf_fp32_hidden)).item()

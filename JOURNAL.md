@@ -1,5 +1,61 @@
 # Engineering Journal
 
+## 2025-12-01
+
+### GPU-Native Steering Operations (4-10x Speedup)
+
+**Timestamp:** 2025-12-01 16:55 UTC
+
+Replaced CPU-side index construction with GPU-native tensor operations for steering, achieving 4-10x speedups.
+
+### Key Insight
+
+The bottleneck was `torch.tensor(list, device='cuda')` which costs ~380μs due to CPU→GPU transfer. Replacing with GPU-native `repeat_interleave` costs only ~27μs (14x faster).
+
+```python
+# SLOW: CPU list → GPU tensor (380μs)
+indices = torch.tensor(python_list, device='cuda')
+
+# FAST: GPU-native construction (27μs)
+vec_expanded = vecs.repeat_interleave(seq_len, dim=0)
+```
+
+### Performance Results
+
+**Single Operation (batch=32, 4 layers, heterogeneous):**
+
+| Op Type   | Slow Loop | Fused GPU-native | Speedup |
+|-----------|-----------|------------------|---------|
+| Add       | 1715μs    | 416μs            | 4.1x    |
+| Cap       | 6184μs    | 802μs            | 7.7x    |
+| Ablation  | 5480μs    | 730μs            | 7.5x    |
+
+**Scaling (heterogeneous, 4 layers):**
+
+| Batch | Cap Speedup | Ablation Speedup |
+|-------|-------------|------------------|
+| 8     | 3.6x        | 4.1x             |
+| 32    | 7.7x        | 7.6x             |
+| 128   | 10.3x       | 9.5x             |
+
+### Approaches Tested
+
+1. **Materialized tensor approach** - Failed: `torch.zeros` + fill overhead negated benefits
+2. **Device/dtype check removal** - Minor: Only 3-6% overhead (not 30% as estimated)
+3. **torch.compile on slow path** - Failed: 7x slower due to dynamic shapes
+4. **Sorted index tensors** - Modest: Fused approach better
+5. **GPU-native repeat_interleave** - Winner: 4-10x speedup
+
+### Files Changed
+
+- `steerllm/backends/vllm/runtime.py`: Added `_fused_add_gpu_native`, `_fused_cap_gpu_native`, `_fused_ablation_gpu_native`
+- `scripts/bench_steering_e2e.py`: Main E2E benchmark
+- `scripts/bench_all_ops_e2e.py`: All ops benchmark
+- `scripts/bench_gpu_alloc.py`: GPU allocation benchmark (key insight)
+- `scripts/archive/`: Exploratory benchmarks that led to the solution
+
+---
+
 ## 2025-11-16
 
 ### Test Isolation Issue Fixed: 205/206 Tests Passing in Full Suite

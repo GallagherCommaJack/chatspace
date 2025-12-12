@@ -266,41 +266,67 @@ async def _run_workload(engine, args) -> dict[str, Any]:
         "throughput_tokens_sec": total_tokens / total_time
     }
 
+def _aggregate_worker_counters(worker_data: list[dict]) -> dict:
+    """Sum counters across all tensor-parallel workers."""
+    totals = {"counters": {}, "timings": {}}
+    for wd in worker_data:
+        for k, v in wd.get("counters", {}).items():
+            totals["counters"][k] = totals["counters"].get(k, 0) + v
+        for k, v in wd.get("timings", {}).items():
+            totals["timings"][k] = totals["timings"].get(k, 0.0) + v
+    return totals
+
+
 async def _run_custom_workload(model, args, runner_fn) -> dict[str, Any]:
     """Wrapper for patched model workload."""
     prompts = get_dummy_prompts(args.num_requests, args.prompt_len)
     sampling_params = SamplingParams(
-        temperature=0.7, 
+        temperature=0.7,
         max_tokens=args.max_tokens,
         ignore_eos=True
     )
-    
+
     # Warmup
     logger.info("Warming up...")
     # Just run one prompt
     await model.generate([prompts[0]], sampling_params)
-        
+
     logger.info("Starting benchmark...")
     # The runner_fn handles the batch generation and timing
     total_tokens, total_time = await runner_fn(prompts, sampling_params)
-    
+
+    # Fetch perf counters if enabled
+    perf_data = None
+    if os.environ.get("CHATSPACE_PERF_COUNTERS") == "1":
+        try:
+            raw_counters = await model.get_perf_counters()
+            perf_data = _aggregate_worker_counters(raw_counters)
+            logger.info(f"Perf counters: {perf_data}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch perf counters: {e}")
+
     # Estimate per-request latency as total_time (since it's a batch, latency is concurrent)
     # For throughput: total_tokens / total_time
-    # For latency: This batch call waits for all. 
+    # For latency: This batch call waits for all.
     # Ideally we'd measure TTFT etc, but coarse overhead is fine.
     # We'll report the batch latency as "avg latency" approx if we treat it as one big batch,
     # but really we want per-request stats.
     # VLLMSteerModel.generate doesn't return per-request timings easily without raw_output=True.
-    
+
     # Let's simplify: Overhead is best seen in aggregate Throughput.
-    
-    return {
+
+    result = {
         "total_tokens": total_tokens,
         "total_time_sec": total_time,
         "avg_latency_ms": (total_time / args.num_requests) * 1000, # Rough avg completion time
         "p95_latency_ms": 0.0, # Not available in batch mode easily
         "throughput_tokens_sec": total_tokens / total_time
     }
+
+    if perf_data:
+        result["perf_counters"] = perf_data
+
+    return result
 
 
 def run_worker_mode(args):
@@ -378,7 +404,27 @@ def run_orchestrator_mode(args):
                 overhead = (1.0 - (tput / baseline_throughput)) * 100 if baseline_throughput > 0 else 0.0
             
             print(f"{case:<25} | {tput:<20.2f} | {lat:<15.2f} | {overhead:<10.1f}")
-            
+
+            # Display perf counters if available
+            if "perf_counters" in data:
+                pc = data["perf_counters"]
+                counters = pc.get("counters", {})
+                timings = pc.get("timings", {})
+
+                # Key metrics
+                fwd = counters.get("forward_calls", 0)
+                exit_no_work = counters.get("exit_no_work", 0)
+                extraction = counters.get("extraction_triggered", 0)
+                steering = counters.get("steering_applied", 0)
+                capture = counters.get("capture_processed", 0)
+                extraction_time = timings.get("extraction_time", 0.0)
+
+                print(f"  Counters: fwd={fwd}, exit_no_work={exit_no_work}, "
+                      f"extraction={extraction}, steering={steering}, capture={capture}")
+                if fwd > 0:
+                    print(f"  Extraction rate: {extraction/fwd*100:.1f}%, "
+                          f"Extraction time: {extraction_time*1000:.2f}ms total")
+
             results.append({
                 "case": case,
                 "metrics": data,

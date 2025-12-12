@@ -24,3 +24,5 @@ TEMP_*.md
 .ruff_cache/
 .pytest_cache/
 .claude/
+
+benchmark_results.json

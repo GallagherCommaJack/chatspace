@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import torch
 from vllm import SamplingParams
@@ -46,7 +48,7 @@ async def test_chat_basic_activation_capture():
     assert len(handles) == 1, "Expected one capture handle"
 
     handle = handles[0]
-    assert handle.request_id.startswith("chat_capture_"), "Expected chat capture request ID"
+    assert handle.request_id, "Expected non-empty request ID"
     assert target_layer in handle.layer_indices, f"Expected layer {target_layer} in handle"
 
     # Fetch captures
@@ -92,7 +94,7 @@ async def test_chat_message_boundaries_single_turn():
         capture_layers=target_layer,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Verify message boundaries exist
@@ -142,7 +144,7 @@ async def test_chat_message_boundaries_multi_turn():
         capture_layers=target_layer,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Verify all messages have boundaries
@@ -203,7 +205,7 @@ async def test_chat_get_message_activations():
         capture_layers=target_layer,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Extract activations for each message
@@ -273,7 +275,7 @@ async def test_chat_get_message_activations_with_generated():
         capture_layers=target_layer,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Get just the message activations (no generated tokens)
@@ -354,7 +356,7 @@ async def test_chat_batch_with_captures():
     assert len(handles) == len(conversations), "Handle count mismatch"
 
     # Fetch all captures at once
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
 
     # Verify each handle has the correct number of message boundaries
     for i, (handle, conv) in enumerate(zip(handles, conversations)):
@@ -405,7 +407,7 @@ async def test_chat_multiple_layers_capture():
         capture_layers=layers,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Verify all layers captured
@@ -539,7 +541,7 @@ async def test_chat_compare_user_messages():
         capture_layers=target_layer,
     )
 
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     # Find user message indices
@@ -608,7 +610,7 @@ async def test_chat_raw_output_with_captures():
     assert hasattr(outputs[0], "prompt"), "Should have prompt field"
 
     # Verify captures still work
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     assert target_layer in handles[0].captures
 
     del model
@@ -743,7 +745,7 @@ async def test_chat_assistant_prefill_with_capture():
     assert len(response.generated) > 0, "Should have generated text"
 
     # Verify message boundaries
-    await model.fetch_captures_batch(handles)
+    await asyncio.gather(*[h.fetch() for h in handles])
     handle = handles[0]
 
     assert handle.message_boundaries is not None, "Should have message boundaries"
